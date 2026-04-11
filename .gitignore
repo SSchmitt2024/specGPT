@@ -1,2 +1,5 @@
 /nvme_spec
 .venv
+/data
+.claude-flow
+__pycache__
