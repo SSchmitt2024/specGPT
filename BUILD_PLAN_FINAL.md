@@ -1,5 +1,3 @@
-# First and Foremost - while this project is AI driven, it is not vibecoded. This is a project I plan to learn from, not just direct an AI to achieve.
-
 # NVMe Spec Intelligence — Build Plan
 
 ## Overview
@@ -309,57 +307,6 @@ CONFIDENCE: HIGH
 | Hosting | Monthly | ~$5-10 |
 | Daily usage (20-30 questions) | Per day | ~$0.50-1.50 |
 
----
-
-## Project Structure
-
-```
-nvme-spec-intelligence/
-├── README.md
-├── BUILD_PLAN.md
-├── requirements.txt
-├── Dockerfile
-│
-├── indexing/
-│   ├── parse_spec.py             # PDF → tables + prose extraction
-│   ├── extract_relationships.py  # Structural + LLM relationship extraction
-│   ├── build_cards.py            # Metadata card generation
-│   ├── build_graph.py            # NetworkX graph construction
-│   ├── chunk_and_embed.py        # Definition-enriched chunking + embedding
-│   └── index_to_supabase.py      # Upload to Supabase
-│
-├── retrieval/
-│   ├── bm25_search.py
-│   ├── vector_search.py
-│   ├── rrf.py                    # Reciprocal Rank Fusion
-│   ├── graph_expansion.py        # NetworkX traversal
-│   └── reranker.py               # Cross-encoder reranking
-│
-├── generation/
-│   └── generate.py               # Sonnet call with strict system prompt
-│
-├── eval/
-│   ├── generate_benchmarks.py    # Auto-generate QA pairs from cards
-│   ├── eval_set.json             # Hand-verified ground-truth questions
-│   └── run_eval.py               # Score pipeline against eval set
-│
-├── api/
-│   └── main.py                   # FastAPI backend
-│
-├── frontend/
-│   └── ...                       # React or HTML frontend
-│
-├── data/
-│   ├── specs/                    # Source NVMe spec PDFs
-│   ├── cards/                    # Generated metadata cards
-│   ├── chunks/                   # Processed chunks
-│   └── graph/                    # Serialized NetworkX graph
-│
-└── scripts/
-    └── reindex.sh                # Full re-indexing script for new spec versions
-```
-
----
 
 ## 1-Month Prototype Checklist
 
