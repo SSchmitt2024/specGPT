@@ -162,19 +162,54 @@ def _looks_like_primary_key(cell: str) -> bool:
 def _looks_like_band_header(row: list[str]) -> bool:
     """
     A band header is a single-cell row inside a table that acts as a section
-    divider for the rows below it (e.g., Figure 328 has rows like "Controller
-    Capabilities and Features" spanning all columns).
+    divider for the rows below it. Two patterns qualify:
+      (a) Multi-word capitalized section label, e.g.
+          "Controller Capabilities and Features" (Figure 328)
+      (b) Single capitalized word ≥4 chars with no header-fragment markers,
+          e.g. "Header", "Records" (Figure 312).
 
-    Exactly one cell, >= 10 chars, multiple words, mostly letters/spaces —
-    this distinguishes from header fragments like "bytes)".
+    Both must NOT look like header-continuation fragments (no leading '(',
+    no trailing ')', no lowercase-only prefix).
     """
     if len(row) != 1:
         return False
-    s = row[0]
-    if len(s) < 10 or len(s.split()) < 2:
+    s = row[0].strip()
+    if not s:
         return False
-    letter_frac = sum(c.isalpha() or c.isspace() for c in s) / max(1, len(s))
-    return letter_frac > 0.85
+    # Reject header-fragment patterns first.
+    if s.startswith("(") or s.endswith(")") or s.endswith(","):
+        return False
+    # (a) multi-word: ≥10 chars, ≥2 words, mostly letters/spaces
+    if len(s) >= 10 and len(s.split()) >= 2:
+        letter_frac = sum(c.isalpha() or c.isspace() for c in s) / max(1, len(s))
+        if letter_frac > 0.85:
+            return True
+    # (b) single capitalized word ≥4 chars, purely alphabetic
+    if (
+        len(s) >= 4
+        and s.split() == [s]  # exactly one word
+        and s[0].isupper()
+        and s.isalpha()
+    ):
+        return True
+    return False
+
+
+def _looks_like_header_fragment(collapsed_row: list[str]) -> bool:
+    """
+    A header-fragment row is one that adds detail to the main header row
+    (e.g., "(in bytes)" under "Size", or "Controller" under "Administrative").
+
+    Rules:
+      - ≥2 non-empty cells → header-detail row (covers "I/O / Admin / Disc")
+      - OR any cell contains '(' or ')' → multi-line header cell fragment
+    Otherwise, not a header fragment (likely a band header or data row).
+    """
+    if not collapsed_row:
+        return False
+    if len(collapsed_row) >= 2:
+        return True
+    return any("(" in c or ")" in c for c in collapsed_row)
 
 
 def _build_header_and_rows(
@@ -213,20 +248,29 @@ def _build_header_and_rows(
         target_cols = len(_collapse_row(raw_rows[0]))
 
     # Step 2: build the header row, folding in sub-header rows as needed.
+    # Fold a subsequent raw row into the header IF it looks like a header
+    # detail/continuation — multi-cell sub-headers or multi-line header cell
+    # fragments like "(in bytes)". Stop when we hit the first data row or a
+    # band header row.
     header_raw = raw_rows[0]
     header_rows_consumed = 1
-    for extra in raw_rows[1:4]:  # at most 3 additional rows
-        if len(_collapse_row(header_raw)) >= target_cols:
-            break
-        # Only fold if `extra` looks header-ish: more than 1 cell and no cell
-        # looks like real data (avoid eating "00h", numeric ids, etc.)
+    for extra in raw_rows[1:5]:
         extra_collapsed = _collapse_row(extra)
-        if len(extra_collapsed) == 0:
+        if not extra_collapsed:
             header_rows_consumed += 1
             continue
-        # Data row sentinel: contains a hex byte offset, a length number,
-        # or looks like a full data row (count matches target).
-        if len(extra_collapsed) == target_cols:
+        # First cell looks like a data primary key → stop
+        if _looks_like_primary_key(extra_collapsed[0]):
+            break
+        # Full-width row with no primary-key first cell → still could be data
+        # (e.g., Figure 31's "Vendor Specific" row). Stop.
+        if len(extra_collapsed) >= target_cols:
+            break
+        # Band header → stop (don't absorb into column header)
+        if _looks_like_band_header(extra_collapsed):
+            break
+        # Must look like a header fragment to fold in
+        if not _looks_like_header_fragment(extra_collapsed):
             break
         header_raw = _merge_raw_header_rows(header_raw, extra)
         header_rows_consumed += 1
@@ -238,44 +282,36 @@ def _build_header_and_rows(
     ]
     rows = [r for r in rows if r]
 
-    # Drop leftover header-fragment rows that appear before the first full
-    # data row. These are rows like ['(in'] or ['bytes)'] that belong to a
-    # multi-line header we didn't fully absorb above. We only peel off rows
-    # at the very start, and we preserve band headers (single prose cell).
-    while rows:
-        first = rows[0]
-        if len(first) == target_cols or _looks_like_band_header(first):
-            break
-        # Append fragment content into the nearest-matching header cell so
-        # no information is dropped entirely.
-        for i, frag in enumerate(first):
-            if i < len(headers):
-                headers[i] = _clean_header_cell(headers[i] + " " + frag)
-        rows = rows[1:]
-
     # Walk rows and decide: is a short row (a) a new primary data row whose
-    # middle columns just happened to be empty, or (b) a nested sub-row that
+    # missing columns just came back empty, or (b) a nested sub-row that
     # should be folded into the previous row's description cell?
     #
-    # Heuristic: if the first cell looks like a primary key (byte/bit offset,
-    # hex value), it's a new row — PAD with empty strings so column alignment
-    # is preserved. Otherwise, fold into the previous parent row's last cell.
-    #
-    # This is what lets Figure 328 byte 391:390 stay as its own row even when
-    # its I/O / Admin / Disc cells come back as empty strings instead of None.
+    # Heuristics (in order):
+    #   1. len == target_cols OR band header → use as-is.
+    #   2. First cell looks like a primary key (byte/bit offset, hex value)
+    #      → new primary row, pad middle columns with empty strings.
+    #      Handles Figure 328 byte 391:390 where middle cells came back empty.
+    #   3. len >= 3 → new primary row, pad missing columns at the END.
+    #      Handles Figure 31 "SMART / Health (Namespace scope)" where the
+    #      Reference column was None — the name column doesn't look like a
+    #      primary key but the row clearly has multi-column data.
+    #   4. Otherwise → fold into previous parent row's description cell.
     merged_rows: list[list[str]] = []
     for r in rows:
         if len(r) == target_cols or _looks_like_band_header(r):
             merged_rows.append(r)
             continue
         if r and _looks_like_primary_key(r[0]) and len(r) < target_cols:
-            # New primary row: pad the middle with empty strings, keeping the
-            # last cell as the description. If only 1 cell, leave description
-            # empty.
+            # Primary-key row: pad middle, keep last cell as description.
             if len(r) == 1:
                 padded = [r[0]] + [""] * (target_cols - 1)
             else:
                 padded = [r[0]] + [""] * (target_cols - len(r)) + list(r[1:])
+            merged_rows.append(padded)
+            continue
+        if len(r) >= 3 and len(r) < target_cols:
+            # Likely a real data row missing its tail column(s) — pad at end.
+            padded = list(r) + [""] * (target_cols - len(r))
             merged_rows.append(padded)
             continue
         if merged_rows and len(merged_rows[-1]) == target_cols:
@@ -504,44 +540,150 @@ def _text_in_rect(page: pymupdf.Page, x0: float, y0: float, x1: float, y1: float
     return txt.strip()
 
 
-def _extract_prose_around_children(
+def _replace_children_text_based(
     page: pymupdf.Page,
     desc_cell_bbox: tuple[float, float, float, float],
-    child_bboxes: list[tuple[float, float, float, float]],
+    children: list[tuple[float, str, tuple]],
 ) -> str:
     """
-    Extract only the prose portion of a description cell that is NOT covered
-    by any nested child table. Returns the prose text pieces joined with a
-    placeholder marker <NESTED> where children should be spliced back in.
+    Replace child table content in a description cell with rendered markdown.
 
-    Rationale: find_tables gives us the description cell's full text verbatim,
-    including the text that lives inside nested sub-tables. If we keep that
-    AND also append rendered children, we duplicate content. Instead, we
-    walk y-bands of the cell and pull text only from the regions NOT covered
-    by children.
+    Instead of the old y-band clipping approach (which loses text when child
+    table bboxes sit tight against prose), this extracts the full cell text
+    and each child's text from the page, then does text-level find-and-replace.
+
+    Both extractions use page.get_text("text", clip=...), so the child's text
+    is a verbatim substring of the full cell text — the child bbox is
+    geometrically contained within the cell bbox.
+
+    Args:
+        page: the PDF page
+        desc_cell_bbox: (x0, y0, x1, y1) of the description cell
+        children: list of (center_y, rendered_markdown, child_bbox) tuples
     """
     x0, y0, x1, y1 = desc_cell_bbox
-    if not child_bboxes:
-        return _text_in_rect(page, x0, y0, x1, y1)
+    full_text = _text_in_rect(page, x0, y0, x1, y1)
+    if not full_text:
+        return "\n".join(md for _, md, _ in sorted(children, key=lambda c: c[0]))
 
-    # Sort children by y-top. Walk y-bands between children.
-    kids = sorted(child_bboxes, key=lambda b: b[1])
-    pieces: list[str] = []
-    cursor_y = y0
-    for cb in kids:
-        c_y0, c_y1 = cb[1], cb[3]
-        if c_y0 > cursor_y:
-            txt = _text_in_rect(page, x0, cursor_y, x1, c_y0)
-            if txt:
-                pieces.append(txt)
-        pieces.append("<NESTED>")
-        cursor_y = max(cursor_y, c_y1)
-    if cursor_y < y1:
-        tail = _text_in_rect(page, x0, cursor_y, x1, y1)
-        if tail:
-            pieces.append(tail)
+    # Sort children top-to-bottom so replacements don't shift later positions.
+    children_sorted = sorted(children, key=lambda c: c[0])
 
-    return "\n".join(pieces)
+    result = full_text
+    for _cy, rendered_md, child_bbox in children_sorted:
+        child_text = _text_in_rect(page, *child_bbox)
+        if not child_text:
+            result += "\n" + rendered_md
+            continue
+
+        # --- exact substring match (most common) ---
+        idx = result.find(child_text)
+        if idx >= 0:
+            result = (
+                result[:idx].rstrip()
+                + "\n" + rendered_md + "\n"
+                + result[idx + len(child_text):].lstrip()
+            )
+            continue
+
+        # --- normalized match (handles minor whitespace drift) ---
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", s).strip()
+
+        norm_result = _norm(result)
+        norm_child = _norm(child_text)
+        idx = norm_result.find(norm_child)
+        if idx >= 0:
+            # Map the normalized index back to the original string.
+            # Walk the original string, counting non-ws chars to find the
+            # start/end positions that correspond to the normalized match.
+            orig_start = _norm_index_to_original(result, idx)
+            orig_end = _norm_index_to_original(result, idx + len(norm_child))
+            result = (
+                result[:orig_start].rstrip()
+                + "\n" + rendered_md + "\n"
+                + result[orig_end:].lstrip()
+            )
+            continue
+
+        # --- line-level fallback ---
+        # Build a set of non-trivial child lines, walk parent lines, replace
+        # the first contiguous block that matches with the rendered markdown.
+        child_lines = [ln.strip() for ln in child_text.split("\n") if ln.strip()]
+        if child_lines:
+            result = _remove_lines_and_insert(result, child_lines, rendered_md)
+        else:
+            result += "\n" + rendered_md
+
+    return result.strip()
+
+
+def _norm_index_to_original(original: str, norm_idx: int) -> int:
+    """
+    Map an index in the normalized (whitespace-collapsed) version of `original`
+    back to the corresponding position in `original`.
+    """
+    norm_pos = 0
+    in_ws = False
+    for i, ch in enumerate(original):
+        if norm_pos >= norm_idx:
+            return i
+        if ch in (" ", "\t", "\n", "\r"):
+            if not in_ws:
+                norm_pos += 1  # collapsed whitespace = one space in normalized
+                in_ws = True
+        else:
+            norm_pos += 1
+            in_ws = False
+    return len(original)
+
+
+def _remove_lines_and_insert(
+    text: str, child_lines: list[str], rendered_md: str
+) -> str:
+    """
+    Remove lines belonging to a child table from `text` and insert
+    `rendered_md` where the first match was found.
+
+    Uses a contiguous-block search: finds the first line of child_lines in
+    text, then checks if subsequent lines also match. If the contiguous block
+    is found, replaces it. Otherwise falls back to set-based line removal.
+    """
+    text_lines = text.split("\n")
+    first_child = child_lines[0]
+
+    # Try contiguous block match first
+    for start_i, tl in enumerate(text_lines):
+        if tl.strip() == first_child:
+            # Check how many contiguous child lines match
+            match_count = 0
+            for j, cl in enumerate(child_lines):
+                ti = start_i + j
+                if ti < len(text_lines) and text_lines[ti].strip() == cl:
+                    match_count += 1
+                else:
+                    break
+            # Accept if we matched at least half the child lines
+            if match_count >= max(1, len(child_lines) // 2):
+                end_i = start_i + match_count
+                new_lines = text_lines[:start_i] + [rendered_md] + text_lines[end_i:]
+                return "\n".join(new_lines)
+
+    # Fallback: set-based removal (less precise but catches scattered matches)
+    child_set = set(child_lines)
+    new_lines = []
+    inserted = False
+    for tl in text_lines:
+        if tl.strip() in child_set:
+            if not inserted:
+                new_lines.append(rendered_md)
+                inserted = True
+            child_set.discard(tl.strip())
+        else:
+            new_lines.append(tl)
+    if not inserted:
+        new_lines.append(rendered_md)
+    return "\n".join(new_lines)
 
 
 def _render_table_recursive(
@@ -628,8 +770,9 @@ def _render_table_recursive(
                 per_row.setdefault(vi, []).append((cy, md, cb))
                 break
 
-    # For each row with children, rebuild the description cell from prose
-    # regions around each child bbox, then splice the rendered markdown in.
+    # For each row with children, replace child table text in the description
+    # cell with rendered markdown. Uses text-level find-and-replace instead of
+    # y-band clipping — more robust when child bboxes sit tight against prose.
     for vi, kids in per_row.items():
         if vi >= len(rows):
             continue
@@ -640,25 +783,7 @@ def _render_table_recursive(
         row_y0 = visual.bbox[1]
         row_y1 = visual.bbox[3]
         desc_bbox = (desc_x0, row_y0, desc_x1, row_y1)
-        kid_bboxes = [cb for _, _, cb in kids]
-        prose = _extract_prose_around_children(page, desc_bbox, kid_bboxes)
-
-        # Replace <NESTED> markers with rendered markdown (in y order).
-        kids_sorted = sorted(kids, key=lambda k: k[0])
-        result_parts: list[str] = []
-        for part in prose.split("\n"):
-            if part.strip() == "<NESTED>":
-                if kids_sorted:
-                    _, md, _ = kids_sorted.pop(0)
-                    result_parts.append(md)
-            else:
-                if part:
-                    result_parts.append(part)
-        # Any remaining kids (shouldn't happen, but be safe) go at the end.
-        for _, md, _ in kids_sorted:
-            result_parts.append(md)
-
-        parent_row[-1] = "\n".join(result_parts).strip()
+        parent_row[-1] = _replace_children_text_based(page, desc_bbox, kids)
 
     return headers, rows
 
