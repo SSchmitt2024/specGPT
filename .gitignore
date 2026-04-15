@@ -1,6 +1,5 @@
 nvme_spec/
 .venv/
-data/
 .claude-flow/
 .swarm/
 .mcp.json
@@ -8,3 +7,4 @@ __pycache__/
 *.pyc
 .claude
 CLAUDE.md
+/data

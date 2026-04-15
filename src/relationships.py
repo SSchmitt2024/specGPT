@@ -474,6 +474,35 @@ def summarize(edges: list[dict]) -> dict:
 # Public entry point
 
 
+def extract_hierarchy(toc: list[dict]) -> list[dict]:
+    """
+    Emit parent_of / child_of edges for every section that has a parent
+    in the TOC. E.g., section 3.1.3.3 -> child_of -> section 3.1.3.
+
+    This makes the section tree fully navigable: from any section you can
+    walk up to the parent or down to children.
+    """
+    known = {e["section_number"] for e in toc}
+    edges: list[dict] = []
+    for entry in toc:
+        sec = entry["section_number"]
+        parts = sec.split(".")
+        if len(parts) < 2:
+            continue
+        parent = ".".join(parts[:-1])
+        if parent not in known:
+            continue
+        edges.append(
+            _mk_edge(
+                source=f"section:{sec}",
+                target=f"section:{parent}",
+                edge_type="child_of",
+                evidence=f"{sec} is a sub-section of {parent}",
+            )
+        )
+    return edges
+
+
 def build_relationships(
     toc: list[dict],
     tables: list[dict],
@@ -487,6 +516,8 @@ def build_relationships(
 
     if prose_blocks:
         edges.extend(extract_from_prose(prose_blocks, lookup))
+
+    edges.extend(extract_hierarchy(toc))
 
     return dedupe(edges)
 
