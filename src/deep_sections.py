@@ -347,14 +347,25 @@ def detect_depth4_sections(
                 numbered_by_parent[d3_parent] = set()
             numbered_by_parent[d3_parent].add(d4_parent)
 
-    # Assign sequential numbers
+    # Build set of section numbers already in the base TOC so we never
+    # assign a depth-4 number that collides with an existing entry
+    # (e.g. the "Command Completion" body heading under 5.3 would
+    # otherwise be numbered 5.3.1, duplicating the real 5.3.1).
+    existing_numbers = {e["section_number"] for e in existing_toc}
+
+    # Assign sequential numbers, skipping any that collide with the base TOC
     depth4_sections = []
     for parent_num, children in parent_children.items():
         # Sort by document position
         children.sort(key=lambda c: (c["pdf_page"], c["bbox"][1]))
 
-        for idx, child in enumerate(children, start=1):
-            sec_num = f"{parent_num}.{idx}"
+        counter = 1
+        for child in children:
+            sec_num = f"{parent_num}.{counter}"
+            while sec_num in existing_numbers:
+                counter += 1
+                sec_num = f"{parent_num}.{counter}"
+            existing_numbers.add(sec_num)  # prevent self-collisions too
             depth4_sections.append({
                 "section_number": sec_num,
                 "title": child["text"],
@@ -363,6 +374,7 @@ def detect_depth4_sections(
                 "pdf_page": child["pdf_page"],
                 "source": "body_title_only",
             })
+            counter += 1
 
     return depth4_sections
 
@@ -421,9 +433,14 @@ def merge_toc(
     Merge new sections into the existing TOC, maintaining document order.
     New sections are interleaved based on target_page and level.
     """
-    # Clean new sections to match TOC schema
+    # Clean new sections to match TOC schema, skipping any whose
+    # section_number already exists in the base TOC (dedup safety net)
+    existing_numbers = {e["section_number"] for e in existing_toc}
     clean_new = []
     for s in new_sections:
+        if s["section_number"] in existing_numbers:
+            continue
+        existing_numbers.add(s["section_number"])
         clean_new.append({
             "section_number": s["section_number"],
             "title": s["title"],

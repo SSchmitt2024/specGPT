@@ -136,12 +136,41 @@ def _build_child_map(toc: list[dict]) -> dict[str, list[str]]:
     return children
 
 
-def _tables_by_section(tables: list[dict], prose_by_section: dict) -> dict[str, list[int]]:
+def _tables_by_section(
+    tables: list[dict],
+    prose_by_section: dict,
+    relationships: list[dict],
+) -> dict[str, list[int]]:
     """
-    Assign each table to the section whose prose page range contains it.
-    Falls back to printed_page matching when possible.
+    Assign each table to its parent section.
+
+    Primary source: ``contained_in`` edges from relationships.json — these
+    carry the structurally-correct figure→section mapping produced by the
+    relationship extractor.
+
+    Fallback (for any figure not covered by a ``contained_in`` edge): the
+    old page-range heuristic that finds the deepest prose section whose
+    pdf_page range contains the table's page.
     """
-    # Build (start_pdf_page, end_pdf_page, section_number) triples.
+    by_section: dict[str, list[int]] = defaultdict(list)
+    covered_figs: set[int] = set()
+
+    # --- primary: relationships.json contained_in edges ---
+    for r in relationships:
+        if r.get("type") != "contained_in":
+            continue
+        src = r.get("source", "")
+        tgt = r.get("target", "")
+        if src.startswith("figure:") and tgt.startswith("section:"):
+            try:
+                fig = int(src.split(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            sec = tgt.split(":", 1)[1]
+            by_section[sec].append(fig)
+            covered_figs.add(fig)
+
+    # --- fallback: page-range heuristic for uncovered figures ---
     ranges = []
     for sec_num, sec in prose_by_section.items():
         s = sec.get("start_pdf_page")
@@ -149,13 +178,11 @@ def _tables_by_section(tables: list[dict], prose_by_section: dict) -> dict[str, 
         if s is not None and e is not None:
             ranges.append((s, e, sec_num))
 
-    by_section: dict[str, list[int]] = defaultdict(list)
     for t in tables:
         fig = t.get("figure_number")
         pdf_page = t.get("pdf_page")
-        if fig is None or pdf_page is None:
+        if fig is None or pdf_page is None or fig in covered_figs:
             continue
-        # Find the deepest (narrowest) range that contains pdf_page.
         best = None
         best_span = None
         for s, e, sec_num in ranges:
@@ -166,6 +193,7 @@ def _tables_by_section(tables: list[dict], prose_by_section: dict) -> dict[str, 
                     best_span = span
         if best:
             by_section[best].append(fig)
+
     return by_section
 
 
@@ -229,7 +257,7 @@ def run(
 
     prose_by_section = {p["section_number"]: p for p in prose}
     children_map = _build_child_map(toc)
-    tables_map = _tables_by_section(tables, prose_by_section)
+    tables_map = _tables_by_section(tables, prose_by_section, relationships)
     rels_map = _relationships_by_section(relationships)
 
     cards: list[dict] = _load_json(OUTPUT_PATH, []) if resume else []
