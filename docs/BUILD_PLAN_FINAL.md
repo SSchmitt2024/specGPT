@@ -8,15 +8,15 @@ Built on publicly available NVMe specifications from nvmexpress.org. No propriet
 
 ---
 
-## Roadmap (3 Parts)
+## Milestone: Working Prototype (1 Month)
 
-- **Part 1 — Clean & Parse the Data** *(in progress)*: Turn the 800+ page NVMe spec into structured, queryable data. Tables, prose, relationships, metadata cards, chunks.
-- **Part 2 — Build the Demo**: Index the parsed output, wire up hybrid retrieval (vector + BM25) + generation, ship a live web app with an eval score. This is what gets shown.
-- **Part 3 — Features Beyond the Demo**: GraphRAG (knowledge graph, graph expansion, community detection, RAPTOR), agent loop, HyDE, self-reflection, reasoning transparency, caching, multi-spec support, conversation mode. Not required for the demo.
+**What ships:** A hosted web app where you type a question about the NVMe spec and get a cited answer. Parsing is solid. Retrieval is hybrid (vector + BM25 + graph). Answers cite section numbers. Eval set proves it works.
+
+**What waits:** Agent loop, RAPTOR summaries, community detection, HyDE, self-reflection, conversation mode, reasoning transparency breakdown. These make it smarter after the prototype proves the foundation.
 
 ---
 
-# PART 1 — Clean & Parse the Data
+## Phase 1: Spec Parser (Weeks 1-2)
 
 **Goal:** This is the foundation everything depends on. Parser quality directly determines answer quality. Get this right before moving forward.
 
@@ -91,15 +91,30 @@ Built on publicly available NVMe specifications from nvmexpress.org. No propriet
 - [ ] Run on full spec, spot-check across all section types
 - [ ] **Parser is not done until output is trustworthy across the spec**
 
-**Part 1 Deliverable:** JSON metadata cards, definition-enriched text chunks, structured table data, and extracted relationships — all derived from a public NVMe spec PDF.
+### 1.9 — Basic Web architecture + UI
+
+- [ ] Basic very simple UI to ask a question
+- [ ] CloudFormation templates to setup only what architecture is needed (AWS)
+- [ ] simple deploy and status script
+
+**Phase 1 Deliverable:** Web tool that already has a public NVMe spec PDF and outputs: JSON metadata cards, definition-enriched text chunks, structured table data, and extracted relationships.
 
 ---
 
-# PART 2 — Build the Demo
+## Phase 2: Knowledge Graph + Indexing + Eval (Week 3)
 
-**Goal:** Take the parsed output and ship a live web app where you type a question and get a cited answer. Hybrid retrieval (vector + BM25) + generation, no graph yet. Eval set proves it works.
+**Goal:** Build the graph from parser output, index everything for retrieval, and establish the evaluation baseline.
 
-### 2.1 — Embedding + Indexing (Supabase)
+### 2.1 — Knowledge Graph (NetworkX)
+
+- [ ] Create nodes from all extracted entities: commands, data structures, log pages, features, fields, sections, figures
+- [ ] Create edges from all extracted relationships (structural + LLM-assisted)
+- [ ] Each node stores: entity name, type, section ID, metadata
+- [ ] Each edge stores: relationship type, source section, confidence (deterministic vs LLM-extracted)
+- [ ] Serialize graph to disk (JSON or pickle) for reuse
+- [ ] **Validate:** For known concepts, verify the graph connects all the pieces an engineer would need
+
+### 2.2 — Embedding + Indexing (Supabase)
 
 - [ ] Choose embedding model (Voyage AI free tier or local `nomic-embed-text`)
 - [ ] Embed all definition-enriched prose chunks
@@ -108,22 +123,30 @@ Built on publicly available NVMe specifications from nvmexpress.org. No propriet
 - [ ] Configure full-text search index for BM25
 - [ ] Add metadata filters: spec version, section number, content type, spec document
 
-### 2.2 — Eval Set
+### 2.3 — Eval Set
 
 - [ ] Auto-generate QA pairs from metadata cards using Haiku (lookup, structural, relational questions)
 - [ ] Hand-verify 50-100 questions as ground-truth eval set
 - [ ] Hand-write 10-20 hard procedural questions that require multi-section synthesis
 - [ ] Store as `eval_set.json` with question, expected answer, source sections, difficulty rating
 
-### 2.3 — Hybrid Retrieval
+**Phase 2 Deliverable:** A stored knowledge graph, a fully indexed vector + BM25 database, and a verified eval set.
+
+---
+
+## Phase 3: Retrieval Pipeline + Web App (Week 4)
+
+**Goal:** Build hybrid retrieval, wire it to generation, deploy as a website.
+
+### 3.1 — Hybrid Retrieval
 
 - [ ] **BM25 search:** Exact identifiers, hex values, LIDs, field names, acronyms
 - [ ] **Vector search:** Semantic similarity using definition-enriched embeddings
 - [ ] **Reciprocal Rank Fusion:** Merge BM25 + vector result lists using `score = Σ 1/(k + rank_i)`
+- [ ] **Graph expansion:** For top retrieved chunks, look up their graph nodes, walk 1-2 hops, pull in neighboring chunks
 - [ ] **Cross-encoder reranking:** Local `cross-encoder/ms-marco-MiniLM` scores all candidates, keep top 5-7
-- [ ] *(Graph expansion deferred to Part 3)*
 
-### 2.4 — Generation
+### 3.2 — Generation
 
 - [ ] Single Sonnet call with strict system prompt:
   - Use ONLY provided context
@@ -133,7 +156,7 @@ Built on publicly available NVMe specifications from nvmexpress.org. No propriet
   - For procedural questions: numbered steps in execution order
 - [ ] Context assembly: top reranked chunks + source metadata, 3-5k token max
 
-### 2.5 — Web Application
+### 3.3 — Web Application
 
 - [ ] **Backend:** FastAPI
   - POST endpoint accepting query string
@@ -150,57 +173,25 @@ Built on publicly available NVMe specifications from nvmexpress.org. No propriet
 - [ ] **Deployment:**
   - Containerize with Docker
   - Deploy to a lightweight cloud provider (Railway, Fly.io, or a small AWS setup on your existing infra)
-  - CloudFormation templates to set up only what architecture is needed (AWS)
-  - Simple deploy and status script
   - Public URL anyone can access
   - Document the re-indexing process for new spec versions
 
-### 2.6 — Demo Evaluation
+### 3.4 — Prototype Evaluation
 
 - [ ] Run full eval set against the pipeline
 - [ ] Score by question type: lookup, structural, relational, procedural
 - [ ] Document accuracy numbers — this is the demo metric
-- [ ] Identify top failure patterns for Part 3 improvements
+- [ ] Identify top failure patterns for Phase 4 improvements
 
-**Part 2 Deliverable: THE DEMO.** A live website where you type an NVMe spec question and get a cited answer. Eval scores documented. Ready to show people.
+**Phase 3 Deliverable: THE PROTOTYPE.** A live website where you type an NVMe spec question and get a cited answer. Eval scores documented. Ready to show people.
 
 ---
 
-# PART 3 — Features Beyond the Demo
+## Phase 4: Make It Smarter (Post-Prototype)
 
-Everything below improves the demo incrementally. Build based on what the eval scores and real usage tell you is needed most. **None of this ships with the demo.**
+Everything below improves the prototype incrementally. Build based on what the eval scores and real usage tell you is needed most.
 
-### 3.1 — GraphRAG
-
-**Knowledge Graph (NetworkX)**
-
-- [ ] Create nodes from all extracted entities: commands, data structures, log pages, features, fields, sections, figures
-- [ ] Create edges from all extracted relationships (structural + LLM-assisted)
-- [ ] Each node stores: entity name, type, section ID, metadata
-- [ ] Each edge stores: relationship type, source section, confidence (deterministic vs LLM-extracted)
-- [ ] Serialize graph to disk (JSON or pickle) for reuse
-- [ ] **Validate:** For known concepts, verify the graph connects all the pieces an engineer would need
-
-**Graph Expansion in Retrieval**
-
-- [ ] For top retrieved chunks, look up their graph nodes, walk 1-2 hops, pull in neighboring chunks
-- [ ] Add as additional retrieval path alongside BM25 + vector in RRF
-
-**RAPTOR Hierarchical Summaries**
-
-- [ ] Cluster semantically similar chunks using GMM
-- [ ] Summarize each cluster with Haiku, repeat recursively
-- [ ] Multi-level abstraction tree for retrieval at different granularities
-- [ ] Embed all summary levels into Supabase
-
-**Community Detection (Idea Clusters)**
-
-- [ ] Run Louvain or Leiden on the NetworkX graph
-- [ ] Each community = a concept cluster spanning multiple sections
-- [ ] Generate labels and summaries per community
-- [ ] Enrich retrieval: when a chunk belongs to a community, pull related chunks from that cluster
-
-### 3.2 — Agent Loop
+### 4.1 — Agent Loop
 
 - [ ] Query understanding (Haiku): classify question type, extract identifiers, estimate complexity
 - [ ] Simple questions skip the loop, complex questions enter iterative retrieval
@@ -208,19 +199,19 @@ Everything below improves the demo incrementally. Build based on what the eval s
 - [ ] Each iteration compressed to 50-100 token summary — raw chunks discarded between iterations
 - [ ] Exit when sufficient or max iterations reached
 
-### 3.3 — HyDE Search
+### 4.2 — HyDE Search
 
 - [ ] Haiku generates a hypothetical answer to the question
 - [ ] Embed the hypothetical answer, search against chunk embeddings
 - [ ] Add as third retrieval path in RRF alongside BM25 and vector search
 
-### 3.4 — Self-Reflection Verification
+### 4.3 — Self-Reflection Verification
 
 - [ ] Post-generation Haiku call checks: grounding, relevance, completeness
 - [ ] If any check fails: targeted re-retrieval + regenerate (1 retry max)
 - [ ] Confidence indicator: HIGH / MEDIUM / LOW
 
-### 3.5 — Reasoning Transparency
+### 4.4 — Reasoning Transparency
 
 - [ ] Structure answers to show evidence chain per claim:
 
@@ -238,37 +229,55 @@ REASONING:
 CONFIDENCE: HIGH
 ```
 
-### 3.6 — Caching
+### 4.5 — RAPTOR Hierarchical Summaries
+
+- [ ] Cluster semantically similar chunks using GMM
+- [ ] Summarize each cluster with Haiku, repeat recursively
+- [ ] Multi-level abstraction tree for retrieval at different granularities
+- [ ] Embed all summary levels into Supabase
+
+### 4.6 — Community Detection (Idea Clusters)
+
+- [ ] Run Louvain or Leiden on the NetworkX graph
+- [ ] Each community = a concept cluster spanning multiple sections
+- [ ] Generate labels and summaries per community
+- [ ] Enrich retrieval: when a chunk belongs to a community, pull related chunks from that cluster
+
+### 4.7 — Caching
 
 - [ ] Normalized query → cached full answer
 - [ ] Spec content is static between versions — cache aggressively
 - [ ] Optional: semantic caching for similar questions
 
-### 3.7 — Domain-Tuned Embeddings
+### 4.8 — Domain-Tuned Embeddings
 
 - [ ] Generate training pairs from graph relationships
 - [ ] Fine-tune a small embedding model with contrastive learning
 - [ ] Or continue enriching embedding input with more graph context
 
-### 3.8 — Additional Spec Documents
+---
+
+## Phase 5: Expand (Post-Prototype)
+
+### 5.1 — Additional Spec Documents
 
 - [ ] Index additional public NVMe specs: base, transport (PCIe, TCP, RDMA, FC), management interface
 - [ ] Track spec version per entity for version-scoped queries
 - [ ] Support "what changed between version X and Y" queries
 
-### 3.9 — Conversation Mode
+### 5.2 — Conversation Mode
 
 - [ ] Rolling conversation summaries (50-100 tokens per turn)
 - [ ] Prepend to query understanding for follow-up context
 - [ ] New topic detection to reset context
 
-### 3.10 — User Feedback
+### 5.3 — User Feedback
 
 - [ ] Thumbs up/down on answers
 - [ ] Track and categorize failures by component
 - [ ] Use feedback to prioritize improvements
 
-### 3.11 — Advanced Features
+### 5.4 — Advanced Features
 
 - [ ] Admin interface for manually adding/correcting graph edges
 - [ ] "Explore" mode: type a concept, see its graph neighbors and related content
@@ -282,8 +291,8 @@ CONFIDENCE: HIGH
 |---|---|---|
 | Spec parsing | Python (`pdfplumber` / `pymupdf`) | Free |
 | Knowledge graph | NetworkX (serialized to disk) | Free |
-| Community detection | Louvain / Leiden (Part 3) | Free |
-| RAPTOR summaries | scikit-learn GMM + Haiku (Part 3) | One-time ~$2-5 |
+| Community detection | Louvain / Leiden (post-prototype) | Free |
+| RAPTOR summaries | scikit-learn GMM + Haiku (post-prototype) | One-time ~$2-5 |
 | Embeddings | Voyage AI free tier or local `nomic-embed-text` | Free |
 | Vector DB + BM25 | Supabase (pgvector + full-text search) | Free tier |
 | Cross-encoder reranker | `cross-encoder/ms-marco-MiniLM` (local) | Free |
@@ -304,16 +313,15 @@ CONFIDENCE: HIGH
 | Hosting | Monthly | ~$5-10 |
 | Daily usage (20-30 questions) | Per day | ~$0.50-1.50 |
 
----
 
-## 1-Month Demo Checklist
+## 1-Month Prototype Checklist
 
-| Week | Part | Focus | Done When |
-|---|---|---|---|
-| 1 | Part 1 | Table extraction + validation | Tables parse cleanly for 10+ diverse spec sections |
-| 2 | Part 1 | Prose, relationships, cards, chunks | Parser runs on entire spec with validated output |
-| 3 | Part 2 | Supabase indexing + eval set | Search returns relevant results, 50-100 ground-truth questions verified |
-| 4 | Part 2 | Hybrid retrieval + generation + web app deployed | Live website: type a question, get a cited answer, eval scores documented |
+| Week | Focus | Done When |
+|---|---|---|
+| 1 | Table extraction + validation | Tables parse cleanly for 10+ diverse spec sections |
+| 2 | Full parser: prose, relationships, cards, chunks | Parser runs on entire spec with validated output |
+| 3 | NetworkX graph + Supabase indexing + eval set | Graph connects known concepts, search returns relevant results |
+| 4 | Hybrid retrieval + generation + web app deployed | Live website: type a question, get a cited answer, eval scores documented |
 
 ---
 
@@ -321,10 +329,10 @@ CONFIDENCE: HIGH
 
 | Risk | Mitigation |
 |---|---|
-| Tables don't parse cleanly from the PDF | Part 1 priority. If `pdfplumber` fails, try `pymupdf` or HTML source. Find out immediately |
+| Tables don't parse cleanly from the PDF | Week 1 priority. If `pdfplumber` fails, try `pymupdf` or HTML source. Find out immediately |
 | LLM relationship extraction produces noise | Structural extraction is the reliable base, LLM extraction is supplementary. Validate on known sections. Flag LLM-extracted edges with lower confidence |
 | Hybrid retrieval doesn't beat vector-only enough | Eval set measures this directly. If extra layers don't improve scores, simplify |
-| Demo accuracy too low to show people | Focus on lookup and structural questions first — high accuracy with good parsing. Procedural accuracy improves in Part 3 with agent loop + graph |
+| Prototype accuracy too low to show people | Focus on lookup and structural questions first — high accuracy with good parsing. Procedural accuracy improves in Phase 4 with agent loop |
 | Rate limits during queries | 3-5k token max per call. No single call large enough to trigger cooldowns |
-| Hosting costs grow | Caching (3.6) eliminates repeat query costs. Free tiers cover demo scale |
+| Hosting costs grow | Caching (Phase 4.7) eliminates repeat query costs. Free tiers cover prototype scale |
 | Someone asks about content not in the indexed spec | Answer states "this information is not in the currently indexed specification" — never hallucinate |

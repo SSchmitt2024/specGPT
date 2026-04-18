@@ -118,8 +118,12 @@ def _load_json(path: str, default):
 
 def _save_json(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _flatten_prose(section: dict) -> str:
@@ -197,6 +201,8 @@ def run(limit: int | None = None, resume: bool = True) -> None:
         print(f"[{i}/{len(candidates)}] {section_number} {title[:60]}")
         try:
             parsed, result = generate_json(user, system=SYSTEM_PROMPT, max_output_tokens=4096)
+        except (ImportError, ModuleNotFoundError):
+            raise
         except Exception as e:  # noqa: BLE001
             print(f"  ! failed: {e}")
             continue

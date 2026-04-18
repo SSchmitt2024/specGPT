@@ -54,9 +54,22 @@ STATE_PATH = "data/cards_state.json"
 DEFAULT_SPEC_DOCUMENT = "NVM Express Base Specification"
 DEFAULT_SPEC_VERSION = "2.1"
 
-# LLM-summary gating
-MIN_PROSE_CHARS = 200
+# LLM-summary gating.
+#
+# Originally MIN_PROSE_CHARS was 200 — anything shorter got a structural stub
+# with no LLM call. That left 290/1036 cards empty (definition-style sections
+# under §1.5/§1.6/§1.7 are typically a single short sentence) and a rerun
+# couldn't recover them because cards_state.json marked them "processed" the
+# first time around.
+#
+# New behaviour: any section with at least MIN_PROSE_CHARS of body text is
+# summarized directly. Sections with shorter or zero prose are summarized from
+# a synthetic "skeleton" built from the title, child-section titles, and the
+# table captions that live under this section. That keeps every section
+# represented in the vector index without re-scraping the PDF.
+MIN_PROSE_CHARS = 50
 MAX_PROSE_CHARS = 6000
+MIN_SKELETON_SIGNAL = 1  # at least 1 child or 1 table to bother prompting
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +101,54 @@ Summarize for engineers. Return JSON.
 """
 
 
+SKELETON_TEMPLATE = """Section {section_number} — {title}
+
+This section has minimal or no body prose in the spec. Use the structural \
+context below to write a short, accurate summary of what this section \
+*defines or organizes* — do NOT invent technical detail. Anchor on the \
+section title and the names of its children/tables.
+
+{parent_block}
+CHILD SUBSECTIONS:
+{child_block}
+
+{tables_block}
+
+Return JSON. Keep the summary to 1-2 sentences max.
+"""
+
+
+def _build_skeleton_prompt(
+    section_number: str,
+    title: str,
+    parent_title: str | None,
+    child_pairs: list[tuple[str, str]],
+    table_captions: list[str],
+) -> str:
+    parent_block = (
+        f"PARENT SECTION: {parent_title}\n\n" if parent_title else ""
+    )
+    if child_pairs:
+        child_block = "\n".join(
+            f"  - {sn} {ct}" for sn, ct in child_pairs[:25]
+        )
+    else:
+        child_block = "  (none)"
+    if table_captions:
+        tables_block = "TABLES IN THIS SECTION:\n" + "\n".join(
+            f"  - {c}" for c in table_captions[:10]
+        )
+    else:
+        tables_block = ""
+    return SKELETON_TEMPLATE.format(
+        section_number=section_number,
+        title=title,
+        parent_block=parent_block,
+        child_block=child_block,
+        tables_block=tables_block,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 
@@ -100,8 +161,12 @@ def _load_json(path: str, default):
 
 def _save_json(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _flatten_prose(section: dict) -> tuple[str, list[int]]:
@@ -210,6 +275,17 @@ def _relationships_by_section(rels: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+def _parse_llm_card(parsed) -> dict:
+    if not isinstance(parsed, dict):
+        return {"summary": "", "keywords": []}
+    summary = parsed.get("summary", "") or ""
+    keywords = parsed.get("keywords", []) or []
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+    return {"summary": summary.strip(), "keywords": keywords}
+
+
 def _summarize(section_number: str, title: str, prose: str, table_figs: list[int]) -> dict:
     """LLM call — returns {'summary': str, 'keywords': [str,...]}."""
     if len(prose) > MAX_PROSE_CHARS:
@@ -227,14 +303,23 @@ def _summarize(section_number: str, title: str, prose: str, table_figs: list[int
     )
 
     parsed, _ = generate_json(user, system=SYSTEM_PROMPT, max_output_tokens=512)
-    if not isinstance(parsed, dict):
-        return {"summary": "", "keywords": []}
-    summary = parsed.get("summary", "") or ""
-    keywords = parsed.get("keywords", []) or []
-    if not isinstance(keywords, list):
-        keywords = []
-    keywords = [str(k).strip() for k in keywords if str(k).strip()]
-    return {"summary": summary.strip(), "keywords": keywords}
+    return _parse_llm_card(parsed)
+
+
+def _summarize_from_skeleton(
+    section_number: str,
+    title: str,
+    parent_title: str | None,
+    child_pairs: list[tuple[str, str]],
+    table_captions: list[str],
+) -> dict:
+    """LLM call for sections with no usable prose. Uses title + children +
+    table captions instead. Returns the same shape as ``_summarize``."""
+    user = _build_skeleton_prompt(
+        section_number, title, parent_title, child_pairs, table_captions
+    )
+    parsed, _ = generate_json(user, system=SYSTEM_PROMPT, max_output_tokens=384)
+    return _parse_llm_card(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +349,24 @@ def run(
     card_by_id = {c["section_id"]: c for c in cards}
     state: dict = _load_json(STATE_PATH, {"processed": []}) if resume else {"processed": []}
     processed = set(state["processed"])
+
+    # Resume semantics: a section counts as "processed" only if its existing
+    # card actually has a summary. Sections marked processed in a prior run
+    # but with empty summary (the old behaviour: structural stub gated by
+    # MIN_PROSE_CHARS) get re-attempted automatically.
+    processed = {
+        sn for sn in processed
+        if card_by_id.get(sn, {}).get("summary")
+    }
+
+    # Lookups for skeleton-fallback context.
+    title_by_id = {e["section_number"]: e["title"] for e in toc}
+    table_caption_by_fig: dict[int, str] = {}
+    for t in tables:
+        fn = t.get("figure_number")
+        cap = (t.get("caption") or t.get("title") or "").strip()
+        if fn is not None and cap:
+            table_caption_by_fig[fn] = cap
 
     # Process every TOC entry (keeps ordering stable).
     targets = toc[:]
@@ -304,27 +407,66 @@ def run(
             "level": entry.get("level"),
         }
 
-        if len(prose_text) >= MIN_PROSE_CHARS:
-            try:
-                print(f"[{i}/{len(targets)}] {sec_num} {title[:60]}")
+        # Preserve any prior LLM output we already have on this card so we
+        # never blank it out by accident on a re-run.
+        prior = card_by_id.get(sec_num)
+        if prior and prior.get("summary"):
+            base_card["summary"] = prior["summary"]
+            base_card["keywords"] = prior.get("keywords", [])
+
+        # Pick a summarization strategy.
+        attempted_llm = False
+        try:
+            if len(prose_text) >= MIN_PROSE_CHARS:
+                attempted_llm = True
+                print(f"[{i}/{len(targets)}] {sec_num} (prose {len(prose_text)}c) {title[:55]}")
                 llm_out = _summarize(sec_num, title, prose_text, table_figs)
-                base_card["summary"] = llm_out["summary"]
-                base_card["keywords"] = llm_out["keywords"]
-            except Exception as e:  # noqa: BLE001
-                print(f"  ! summary failed: {e}")
-        else:
-            # Structural stub — no LLM call.
-            pass
+                if llm_out["summary"]:
+                    base_card["summary"] = llm_out["summary"]
+                    base_card["keywords"] = llm_out["keywords"]
+            else:
+                child_ids = children_map.get(sec_num, [])
+                child_pairs = [
+                    (cid, title_by_id.get(cid, "")) for cid in child_ids
+                ]
+                table_caps = [
+                    f"Figure {fn}: {table_caption_by_fig.get(fn, '')}".rstrip(": ")
+                    for fn in table_figs
+                ]
+                signal = len(child_pairs) + len(table_caps)
+                if signal >= MIN_SKELETON_SIGNAL or prose_text:
+                    attempted_llm = True
+                    parent_title = title_by_id.get(_parent_section(sec_num) or "")
+                    print(f"[{i}/{len(targets)}] {sec_num} (skeleton "
+                          f"children={len(child_pairs)} tables={len(table_caps)} "
+                          f"prose={len(prose_text)}c) {title[:45]}")
+                    llm_out = _summarize_from_skeleton(
+                        sec_num, title, parent_title, child_pairs, table_caps,
+                    )
+                    if llm_out["summary"]:
+                        base_card["summary"] = llm_out["summary"]
+                        base_card["keywords"] = llm_out["keywords"]
+        except (ImportError, ModuleNotFoundError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! summary failed: {e}")
 
         # Upsert
         if sec_num in card_by_id:
-            # Merge in place
             card_by_id[sec_num].update(base_card)
         else:
             cards.append(base_card)
             card_by_id[sec_num] = base_card
 
-        processed.add(sec_num)
+        # Only mark "processed" if we actually have a summary on the card.
+        # That way a future re-run with a better prompt or higher signal
+        # automatically retries any section we couldn't summarize.
+        if base_card["summary"]:
+            processed.add(sec_num)
+        elif not attempted_llm:
+            # Pure structural stub with nothing to attempt — don't mark
+            # processed either (keeps the door open for later enrichment).
+            pass
         state["processed"] = sorted(processed)
 
         _save_json(OUTPUT_PATH, cards)

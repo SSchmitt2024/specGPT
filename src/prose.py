@@ -238,7 +238,19 @@ def scan_document(
     We read the whole doc once up front so the section-splitting pass has
     O(pages) access without re-parsing each PDF page.
     """
+    # Silence MuPDF's non-fatal structure-tree warnings. Same issue as in
+    # tables.py — find_tables() prints "No common ancestor..." on nearly
+    # every page of the NVMe PDF and floods the terminal.
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)
+    except Exception:  # noqa: BLE001
+        pass
+
     doc = pymupdf.open(pdf_path)
+    total = last_page_idx - first_page_idx + 1
+    print(f"[prose] scanning {total} pages (pdf idx "
+          f"{first_page_idx}..{last_page_idx})", flush=True)
+
     pages: list[dict] = []
     for pi in range(first_page_idx, last_page_idx + 1):
         page = doc[pi]
@@ -252,6 +264,12 @@ def scan_document(
                 "table_bboxes": tbboxes,
             }
         )
+
+        done = pi - first_page_idx + 1
+        if done % 25 == 0 or done == total:
+            print(f"  [prose] page {done}/{total} "
+                  f"(pdf idx {pi}, printed p.{pi - PAGE_OFFSET})", flush=True)
+
     doc.close()
     return pages
 
@@ -683,18 +701,25 @@ def extract_prose(
     return sections, definitions
 
 
+DEFINITION_SECTION_PREFIXES = ("1.5.", "1.6.", "1.7.")
+
+
 def _build_definitions(sections: list[dict]) -> dict[str, str]:
     """
-    Walk the 1.5.x subsections (each one is a single defined term) and
-    flatten them into a {term: definition} lookup. The term is the section
-    title; the definition is all paragraphs joined.
+    Walk the leaf subsections of the spec's three definition sections —
+    1.5 (general), 1.6 (I/O Command Set specific), and 1.7 (NVM Command
+    Set specific) — and flatten them into a {term: definition} lookup.
+    The term is the section title; the definition is all paragraphs joined.
+
+    1.7.2 in particular is where `LBA` lives; without 1.6/1.7 coverage the
+    extractor silently dropped LBA and ~13 other core terms.
     """
     out: dict[str, str] = {}
     for s in sections:
         sn = s["section_number"]
-        if not sn.startswith("1.5."):
+        if not any(sn.startswith(p) for p in DEFINITION_SECTION_PREFIXES):
             continue
-        # Skip 1.5 parent itself; only leaf subsections
+        # Skip the parent (1.5/1.6/1.7) itself; only leaf subsections.
         if sn.count(".") < 1:
             continue
         term = s["title"].strip()

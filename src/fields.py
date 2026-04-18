@@ -374,6 +374,50 @@ def extract_fields(tables: list[dict]) -> list[dict]:
     return fields
 
 
+REGISTER_CAPTION_RE = re.compile(
+    r"^(?:Figure\s+\d+\s*[:\-\u2013\u2014]\s*)?"
+    r"Offset\s+([0-9A-Fa-f]+h)\s*[:\-\u2013\u2014\uFFFD?]\s*"
+    r"([A-Z][A-Z0-9]+)\s*[\-\u2013\u2014\uFFFD?]\s*"
+    r"(.+)$"
+)
+
+
+def synthesize_register_containers(tables: list[dict]) -> list[dict]:
+    """
+    Scan table captions for register containers (``Offset Xh: ABBR – Full Name``)
+    and emit one pseudo-field record per unique register. Lets callers resolve
+    ``idx['CAP']`` to the container itself, not just its sub-fields.
+    """
+    records: list[dict] = []
+    seen: set[str] = set()
+    for table in tables:
+        cap = (table.get("caption") or "").strip()
+        m = REGISTER_CAPTION_RE.match(cap)
+        if not m:
+            continue
+        offset, abbr, full_name = m.group(1), m.group(2), m.group(3).strip()
+        if abbr in seen:
+            continue
+        seen.add(abbr)
+        records.append({
+            "field_name": abbr,
+            "full_name": full_name,
+            "parent_figure": table.get("figure_number"),
+            "parent_caption": cap,
+            "parent_type": "register_container",
+            "offset": offset,
+            "offset_type": "offset",
+            "requirements": None,
+            "register_type": None,
+            "register_reset": None,
+            "values": None,
+            "cross_refs": None,
+            "description": f"{full_name} register, located at offset {offset}.",
+            "spec_page": table.get("printed_page"),
+        })
+    return records
+
+
 def build_field_index(fields: list[dict]) -> dict[str, list[dict]]:
     """
     Build a reverse index: abbreviation -> list of field records.
@@ -403,6 +447,10 @@ if __name__ == "__main__":
 
     fields = extract_fields(tables)
     print(f"extracted {len(fields)} field definitions")
+
+    register_containers = synthesize_register_containers(tables)
+    fields.extend(register_containers)
+    print(f"synthesized {len(register_containers)} register-container entries")
 
     # Stats
     by_type = {}

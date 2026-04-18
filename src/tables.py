@@ -933,9 +933,22 @@ def extract_tables(
     - `first_content_page_idx`: skip front matter (cover, TOC)
     - `last_content_page_idx`: optional end index (inclusive); default = last page
     """
+    # Silence MuPDF's non-fatal structure-tree warnings. The NVMe PDF triggers
+    # "format error: No common ancestor in structure tree" on nearly every
+    # page via find_tables() -> get_pixmap(); the warnings are cosmetic and
+    # flood the terminal otherwise.
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)
+    except Exception:  # noqa: BLE001
+        pass
+
     doc = pymupdf.open(pdf_path)
     if last_content_page_idx is None:
         last_content_page_idx = doc.page_count - 1
+
+    total_pages = last_content_page_idx - first_content_page_idx + 1
+    print(f"[tables] scanning {total_pages} pages (pdf idx "
+          f"{first_content_page_idx}..{last_content_page_idx})", flush=True)
 
     all_tables: list[dict] = []
     for i in range(first_content_page_idx, last_content_page_idx + 1):
@@ -943,6 +956,15 @@ def extract_tables(
         page_tables = _extract_page_tables(page, i, page_offset)
         all_tables.extend(page_tables)
 
+        # Progress every 25 pages (and at the end) so long runs don't look hung.
+        done = i - first_content_page_idx + 1
+        if done % 25 == 0 or done == total_pages:
+            print(f"  [tables] page {done}/{total_pages} "
+                  f"(pdf idx {i}, printed p.{i - page_offset})  "
+                  f"slices-so-far={len(all_tables)}", flush=True)
+
+    print(f"[tables] merging continuations across {len(all_tables)} raw slices...",
+          flush=True)
     merged = _merge_continuations(all_tables)
 
     # Strip internal-only fields before returning

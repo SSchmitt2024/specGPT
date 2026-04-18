@@ -135,9 +135,20 @@ def scan_body_headings(
     Scan all body pages and return a flat list of bold heading lines
     in document order, each tagged with pdf_page.
     """
+    # Silence MuPDF's cosmetic structure-tree warnings — same rationale as
+    # tables.py and prose.py.
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)
+    except Exception:  # noqa: BLE001
+        pass
+
     doc = pymupdf.open(pdf_path)
     if last_page is None:
         last_page = doc.page_count - 1
+
+    total = last_page - first_page + 1
+    print(f"[deep_sections] scanning {total} pages for bold headings "
+          f"(pdf idx {first_page}..{last_page})", flush=True)
 
     all_headings = []
     for pi in range(first_page, last_page + 1):
@@ -147,6 +158,11 @@ def scan_body_headings(
             h["pdf_page"] = pi
             h["printed_page"] = pi - PAGE_OFFSET
         all_headings.extend(headings)
+
+        done = pi - first_page + 1
+        if done % 50 == 0 or done == total:
+            print(f"  [deep_sections] page {done}/{total} "
+                  f"(headings-so-far={len(all_headings)})", flush=True)
 
     doc.close()
     return all_headings

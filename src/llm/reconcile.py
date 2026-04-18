@@ -128,8 +128,12 @@ def _load_json(path: str, default):
 
 def _save_json(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +206,7 @@ def dedup_edges(edges: list[dict]) -> list[dict]:
             continue
         existing["confirmed_by"].add(e.get("confidence", "unknown"))
         # Upgrade confidence if the new edge is stronger.
+        
         if e.get("confidence") == "deterministic":
             existing["confidence"] = "deterministic"
             if "evidence" in e:
