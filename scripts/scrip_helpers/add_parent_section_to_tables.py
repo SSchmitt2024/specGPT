@@ -11,7 +11,7 @@ Logic source: re-uses `build_section_lookup` + `section_for_page` from
 `contained_in` edges in `relationships.json` (single source of truth).
 
 Usage:
-    python scripts/add_parent_section_to_tables.py
+    python scripts/scrip_helpers/add_parent_section_to_tables.py
 """
 
 from __future__ import annotations
