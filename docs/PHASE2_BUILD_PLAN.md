@@ -78,7 +78,7 @@ PHASE 1 OUTPUTS (data/)
 │    lookup     → "What are bits 7:4 of CDW10?"   │
 │    structural → "How is the SQ organized?"      │
 │    relational → "How do FID 0x01 and 0x12       │
-│                  interact?"                      │
+│                  interact?"                     │
 │    procedural → "How do I implement SGLs?"      │
 │                                                 │
 │  Step 2 — Extract entities:                     │
@@ -95,7 +95,7 @@ PHASE 1 OUTPUTS (data/)
        ├─────────────────────────────────────┐
        ▼                                     ▼
   type == "lookup"                    all other types
-  AND entities found                       │
+  AND entities found                        │
        │                                    │
        ▼                                    ▼
 ┌──────────────────────┐     ┌──────────────────────────────────┐

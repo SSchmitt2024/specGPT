@@ -72,7 +72,6 @@ What we extract from the NVMe spec PDF and why each piece exists.
 **Source:** `prose.py`
 **What it is:** All non-table text per section, split into paragraphs, with normative language tagged.
 
-### QUESTION. are these the chunks will be embedding and storing into a vector DB?
 
 ```json
 {
