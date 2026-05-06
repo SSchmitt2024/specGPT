@@ -1,7 +1,7 @@
 """
 Phase 2 - Orchestration Layer
 
-Wires together query_processor → (structured_lookup OR hybrid_search) →
+Wires together query_processor → (structured_lookup AND hybrid_search) →
 reranker → generator. Each stage emits structured tracing data for the
 debug UI.
 
@@ -9,9 +9,22 @@ Designed to be called by the FastAPI app (app.py). Returns full pipeline
 trace + final answer + citations, making it easy to wire a frontend that
 visualizes every decision and result.
 
-    result = orchestrate("What is bit 7:4 of CDW10?", debug=True)
-    answer = result["answer"]
-    trace = result["pipeline_trace"]  # list of PipelineStage dicts
+All high-impact tunable parameters are exposed as config:
+  - vector_search.top_k
+  - bm25_search.top_k
+  - rrf_merge.k
+  - rrf_output.top_k
+  - reranker.top_k
+  - query_processor.max_subqueries
+  - reranker.model_name
+
+    config = PipelineConfig(
+        vector_topk=15,
+        bm25_topk=15,
+        rrf_k=45,
+        final_rerank_topk=10,
+    )
+    result = orchestrate("What is bit 7:4 of CDW10?", config=config)
 """
 
 from __future__ import annotations
@@ -23,6 +36,28 @@ from typing import Any
 
 from src.pipeline import query_processor, retriever, search, reranker
 from src.pipeline.query_processor import QueryDecomposition
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration for all tunable high-impact parameters."""
+    # Search parameters
+    vector_topk: int = 10
+    bm25_topk: int = 10
+
+    # RRF merge parameters
+    rrf_k: int = 60
+    rrf_output_topk: int = 20
+
+    # Reranking parameters
+    final_rerank_topk: int = 7
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    # Query decomposition parameters
+    max_subqueries: int = 3
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
@@ -69,24 +104,22 @@ def hybrid_search(
     query: str,
     sub_queries: list[str] | None = None,
     *,
-    top_k_per_method: int = 10,
-    top_k_rrf: int = 20,
-    rerank: bool = False,
+    config: PipelineConfig | None = None,
 ) -> tuple[list[dict], list[PipelineStage]]:
     """
     Orchestrate hybrid retrieval: vector + BM25 per sub-query, then RRF merge.
 
     Args:
-        query: original user query (for reranking context, if rerank=True).
+        query: original user query.
         sub_queries: decomposed queries. If None, use [query].
-        top_k_per_method: top-K candidates per search method per sub-query.
-        top_k_rrf: output size after RRF merge (before reranking).
-        rerank: if True, also rerank with cross-encoder.
+        config: PipelineConfig with tunable parameters. Defaults to PipelineConfig().
 
     Returns:
-        (chunks, sub_trace) where chunks is RRF-merged results (optionally
-        reranked) and sub_trace is list of PipelineStage dicts.
+        (chunks, sub_trace) where chunks is RRF-merged results and sub_trace
+        is list of PipelineStage dicts.
     """
+    if config is None:
+        config = PipelineConfig()
     if sub_queries is None:
         sub_queries = [query]
 
@@ -96,17 +129,17 @@ def hybrid_search(
     # Step 1: Vector + BM25 per sub-query
     for i, sq in enumerate(sub_queries):
         start = time.time()
-        vec_results = search.vector_search(sq, top_k=top_k_per_method)
+        vec_results = search.vector_search(sq, top_k=config.vector_topk)
         took_vec = time.time() - start
 
         start = time.time()
-        bm25_results = search.bm25_search(sq, top_k=top_k_per_method)
+        bm25_results = search.bm25_search(sq, top_k=config.bm25_topk)
         took_bm25 = time.time() - start
 
         sub_trace.append(
             PipelineStage(
                 stage=f"hybrid_search.vector_search_q{i}",
-                input={"query": sq, "top_k": top_k_per_method},
+                input={"query": sq, "top_k": config.vector_topk},
                 output={"results": _result_summary(vec_results, limit=3), "count": len(vec_results)},
                 took_ms=took_vec * 1000,
             )
@@ -114,7 +147,7 @@ def hybrid_search(
         sub_trace.append(
             PipelineStage(
                 stage=f"hybrid_search.bm25_search_q{i}",
-                input={"query": sq, "top_k": top_k_per_method},
+                input={"query": sq, "top_k": config.bm25_topk},
                 output={"results": _result_summary(bm25_results, limit=3), "count": len(bm25_results)},
                 took_ms=took_bm25 * 1000,
             )
@@ -129,7 +162,7 @@ def hybrid_search(
     # For simplicity, merge all. A more sophisticated approach would RRF per sub-query,
     # then rank sub-query result groups.
     # TODO: Consider per-sub-query RRF for better relevance isolation.
-    merged = retriever.rrf_merge([all_results], top_k=top_k_rrf)
+    merged = retriever.rrf_merge([all_results], k=config.rrf_k, top_k=config.rrf_output_topk)
     took_rrf = time.time() - start
 
     sub_trace.append(
@@ -138,7 +171,7 @@ def hybrid_search(
             input={
                 "result_lists": len([all_results]),
                 "total_input": len(all_results),
-                "k": 60,
+                "k": config.rrf_k,
             },
             output={"results": _result_summary(merged, limit=3), "count": len(merged)},
             took_ms=took_rrf * 1000,
@@ -169,12 +202,18 @@ def hybrid_search(
     return final_results, sub_trace
 
 
-def orchestrate(query: str, *, debug: bool = True) -> dict:
+def orchestrate(
+    query: str,
+    *,
+    config: PipelineConfig | None = None,
+    debug: bool = True,
+) -> dict:
     """
     Execute the full retrieval + generation pipeline.
 
     Args:
         query: the user's question.
+        config: PipelineConfig with tunable parameters. Defaults to PipelineConfig().
         debug: if True, include full pipeline_trace in response.
 
     Returns:
@@ -182,16 +221,24 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
             "answer": str,
             "citations": [{"text": ..., "source": ...}, ...],
             "sources": [chunk dicts],
+            "config": config used,
             "pipeline_trace": [PipelineStage dicts] if debug else [],
         }
     """
+    if config is None:
+        config = PipelineConfig()
+
     trace: list[PipelineStage] = []
 
     # -------------------------------------------------------------------------
     # Stage 1: Query Processor (classify + decompose + extract entities)
     # -------------------------------------------------------------------------
     start = time.time()
-    decomp: QueryDecomposition = query_processor.process_query(query, use_llm=True)
+    decomp: QueryDecomposition = query_processor.process_query(
+        query,
+        use_llm=True,
+        max_subqueries=config.max_subqueries,
+    )
     took_qp = time.time() - start
 
     trace.append(
@@ -268,9 +315,7 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
     hybrid_chunks, hybrid_trace = hybrid_search(
         query,
         sub_queries=decomp.sub_queries if decomp.sub_queries else None,
-        top_k_per_method=10,
-        top_k_rrf=20,  # Keep more candidates for merging with structured results
-        rerank=False,  # Will rerank merged pool once at orchestrator level
+        config=config,
     )
     took_hybrid = time.time() - start
 
@@ -322,7 +367,8 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
     retrieved_chunks = reranker.rerank(
         query,
         deduplicated,
-        top_k=7,
+        top_k=config.final_rerank_topk,
+        model_name=config.cross_encoder_model,
         text_field="text_raw",
     )
     took_rerank = time.time() - start
@@ -330,7 +376,7 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
     trace.append(
         PipelineStage(
             stage="final_rerank",
-            input={"chunk_count": len(deduplicated)},
+            input={"chunk_count": len(deduplicated), "model": config.cross_encoder_model},
             output={
                 "results": _result_summary(retrieved_chunks),
                 "count": len(retrieved_chunks),
@@ -409,6 +455,7 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
         "answer": answer,
         "citations": citations,
         "sources": context_chunks,
+        "config": config.to_dict(),
         "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
     }
 
