@@ -34,7 +34,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from src.pipeline import query_processor, retriever, search, reranker
+from src.pipeline import query_processor, retriever, search, reranker, generator
 from src.pipeline.query_processor import QueryDecomposition
 
 
@@ -386,51 +386,57 @@ def orchestrate(
     )
 
     # -------------------------------------------------------------------------
-    # Stage 3: Context Assembly (TODO: implement full token budgeting)
+    # Stage 4: Context Assembly + Generation (Sonnet with strict system prompt)
     # -------------------------------------------------------------------------
     start = time.time()
-    # TODO: Implement proper context assembly with:
-    #   - Token budget enforcement (3-5k tokens)
-    #   - Large table trimming (serialize only relevant rows)
-    #   - Card summary prepending
-    #   - Metadata preservation for citations
-    context_chunks = retrieved_chunks[:7]  # For now, just use top 7
-    context_text = "\n\n".join(
-        f"[Section {c.get('section_id')}] {c.get('section_title')}\n{c.get('text_raw', '')}"
-        for c in context_chunks
-    )
-    took_context = time.time() - start
-
-    trace.append(
-        PipelineStage(
-            stage="context_assembly",
-            input={"chunk_count": len(retrieved_chunks)},
-            output={
-                "context_length": len(context_text),
-                "chunk_count": len(context_chunks),
-                "chunks_included": [
-                    {
-                        "id": c.get("id"),
-                        "section_id": c.get("section_id"),
-                        "content_type": c.get("content_type"),
-                    }
-                    for c in context_chunks
-                ],
-            },
-            took_ms=took_context * 1000,
+    try:
+        answer, citations, context_used, tokens_used = generator.generate(
+            query,
+            retrieved_chunks,
+            model="claude-3-5-sonnet-20241022",
+            max_context_tokens=4000,
         )
-    )
+        took_gen = time.time() - start
 
-    # -------------------------------------------------------------------------
-    # Stage 4: Generation (Sonnet with strict system prompt)
-    # -------------------------------------------------------------------------
-    start = time.time()
-    # TODO: Implement generator.generate(query, context, context_chunks)
-    #   Should return (answer, citations) where citations are structured dicts
-    #   with {"text": quoted text, "source": section_id or chunk_id}
-    answer = "Answer not yet implemented; generator.py needed"
-    citations = []
-    took_gen = time.time() - start
+        trace.append(
+            PipelineStage(
+                stage="generation",
+                input={
+                    "query": query,
+                    "chunk_count": len(retrieved_chunks),
+                },
+                output={
+                    "answer_length": len(answer),
+                    "citation_count": len(citations),
+                    "context_used": [
+                        {
+                            "section_id": c.get("section_id"),
+                            "section_title": c.get("section_title"),
+                            "content_type": c.get("content_type"),
+                        }
+                        for c in context_used
+                    ],
+                    "tokens": tokens_used,
+                },
+                took_ms=took_gen * 1000,
+            )
+        )
+        context_chunks = context_used  # For response metadata
+    except Exception as e:
+        answer = f"Generation failed: {type(e).__name__}: {str(e)}"
+        citations = []
+        context_chunks = retrieved_chunks
+        took_gen = time.time() - start
+        tokens_used = {"prompt": 0, "completion": 0}
+
+        trace.append(
+            PipelineStage(
+                stage="generation",
+                input={"query": query, "chunk_count": len(retrieved_chunks)},
+                output={"error": str(e)},
+                took_ms=took_gen * 1000,
+            )
+        )
 
     trace.append(
         PipelineStage(
