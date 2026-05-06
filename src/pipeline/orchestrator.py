@@ -70,24 +70,22 @@ def hybrid_search(
     sub_queries: list[str] | None = None,
     *,
     top_k_per_method: int = 10,
-    top_k_final: int = 7,
+    top_k_rrf: int = 20,
+    rerank: bool = False,
 ) -> tuple[list[dict], list[PipelineStage]]:
     """
-    Orchestrate hybrid retrieval for non-lookup queries.
-
-    Runs BM25 + vector search per sub-query, merges via RRF, reranks via
-    cross-encoder. Returns final chunks + trace of sub-stages.
+    Orchestrate hybrid retrieval: vector + BM25 per sub-query, then RRF merge.
 
     Args:
-        query: original user query (for reranking context).
+        query: original user query (for reranking context, if rerank=True).
         sub_queries: decomposed queries. If None, use [query].
         top_k_per_method: top-K candidates per search method per sub-query.
-        top_k_final: final top-K after reranking.
+        top_k_rrf: output size after RRF merge (before reranking).
+        rerank: if True, also rerank with cross-encoder.
 
     Returns:
-        (final_chunks, sub_trace) where final_chunks is the top-K reranked
-        results and sub_trace is a list of PipelineStage dicts for each
-        sub-step (vector, bm25, rrf, rerank).
+        (chunks, sub_trace) where chunks is RRF-merged results (optionally
+        reranked) and sub_trace is list of PipelineStage dicts.
     """
     if sub_queries is None:
         sub_queries = [query]
@@ -131,7 +129,7 @@ def hybrid_search(
     # For simplicity, merge all. A more sophisticated approach would RRF per sub-query,
     # then rank sub-query result groups.
     # TODO: Consider per-sub-query RRF for better relevance isolation.
-    merged = retriever.rrf_merge([all_results], top_k=top_k_per_method * 2)
+    merged = retriever.rrf_merge([all_results], top_k=top_k_rrf)
     took_rrf = time.time() - start
 
     sub_trace.append(
@@ -147,36 +145,28 @@ def hybrid_search(
         )
     )
 
-    # Step 3: Cross-encoder reranking
-    start = time.time()
-    reranked = reranker.rerank(
-        query,
-        merged,
-        top_k=top_k_final,
-        text_field="text_raw",
-    )
-    took_rerank = time.time() - start
-
-    sub_trace.append(
-        PipelineStage(
-            stage="hybrid_search.rerank",
-            input={"count": len(merged), "top_k": top_k_final},
-            output={"results": _result_summary(reranked, limit=3), "count": len(reranked)},
-            took_ms=took_rerank * 1000,
-            metadata={
-                "score_shifts": [
-                    {
-                        "id": r.get("id"),
-                        "prior_rank": i,
-                        "rerank_score": r.get("rerank_score"),
-                    }
-                    for i, r in enumerate(reranked[:5])
-                ],
-            },
+    # Step 3: Optional cross-encoder reranking
+    final_results = merged
+    if rerank:
+        start = time.time()
+        final_results = reranker.rerank(
+            query,
+            merged,
+            top_k=None,  # keep all for now; will rerank merged pool again at orchestrator level
+            text_field="text_raw",
         )
-    )
+        took_rerank = time.time() - start
 
-    return reranked, sub_trace
+        sub_trace.append(
+            PipelineStage(
+                stage="hybrid_search.rerank",
+                input={"count": len(merged)},
+                output={"results": _result_summary(final_results, limit=3), "count": len(final_results)},
+                took_ms=took_rerank * 1000,
+            )
+        )
+
+    return final_results, sub_trace
 
 
 def orchestrate(query: str, *, debug: bool = True) -> dict:
@@ -219,12 +209,11 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
     )
 
     # -------------------------------------------------------------------------
-    # Stage 2a/2b: Routing decision (structured vs hybrid)
+    # Stage 2a: Structured Lookup (always attempt if lookup query)
     # -------------------------------------------------------------------------
-    retrieved_chunks: list[dict] = []
-    used_structured: bool = False
+    structured_chunks: list[dict] = []
+    struct_found: bool = False
 
-    # Try structured lookup if this is a lookup query with extracted entities
     if decomp.type == "lookup" and decomp.entities:
         start = time.time()
         struct_result = retriever.structured_lookup(
@@ -233,6 +222,9 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
             max_fields=8,
         )
         took_struct = time.time() - start
+
+        struct_found = struct_result.found
+        structured_chunks = struct_result.sources if struct_result.found else []
 
         trace.append(
             PipelineStage(
@@ -252,35 +244,100 @@ def orchestrate(query: str, *, debug: bool = True) -> dict:
                 took_ms=took_struct * 1000,
             )
         )
-
-        if struct_result.found:
-            retrieved_chunks = struct_result.sources
-            used_structured = True
-        # If not found, fall through to hybrid
-
-    # If structured lookup was skipped or didn't find anything, try hybrid
-    if not used_structured:
-        start = time.time()
-        retrieved_chunks, hybrid_trace = hybrid_search(
-            query,
-            sub_queries=decomp.sub_queries if decomp.sub_queries else None,
-            top_k_per_method=10,
-            top_k_final=7,
-        )
-        took_hybrid = time.time() - start
-
-        trace.extend(hybrid_trace)
+    else:
         trace.append(
             PipelineStage(
-                stage="hybrid_search_complete",
+                stage="structured_lookup",
                 input={
-                    "method": "hybrid",
-                    "sub_queries": decomp.sub_queries or [query],
+                    "type": decomp.type,
+                    "entities": _entity_list_to_dict(decomp.entities),
                 },
-                output={"results": _result_summary(retrieved_chunks), "count": len(retrieved_chunks)},
-                took_ms=took_hybrid * 1000,
+                output={
+                    "found": False,
+                    "skipped": True,
+                    "reason": "not a lookup query or no entities extracted",
+                },
+                took_ms=0.0,
             )
         )
+
+    # -------------------------------------------------------------------------
+    # Stage 2b: Hybrid Search (always run; vector + BM25 + RRF, no rerank yet)
+    # -------------------------------------------------------------------------
+    start = time.time()
+    hybrid_chunks, hybrid_trace = hybrid_search(
+        query,
+        sub_queries=decomp.sub_queries if decomp.sub_queries else None,
+        top_k_per_method=10,
+        top_k_rrf=20,  # Keep more candidates for merging with structured results
+        rerank=False,  # Will rerank merged pool once at orchestrator level
+    )
+    took_hybrid = time.time() - start
+
+    trace.extend(hybrid_trace)
+
+    # -------------------------------------------------------------------------
+    # Stage 2c: Merge results from both paths
+    # -------------------------------------------------------------------------
+    start = time.time()
+    all_chunks = structured_chunks + hybrid_chunks
+
+    # Deduplicate by id, keeping first occurrence (structured has priority)
+    seen_ids: set = set()
+    deduplicated: list[dict] = []
+    for chunk in all_chunks:
+        chunk_id = chunk.get("id")
+        if chunk_id not in seen_ids:
+            seen_ids.add(chunk_id)
+            deduplicated.append(chunk)
+
+    took_dedup = time.time() - start
+
+    trace.append(
+        PipelineStage(
+            stage="result_dedup",
+            input={
+                "structured_count": len(structured_chunks),
+                "hybrid_count": len(hybrid_chunks),
+            },
+            output={
+                "deduped_count": len(deduplicated),
+                "sources": [
+                    {
+                        "id": c.get("id"),
+                        "section_id": c.get("section_id"),
+                        "method": c.get("method"),
+                    }
+                    for c in deduplicated[:10]
+                ],
+            },
+            took_ms=took_dedup * 1000,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Stage 3: Rerank merged results (cross-encoder on combined pool)
+    # -------------------------------------------------------------------------
+    start = time.time()
+    retrieved_chunks = reranker.rerank(
+        query,
+        deduplicated,
+        top_k=7,
+        text_field="text_raw",
+    )
+    took_rerank = time.time() - start
+
+    trace.append(
+        PipelineStage(
+            stage="final_rerank",
+            input={"chunk_count": len(deduplicated)},
+            output={
+                "results": _result_summary(retrieved_chunks),
+                "count": len(retrieved_chunks),
+            },
+            took_ms=took_rerank * 1000,
+        )
+    )
 
     # -------------------------------------------------------------------------
     # Stage 3: Context Assembly (TODO: implement full token budgeting)
