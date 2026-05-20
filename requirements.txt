@@ -10,3 +10,10 @@ pypdfium2==5.7.0
 voyageai
 supabase
 sentence-transformers
+psycopg2-binary
+anthropic
+google-genai
+openai
+fastapi
+uvicorn[standard]
+pydantic

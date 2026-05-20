@@ -52,6 +52,8 @@ def chunk_to_row(chunk: dict) -> dict:
         "figure_number": chunk.get("figure_number"),
         "word_count": chunk.get("word_count"),
         "token_count_approx": chunk.get("token_count_approx"),
+        "row_start": chunk.get("row_start"),
+        "row_end": chunk.get("row_end"),
     }
 
 

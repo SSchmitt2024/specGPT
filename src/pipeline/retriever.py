@@ -67,20 +67,47 @@ class StructuredLookupResult:
         return asdict(self)
 
 
+def _supabase_available() -> bool:
+    """True if SUPABASE_URL is configured (env or .env)."""
+    import os
+    url = os.environ.get("SUPABASE_URL")
+    if url:
+        return True
+    env = Path(".env")
+    if env.exists():
+        return any(line.startswith("SUPABASE_URL=") for line in env.read_text().splitlines())
+    return False
+
+
 @lru_cache(maxsize=1)
 def load_field_index() -> dict[str, list[dict]]:
+    if _supabase_available():
+        from src.pipeline.search import supabase_client
+        rows = supabase_client().table("spec_field_index").select("field_name, data").execute().data or []
+        result: dict[str, list[dict]] = {}
+        for row in rows:
+            result.setdefault(row["field_name"], []).append(row["data"])
+        return result
     with open(FIELD_INDEX_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
 @lru_cache(maxsize=1)
 def load_fields() -> list[dict]:
+    if _supabase_available():
+        from src.pipeline.search import supabase_client
+        rows = supabase_client().table("spec_fields").select("data").execute().data or []
+        return [row["data"] for row in rows]
     with open(FIELDS_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
 @lru_cache(maxsize=1)
 def load_tables_by_figure() -> dict[str, dict]:
+    if _supabase_available():
+        from src.pipeline.search import supabase_client
+        rows = supabase_client().table("spec_tables").select("figure_number, data").execute().data or []
+        return {str(r["figure_number"]): r["data"] for r in rows if r.get("figure_number")}
     with open(TABLES_PATH, encoding="utf-8") as f:
         tables = json.load(f)
     return {str(t.get("figure_number")): t for t in tables if t.get("figure_number") is not None}

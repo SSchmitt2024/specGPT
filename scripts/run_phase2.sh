@@ -9,16 +9,11 @@
 #   1. Chunk prose         src.pipeline.chunker           (chunks_prose.json)
 #   2. Serialize tables    src.pipeline.table_serializer  (chunks_tables.json)
 #   3. Embed chunks        src.pipeline.embedder          (chunks_embedded.json)
-#
-# Future steps (uncomment as built):
-#   4. Index to Supabase   src.pipeline.indexer           (remote DB)
-#
-# Future steps (uncomment as built):
-#   5. Eval set gen        src.pipeline.eval_gen          (eval_set.json)
-#   6. Retriever           src.pipeline.retriever         (module — no file output)
-#   7. Generator           src.pipeline.generator         (module — no file output)
-#   8. Web app             src.pipeline.app               (server)
-#   9. Eval run            src.pipeline.eval_run          (eval_results.json)
+#   4. Apply schema        scripts/apply_schema.py        (remote DB — DDL)
+#   5. Index to Supabase   src.pipeline.indexer           (remote DB — chunks)
+#   6. Load lookup data    scripts/load_lookup_data.py    (remote DB — fields/tables)
+#   7. Generate eval set   src.pipeline.eval_gen          (eval_set.json)
+#   8. Run eval            src.pipeline.eval_run          (eval_results.json)
 #
 # Usage:
 #   ./scripts/run_phase2.sh
@@ -77,31 +72,62 @@ STEP_NAME=(
   "Chunk prose"
   "Serialize tables"
   "Embed chunks"
+  "Apply schema"
   "Index to Supabase"
+  "Load lookup data"
+  "Generate eval set"
+  "Run eval"
 )
+# For script-based steps, leave MODULE empty and set SCRIPT path instead.
 STEP_MODULE=(
   "src.pipeline.chunker"
   "src.pipeline.table_serializer"
   "src.pipeline.embedder"
+  ""
   "src.pipeline.indexer"
+  ""
+  "src.pipeline.eval_gen"
+  "src.pipeline.eval_run"
+)
+STEP_SCRIPT=(
+  ""
+  ""
+  ""
+  "scripts/apply_schema.py"
+  ""
+  "scripts/load_lookup_data.py"
+  ""
+  ""
 )
 STEP_OUTPUTS=(
   "data/chunks_prose.json"
   "data/chunks_tables.json"
   "data/chunks_embedded.json"
   ""
+  ""
+  ""
+  "data/eval_set.json"
+  "data/eval_results.json"
 )
 STEP_INPUTS=(
   "data/prose.json data/cards.json"
   "data/tables.json data/cards.json"
   "data/chunks_prose.json data/chunks_tables.json"
+  ""
   "data/chunks_embedded.json"
+  "data/fields.json data/field_index.json data/tables.json"
+  "data/cards.json data/fields.json data/field_index.json"
+  "data/eval_set.json"
 )
 STEP_API=(
   "no"
   "no"
-  "yes"
-  "yes"
+  "voyage"
+  "db"
+  "supabase"
+  "supabase"
+  "gemini"
+  "supabase gemini anthropic"
 )
 
 NUM_STEPS=${#STEP_NAME[@]}
@@ -157,7 +183,7 @@ parse_selection() {
     fi
   done
 
-  mapfile -t SELECTED_STEPS < <(printf '%s\n' "${out[@]}" | sort -nu)
+  IFS=$'\n' read -r -d '' -a SELECTED_STEPS < <(printf '%s\n' "${out[@]}" | sort -nu; printf '\0')
 }
 
 print_menu
@@ -176,89 +202,54 @@ for idx in "${SELECTED_STEPS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# API key check (Voyage AI for embedder)
+# API key check
 # ---------------------------------------------------------------------------
-needs_api=0
+_needs_api() {
+  local tag="$1"
+  for idx in "${SELECTED_STEPS[@]}"; do
+    [[ " ${STEP_API[$idx]} " == *" $tag "* ]] && return 0
+  done
+  return 1
+}
+
+_prompt_env() {
+  local var="$1" prompt="$2" secret="${3:-n}"
+  if [[ -n "${!var:-}" ]]; then
+    echo "    $var: present"
+    return
+  fi
+  echo "    $var not set."
+  if [[ "$secret" == "y" ]]; then
+    read -rsp "    $prompt (input hidden): " entered; echo ""
+  else
+    read -rp "    $prompt: " entered
+  fi
+  if [[ -z "$entered" ]]; then
+    echo "ERROR: empty value. aborting." >&2; exit 1
+  fi
+  export "$var"="$entered"
+  read -rp "    save $var to .env? [y/N] " persist
+  if [[ "$persist" == "y" || "$persist" == "Y" ]]; then
+    touch ".env"
+    grep -q "^${var}=" .env || echo "${var}=${entered}" >> .env
+    echo "    written to .env"
+  fi
+}
+
+any_api=0
 for idx in "${SELECTED_STEPS[@]}"; do
-  [[ "${STEP_API[$idx]}" == "yes" ]] && needs_api=1
+  [[ "${STEP_API[$idx]}" != "no" ]] && any_api=1
 done
 
-if (( needs_api == 1 )); then
+if (( any_api == 1 )); then
   echo ""
   echo "=== API setup ==="
-
-  # --- Voyage AI (embedder) ---
-  needs_voyage=0
-  for idx in "${SELECTED_STEPS[@]}"; do
-    [[ "${STEP_MODULE[$idx]}" == "src.pipeline.embedder" ]] && needs_voyage=1
-  done
-  if (( needs_voyage == 1 )); then
-    if [[ -z "${VOYAGE_API_KEY:-}" ]]; then
-      echo "    VOYAGE_API_KEY not set."
-      read -rsp "    paste key (input hidden): " entered_key
-      echo ""
-      if [[ -z "$entered_key" ]]; then
-        echo "ERROR: empty key. aborting." >&2
-        exit 1
-      fi
-      export VOYAGE_API_KEY="$entered_key"
-
-      read -rp "    save VOYAGE_API_KEY to .env? [y/N] " persist
-      if [[ "$persist" == "y" || "$persist" == "Y" ]]; then
-        touch ".env"
-        grep -q "^VOYAGE_API_KEY=" .env || echo "VOYAGE_API_KEY=${entered_key}" >> .env
-        echo "    written to .env"
-      fi
-    else
-      echo "    VOYAGE_API_KEY: present"
-    fi
-  fi
-
-  # --- Supabase (indexer) ---
-  needs_supabase=0
-  for idx in "${SELECTED_STEPS[@]}"; do
-    [[ "${STEP_MODULE[$idx]}" == "src.pipeline.indexer" ]] && needs_supabase=1
-  done
-  if (( needs_supabase == 1 )); then
-    if [[ -z "${SUPABASE_URL:-}" ]]; then
-      echo "    SUPABASE_URL not set."
-      read -rp "    paste project URL: " entered_url
-      if [[ -z "$entered_url" ]]; then
-        echo "ERROR: empty URL. aborting." >&2
-        exit 1
-      fi
-      export SUPABASE_URL="$entered_url"
-
-      read -rp "    save SUPABASE_URL to .env? [y/N] " persist
-      if [[ "$persist" == "y" || "$persist" == "Y" ]]; then
-        touch ".env"
-        grep -q "^SUPABASE_URL=" .env || echo "SUPABASE_URL=${entered_url}" >> .env
-        echo "    written to .env"
-      fi
-    else
-      echo "    SUPABASE_URL: present"
-    fi
-
-    if [[ -z "${SUPABASE_KEY:-}" ]]; then
-      echo "    SUPABASE_KEY not set."
-      read -rsp "    paste service_role key (input hidden): " entered_skey
-      echo ""
-      if [[ -z "$entered_skey" ]]; then
-        echo "ERROR: empty key. aborting." >&2
-        exit 1
-      fi
-      export SUPABASE_KEY="$entered_skey"
-
-      read -rp "    save SUPABASE_KEY to .env? [y/N] " persist
-      if [[ "$persist" == "y" || "$persist" == "Y" ]]; then
-        touch ".env"
-        grep -q "^SUPABASE_KEY=" .env || echo "SUPABASE_KEY=${entered_skey}" >> .env
-        echo "    written to .env"
-      fi
-    else
-      echo "    SUPABASE_KEY: present"
-    fi
-  fi
+  _needs_api "voyage"    && _prompt_env VOYAGE_API_KEY    "paste Voyage AI key"       y
+  _needs_api "db"        && _prompt_env DATABASE_URL       "paste Postgres DATABASE_URL (Supabase Project Settings → Database → URI)"
+  _needs_api "supabase"  && _prompt_env SUPABASE_URL       "paste Supabase project URL"
+  _needs_api "supabase"  && _prompt_env SUPABASE_KEY       "paste service_role key"    y
+  _needs_api "gemini"    && _prompt_env GEMINI_API_KEY     "paste Gemini API key"      y
+  _needs_api "anthropic" && _prompt_env ANTHROPIC_API_KEY  "paste Anthropic API key"   y
 fi
 
 # ---------------------------------------------------------------------------
@@ -349,12 +340,22 @@ run_step() {
     echo "    (no existing outputs — first run)"
   fi
 
-  # Run
-  echo "    running: ${PYTHON_BIN[*]} -u -m $module"
-  if command -v stdbuf >/dev/null 2>&1; then
-    stdbuf -oL -eL "${PYTHON_BIN[@]}" -u -m "$module"
+  # Run — script path takes precedence over -m module
+  local script="${STEP_SCRIPT[$idx]}"
+  if [[ -n "$script" ]]; then
+    echo "    running: ${PYTHON_BIN[*]} -u $script"
+    if command -v stdbuf >/dev/null 2>&1; then
+      stdbuf -oL -eL "${PYTHON_BIN[@]}" -u "$script"
+    else
+      "${PYTHON_BIN[@]}" -u "$script"
+    fi
   else
-    "${PYTHON_BIN[@]}" -u -m "$module"
+    echo "    running: ${PYTHON_BIN[*]} -u -m $module"
+    if command -v stdbuf >/dev/null 2>&1; then
+      stdbuf -oL -eL "${PYTHON_BIN[@]}" -u -m "$module"
+    else
+      "${PYTHON_BIN[@]}" -u -m "$module"
+    fi
   fi
   echo "    done: $name"
 }

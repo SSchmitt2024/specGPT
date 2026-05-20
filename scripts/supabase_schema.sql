@@ -16,6 +16,10 @@
 -- ── Extensions ─────────────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- ── Table chunk range columns (added for split-table support) ───────────────
+ALTER TABLE spec_chunks ADD COLUMN IF NOT EXISTS row_start int;
+ALTER TABLE spec_chunks ADD COLUMN IF NOT EXISTS row_end   int;
+
 -- ── Generated tsvector column for full-text search ─────────────────────────
 -- Title is weighted higher than body so a query that matches the section
 -- heading ranks ahead of one that only mentions the term in passing.
@@ -108,3 +112,37 @@ LANGUAGE sql STABLE AS $$
   ORDER BY rank DESC
   LIMIT match_count;
 $$;
+
+-- ── Lookup tables (loaded by scripts/load_lookup_data.py) ────────────────────
+-- These replace local JSON file reads in retriever.py for deployed environments.
+
+-- One row per unique field/register (from fields.json).
+CREATE TABLE IF NOT EXISTS spec_fields (
+    name          TEXT PRIMARY KEY,
+    description   TEXT,
+    offset        TEXT,
+    figure_number TEXT,
+    section_id    TEXT,
+    data          JSONB NOT NULL
+);
+
+-- One row per (field_name, location) pair (from field_index.json).
+-- field_index maps name → [records], so this is the flattened form.
+CREATE TABLE IF NOT EXISTS spec_field_index (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    field_name    TEXT NOT NULL,
+    section_id    TEXT,
+    figure_number TEXT,
+    data          JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS spec_field_index_name_idx ON spec_field_index (field_name);
+
+-- One row per table (from tables.json), keyed by figure_number.
+CREATE TABLE IF NOT EXISTS spec_tables (
+    figure_number TEXT PRIMARY KEY,
+    title         TEXT,
+    section_id    TEXT,
+    raw_text      TEXT,
+    table_json    JSONB,
+    data          JSONB NOT NULL
+);

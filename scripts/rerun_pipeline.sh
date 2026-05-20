@@ -201,7 +201,7 @@ parse_selection() {
   done
 
   # sort + dedupe, assign to global
-  mapfile -t SELECTED_STEPS < <(printf '%s\n' "${out[@]}" | sort -nu)
+  IFS=$'\n' read -r -d '' -a SELECTED_STEPS < <(printf '%s\n' "${out[@]}" | sort -nu; printf '\0')
 }
 
 print_menu
@@ -412,11 +412,11 @@ run_step() {
   # (e) run — `-u` = unbuffered, so print() lines stream live to the terminal.
   # `stdbuf -oL -eL` on the outside also line-buffers anything the child
   # shells out to (best-effort: not present on every system, so we guard it).
-  echo "    running: ${PYTHON_BIN[*]} -u -m $module ${extra_args[*]:-}"
+  echo "    running: ${PYTHON_BIN[*]} -u -m $module ${extra_args[*]+"${extra_args[*]}"}"
   if command -v stdbuf >/dev/null 2>&1; then
-    stdbuf -oL -eL "${PYTHON_BIN[@]}" -u -m "$module" "${extra_args[@]}"
+    stdbuf -oL -eL "${PYTHON_BIN[@]}" -u -m "$module" "${extra_args[@]+"${extra_args[@]}"}"
   else
-    "${PYTHON_BIN[@]}" -u -m "$module" "${extra_args[@]}"
+    "${PYTHON_BIN[@]}" -u -m "$module" "${extra_args[@]+"${extra_args[@]}"}"
   fi
   echo "    done: $name"
 }
