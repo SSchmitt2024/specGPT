@@ -249,7 +249,11 @@ def _build_user_prompt(query: str, entities: list[Entity]) -> str:
     return f"{entity_block}User question:\n{query}\n"
 
 
-def _normalize_llm_output(parsed: object, query: str) -> tuple[str, list[str], str]:
+def _normalize_llm_output(
+    parsed: object,
+    query: str,
+    max_subqueries: int = 3,
+) -> tuple[str, list[str], str]:
     """Coerce the LLM's JSON into (type, sub_queries, rationale). Raises on hard failures."""
     if not isinstance(parsed, dict):
         raise ValueError(f"LLM returned non-object: {type(parsed).__name__}")
@@ -270,8 +274,8 @@ def _normalize_llm_output(parsed: object, query: str) -> tuple[str, list[str], s
     if qtype in ("lookup", "structural"):
         sub_queries = [query]
     else:
-        # Cap at 3, never duplicate the original verbatim alongside reworded variants.
-        sub_queries = sub_queries[:3]
+        # Cap at max_subqueries, never duplicate the original verbatim alongside reworded variants.
+        sub_queries = sub_queries[:max_subqueries]
 
     rationale = str(parsed.get("rationale", "")).strip()
     return qtype, sub_queries, rationale
@@ -282,6 +286,7 @@ def classify_and_decompose(
     entities: list[Entity],
     *,
     model: str | None = None,
+    max_subqueries: int = 3,
 ) -> tuple[str, list[str], str]:
     """Single LLM call. Returns (type, sub_queries, rationale)."""
     user_prompt = _build_user_prompt(query, entities)
@@ -294,7 +299,7 @@ def classify_and_decompose(
         kwargs["model"] = model
 
     parsed, _result = generate_json(user_prompt, **kwargs)
-    return _normalize_llm_output(parsed, query)
+    return _normalize_llm_output(parsed, query, max_subqueries=max_subqueries)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +321,7 @@ def process_query(
     *,
     use_llm: bool = True,
     model: str | None = None,
+    max_subqueries: int = 3,
     strict: bool = False,
 ) -> QueryDecomposition:
     """
@@ -326,6 +332,13 @@ def process_query(
     heuristic on any failure (quota, network, malformed JSON). Pass strict=True
     to surface the underlying exception instead of falling back — useful when
     debugging the LLM prompt itself.
+
+    Args:
+        query: the user's question.
+        use_llm: whether to use LLM classification/decomposition.
+        model: optional model override.
+        max_subqueries: max number of sub-queries to produce (tunable for testing).
+        strict: if True, raise exceptions instead of falling back.
     """
     query = query.strip()
     if not query:
@@ -337,7 +350,12 @@ def process_query(
         return _heuristic_result(query, entities, "no-llm mode")
 
     try:
-        qtype, sub_queries, rationale = classify_and_decompose(query, entities, model=model)
+        qtype, sub_queries, rationale = classify_and_decompose(
+            query,
+            entities,
+            model=model,
+            max_subqueries=max_subqueries,
+        )
     except Exception as e:  # noqa: BLE001 — broad on purpose; this is a fallback boundary
         if strict:
             raise

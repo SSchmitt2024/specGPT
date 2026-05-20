@@ -1,14 +1,19 @@
 """
-Phase 2 - Step 2.3a: Structured lookup retriever
+Phase 2 - Step 2.3: Retriever orchestration
 
-Exact lookup path for field/register/table questions. This module is the
-deterministic alternative to fuzzy vector search:
+Houses the structured lookup path (2.3a) and the merge primitives for the
+hybrid retrieval path (2.3b).
 
-  query -> query_processor entities -> field_index.json -> fields.json
-        -> parent table from tables.json -> compact source bundle
+  - `structured_lookup()` — deterministic field/register/table lookup
+        query -> query_processor entities -> field_index.json -> fields.json
+             -> parent table from tables.json -> compact source bundle
+  - `rrf_merge()` — Reciprocal Rank Fusion across vector/BM25 result lists
+        (and across sub-queries when query_processor decomposes a query)
 
-The web backend can call `structured_lookup()` after query processing. If it
-returns `found=False`, route the request to the hybrid BM25/vector path.
+The web backend should call `structured_lookup()` first. If it returns
+`found=False`, route the query to the hybrid path that runs
+`search.vector_search` + `search.bm25_search` per sub-query and combines the
+ranked lists via `rrf_merge()`.
 
 CLI:
   python -m src.pipeline.retriever structured "What does bit 3 of OACS mean?"
@@ -396,6 +401,79 @@ def structured_lookup(
         sources=sources,
         notes=notes,
     )
+
+
+def rrf_merge(
+    result_lists: list[list[dict]],
+    *,
+    k: int = 60,
+    top_k: int | None = None,
+) -> list[dict]:
+    """
+    Reciprocal Rank Fusion merge of independent ranked result lists.
+
+    For each document, sum 1/(k + rank) across every list it appears in
+    (rank is 1-indexed). Documents are deduped by `id`; metadata from the
+    first occurrence is preserved. Use this to fuse vector + BM25 results,
+    or to combine results across decomposed sub-queries.
+
+    Args:
+        result_lists: ranked result lists shaped like search.py output
+            (dicts with `id` and optional `method`).
+        k: RRF constant. Cormack et al.'s classic value is 60; lower values
+            sharpen the lead of top-ranked items.
+        top_k: if set, return only the top_k merged results.
+
+    Returns:
+        Merged list sorted by RRF score (descending). Each result gains:
+          - `rrf_score`: float
+          - `method`: "rrf"
+          - `contributing_methods`: source methods that surfaced this id
+          - `ranks`: {method: best_rank_seen}
+    """
+    if not result_lists:
+        return []
+
+    scores: dict[Any, float] = {}
+    representative: dict[Any, dict] = {}
+    methods: dict[Any, list[str]] = {}
+    ranks: dict[Any, dict[str, int]] = {}
+
+    for results in result_lists:
+        seen: set = set()
+        for rank, item in enumerate(results, start=1):
+            doc_id = item.get("id")
+            if doc_id is None or doc_id in seen:
+                continue
+            seen.add(doc_id)
+
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+
+            method = str(item.get("method") or "unknown")
+            method_list = methods.setdefault(doc_id, [])
+            if method not in method_list:
+                method_list.append(method)
+
+            rank_map = ranks.setdefault(doc_id, {})
+            if method not in rank_map or rank < rank_map[method]:
+                rank_map[method] = rank
+
+            if doc_id not in representative:
+                representative[doc_id] = item
+
+    merged: list[dict] = []
+    for doc_id, score in scores.items():
+        base = dict(representative[doc_id])
+        base["rrf_score"] = score
+        base["method"] = "rrf"
+        base["contributing_methods"] = methods[doc_id]
+        base["ranks"] = ranks[doc_id]
+        merged.append(base)
+
+    merged.sort(key=lambda r: r["rrf_score"], reverse=True)
+    if top_k is not None:
+        merged = merged[:top_k]
+    return merged
 
 
 def _main(argv: list[str]) -> int:
