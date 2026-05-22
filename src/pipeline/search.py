@@ -1,14 +1,18 @@
 """
 Phase 2 — Step 2.3: Search primitives
 
-Two scoring primitives over the `spec_chunks` table populated by indexer.py.
+Three scoring primitives over the `spec_chunks` table populated by indexer.py.
 Higher-level orchestration (RRF merge, reranking, structured lookup path)
 belongs in `retriever.py` per PHASE2_BUILD_PLAN.md §2.3.
 
-  1. vector_search(query, ...) — semantic via Voyage query embedding + pgvector cosine
-  2. bm25_search(query, ...)   — keyword via Postgres tsvector + websearch_to_tsquery
+  1. vector_search(query, ...)    — semantic: Voyage query embedding + pgvector cosine
+  2. tsvector_search(query, ...)  — keyword: Postgres tsvector + ts_rank_cd
+                                    (stemmed via 'english' config; good for prose)
+  3. bm25_search(query, ...)      — keyword: true Okapi BM25 via rank_bm25
+                                    (literal tokens; good for spec identifiers
+                                    like CDW10, FUSE, MPTR)
 
-Both return a list of normalized result dicts:
+All three return a list of normalized result dicts:
 
   {
     "id":            str,
@@ -19,8 +23,8 @@ Both return a list of normalized result dicts:
     "pdf_pages":     [int, ...],
     "figure_number": str | None,
     "has_normative": bool,
-    "score":         float,                 # cosine sim / ts_rank_cd
-    "method":        "vector" | "bm25",
+    "score":         float,                 # cosine sim / ts_rank_cd / bm25
+    "method":        "vector" | "tsvector" | "bm25",
   }
 
 Optional `filter` dict (applied inside both RPCs to scope candidates):
@@ -34,12 +38,14 @@ Optional `filter` dict (applied inside both RPCs to scope candidates):
   }
 
 Depends on Supabase RPCs `match_spec_chunks` and `search_spec_chunks_text`,
-plus a generated `tsv` column on `spec_chunks`.
-See scripts/supabase_schema.sql for the one-time setup.
+plus a generated `tsv` column on `spec_chunks`. See
+scripts/supabase_schema.sql for the one-time setup. True BM25 has no
+server-side dependency — see bm25_index.py.
 
 CLI:
-  python -m src.pipeline.search vector "host memory buffer feature" --top-k 5
-  python -m src.pipeline.search bm25   "Set Features"               --section-prefix 5
+  python -m src.pipeline.search vector   "host memory buffer feature" --top-k 5
+  python -m src.pipeline.search tsvector "Set Features"               --section-prefix 5
+  python -m src.pipeline.search bm25     "CDW10 FUSE"                 --top-k 5
 """
 
 from __future__ import annotations
@@ -71,8 +77,8 @@ VOYAGE_MODEL = "voyage-3-lite"     # must match embedder.py
 DEFAULT_TOP_K = 10
 
 # RPC names (must match scripts/supabase_schema.sql)
-RPC_VECTOR = "match_spec_chunks"
-RPC_BM25   = "search_spec_chunks_text"
+RPC_VECTOR   = "match_spec_chunks"
+RPC_TSVECTOR = "search_spec_chunks_text"
 
 
 # ---------------------------------------------------------------------------
@@ -183,24 +189,24 @@ def vector_search(
 
 
 # ---------------------------------------------------------------------------
-# 2. BM25 / full-text search
+# 2. tsvector / full-text search
 #
-# Note: Postgres' built-in text search uses ts_rank_cd, which is a TF-IDF-style
-# normalized cover density score — not strict BM25. Good enough as a Phase 2
-# keyword baseline; named bm25_search to match BUILD_PLAN_FINAL.md. Swap the
-# SQL function if you later install the paradedb / pg_search extension.
+# Postgres' built-in text search via 'english' config + ts_rank_cd: applies
+# Porter stemming and English stopword removal, then ranks by normalized
+# cover density (TF-IDF-flavored). Strong for natural-language prose
+# queries; weaker for exact-token queries like spec identifiers.
 
-def bm25_search(
+def tsvector_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
     filter: dict | None = None,
 ) -> list[dict]:
-    """Full-text search via tsvector + websearch_to_tsquery."""
+    """Full-text search via Postgres tsvector + websearch_to_tsquery."""
     if not query.strip():
         return []
 
     resp = supabase_client().rpc(
-        RPC_BM25,
+        RPC_TSVECTOR,
         {
             "query_text":  query,
             "match_count": top_k,
@@ -209,7 +215,29 @@ def bm25_search(
     ).execute()
 
     rows = resp.data or []
-    return [_shape(r, r.get("rank", 0.0), "bm25") for r in rows]
+    return [_shape(r, r.get("rank", 0.0), "tsvector") for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 3. True Okapi BM25 (client-side, via rank_bm25)
+#
+# Managed Supabase doesn't permit installing ParadeDB / pg_search, so BM25
+# runs in-process. The ~1,900-row corpus is loaded once per process and
+# cached; see bm25_index.py for index + tokenization details.
+
+def bm25_search(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    filter: dict | None = None,
+) -> list[dict]:
+    """True Okapi BM25 over an in-memory index of spec_chunks."""
+    if not query.strip():
+        return []
+
+    from src.pipeline import bm25_index  # local import: avoid load on cold paths
+
+    hits = bm25_index.get_index().search(query, top_k=top_k, filter=filter)
+    return [_shape(row, score, "bm25") for row, score in hits]
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +275,10 @@ def _build_filter(args) -> dict:
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(prog="search", description="Search spec_chunks (vector | bm25).")
+    p = argparse.ArgumentParser(
+        prog="search",
+        description="Search spec_chunks (vector | tsvector | bm25).",
+    )
     sub = p.add_subparsers(dest="mode", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -259,10 +290,13 @@ def main(argv: list[str] | None = None) -> None:
     common.add_argument("--spec-version")
     common.add_argument("--json", action="store_true", help="emit raw JSON")
 
-    pv = sub.add_parser("vector", parents=[common], help="semantic search")
+    pv = sub.add_parser("vector", parents=[common], help="semantic (pgvector)")
     pv.add_argument("query")
 
-    pb = sub.add_parser("bm25", parents=[common], help="keyword / full-text search")
+    pt = sub.add_parser("tsvector", parents=[common], help="Postgres tsvector full-text")
+    pt.add_argument("query")
+
+    pb = sub.add_parser("bm25", parents=[common], help="true Okapi BM25 (in-memory)")
     pb.add_argument("query")
 
     args = p.parse_args(argv)
@@ -270,6 +304,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.mode == "vector":
         results = vector_search(args.query, top_k=args.top_k, filter=filt or None)
+    elif args.mode == "tsvector":
+        results = tsvector_search(args.query, top_k=args.top_k, filter=filt or None)
     else:
         results = bm25_search(args.query, top_k=args.top_k, filter=filt or None)
 

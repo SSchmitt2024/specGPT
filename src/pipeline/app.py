@@ -474,6 +474,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         <input type="number" id="config-vector_topk" value="10" min="1" max="50">
                     </div>
                     <div class="config-item">
+                        <label>tsvector Top-K</label>
+                        <input type="number" id="config-tsvector_topk" value="10" min="1" max="50">
+                    </div>
+                    <div class="config-item">
                         <label>BM25 Top-K</label>
                         <input type="number" id="config-bm25_topk" value="10" min="1" max="50">
                     </div>
@@ -561,6 +565,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             // Collect config
             const config = {
                 vector_topk: parseInt(document.getElementById("config-vector_topk").value),
+                tsvector_topk: parseInt(document.getElementById("config-tsvector_topk").value),
                 bm25_topk: parseInt(document.getElementById("config-bm25_topk").value),
                 rrf_k: parseInt(document.getElementById("config-rrf_k").value),
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
