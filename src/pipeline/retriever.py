@@ -7,13 +7,14 @@ hybrid retrieval path (2.3b).
   - `structured_lookup()` — deterministic field/register/table lookup
         query -> query_processor entities -> field_index.json -> fields.json
              -> parent table from tables.json -> compact source bundle
-  - `rrf_merge()` — Reciprocal Rank Fusion across vector/BM25 result lists
-        (and across sub-queries when query_processor decomposes a query)
+  - `rrf_merge()` — Reciprocal Rank Fusion across vector / tsvector / BM25
+        result lists (and across sub-queries when query_processor
+        decomposes a query)
 
 The web backend should call `structured_lookup()` first. If it returns
 `found=False`, route the query to the hybrid path that runs
-`search.vector_search` + `search.bm25_search` per sub-query and combines the
-ranked lists via `rrf_merge()`.
+`search.vector_search` + `search.tsvector_search` + `search.bm25_search`
+per sub-query and combines the ranked lists via `rrf_merge()`.
 
 CLI:
   python -m src.pipeline.retriever structured "What does bit 3 of OACS mean?"

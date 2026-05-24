@@ -2,13 +2,17 @@
 --
 -- Assumes spec_chunks already exists (created when you set up the project /
 -- when indexer.py first upserted rows). This script only ADDS the parts
--- needed for the three search modes:
+-- needed for the server-backed retrievers:
 --
---   * generated tsvector column + GIN index → bm25_search()
+--   * generated tsvector column + GIN index → tsvector_search()
 --   * pgvector IVFFLAT index                 → vector_search()
 --   * filter-helper btree indexes
 --   * match_spec_chunks RPC                  → vector_search()
---   * search_spec_chunks_text RPC            → bm25_search()
+--   * search_spec_chunks_text RPC            → tsvector_search()
+--
+-- The third retriever, true Okapi BM25 (search.bm25_search), runs
+-- client-side via rank_bm25 and needs no schema changes — see
+-- src/pipeline/bm25_index.py.
 --
 -- Safe to re-run (everything is IF NOT EXISTS / OR REPLACE).
 -- Run in the Supabase SQL editor or via psql.
@@ -78,9 +82,9 @@ LANGUAGE sql STABLE AS $$
   LIMIT match_count;
 $$;
 
--- ── RPC: BM25-style full-text search ──────────────────────────────────────
--- Uses ts_rank_cd over the generated tsv column. Not strict BM25 — swap to
--- paradedb / pg_search if you need true BM25 scoring later.
+-- ── RPC: tsvector full-text search ────────────────────────────────────────
+-- Uses ts_rank_cd over the generated tsv column. Stems via 'english' config
+-- (good for prose). True Okapi BM25 runs client-side; see bm25_index.py.
 CREATE OR REPLACE FUNCTION search_spec_chunks_text(
   query_text  text,
   match_count int   DEFAULT 10,

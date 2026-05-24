@@ -11,6 +11,7 @@ visualizes every decision and result.
 
 All high-impact tunable parameters are exposed as config:
   - vector_search.top_k
+  - tsvector_search.top_k
   - bm25_search.top_k
   - rrf_merge.k
   - rrf_output.top_k
@@ -20,6 +21,7 @@ All high-impact tunable parameters are exposed as config:
 
     config = PipelineConfig(
         vector_topk=15,
+        tsvector_topk=15,
         bm25_topk=15,
         rrf_k=45,
         final_rerank_topk=10,
@@ -43,6 +45,7 @@ class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
     # Search parameters
     vector_topk: int = 10
+    tsvector_topk: int = 10
     bm25_topk: int = 10
 
     # RRF merge parameters
@@ -107,7 +110,12 @@ def hybrid_search(
     config: PipelineConfig | None = None,
 ) -> tuple[list[dict], list[PipelineStage]]:
     """
-    Orchestrate hybrid retrieval: vector + BM25 per sub-query, then RRF merge.
+    Orchestrate hybrid retrieval: vector + tsvector + BM25 per sub-query,
+    fused via Reciprocal Rank Fusion.
+
+    Each (method, sub-query) pair is treated as an independent ranked list
+    in the RRF input — that's what makes the fusion work. Flattening them
+    into a single list before RRF would collapse all rank information.
 
     Args:
         query: original user query.
@@ -124,13 +132,18 @@ def hybrid_search(
         sub_queries = [query]
 
     sub_trace: list[PipelineStage] = []
-    all_results: list[dict] = []
+    ranked_lists: list[list[dict]] = []
+    total_input = 0
 
-    # Step 1: Vector + BM25 per sub-query
+    # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
     for i, sq in enumerate(sub_queries):
         start = time.time()
         vec_results = search.vector_search(sq, top_k=config.vector_topk)
         took_vec = time.time() - start
+
+        start = time.time()
+        tsv_results = search.tsvector_search(sq, top_k=config.tsvector_topk)
+        took_tsv = time.time() - start
 
         start = time.time()
         bm25_results = search.bm25_search(sq, top_k=config.bm25_topk)
@@ -146,6 +159,14 @@ def hybrid_search(
         )
         sub_trace.append(
             PipelineStage(
+                stage=f"hybrid_search.tsvector_search_q{i}",
+                input={"query": sq, "top_k": config.tsvector_topk},
+                output={"results": _result_summary(tsv_results, limit=3), "count": len(tsv_results)},
+                took_ms=took_tsv * 1000,
+            )
+        )
+        sub_trace.append(
+            PipelineStage(
                 stage=f"hybrid_search.bm25_search_q{i}",
                 input={"query": sq, "top_k": config.bm25_topk},
                 output={"results": _result_summary(bm25_results, limit=3), "count": len(bm25_results)},
@@ -153,24 +174,22 @@ def hybrid_search(
             )
         )
 
-        all_results.extend(vec_results)
-        all_results.extend(bm25_results)
+        for lst in (vec_results, tsv_results, bm25_results):
+            if lst:
+                ranked_lists.append(lst)
+                total_input += len(lst)
 
-    # Step 2: RRF merge
+    # Step 2: RRF merge across all (method, sub-query) ranked lists
     start = time.time()
-    # Group by sub-query for per-query RRF, or just merge all together?
-    # For simplicity, merge all. A more sophisticated approach would RRF per sub-query,
-    # then rank sub-query result groups.
-    # TODO: Consider per-sub-query RRF for better relevance isolation.
-    merged = retriever.rrf_merge([all_results], k=config.rrf_k, top_k=config.rrf_output_topk)
+    merged = retriever.rrf_merge(ranked_lists, k=config.rrf_k, top_k=config.rrf_output_topk)
     took_rrf = time.time() - start
 
     sub_trace.append(
         PipelineStage(
             stage="hybrid_search.rrf_merge",
             input={
-                "result_lists": len([all_results]),
-                "total_input": len(all_results),
+                "result_lists": len(ranked_lists),
+                "total_input": total_input,
                 "k": config.rrf_k,
             },
             output={"results": _result_summary(merged, limit=3), "count": len(merged)},
@@ -178,28 +197,9 @@ def hybrid_search(
         )
     )
 
-    # Step 3: Optional cross-encoder reranking
-    final_results = merged
-    if rerank:
-        start = time.time()
-        final_results = reranker.rerank(
-            query,
-            merged,
-            top_k=None,  # keep all for now; will rerank merged pool again at orchestrator level
-            text_field="text_raw",
-        )
-        took_rerank = time.time() - start
-
-        sub_trace.append(
-            PipelineStage(
-                stage="hybrid_search.rerank",
-                input={"count": len(merged)},
-                output={"results": _result_summary(final_results, limit=3), "count": len(final_results)},
-                took_ms=took_rerank * 1000,
-            )
-        )
-
-    return final_results, sub_trace
+    # Cross-encoder reranking is applied later at the orchestrator level
+    # on the merged pool (structured + hybrid), not here.
+    return merged, sub_trace
 
 
 def orchestrate(
