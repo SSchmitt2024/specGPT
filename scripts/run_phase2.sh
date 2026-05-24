@@ -6,14 +6,14 @@
 # Same UX as rerun_pipeline.sh — pick steps, backup outputs, run in order.
 #
 # Pipeline (output files in parentheses):
-#   1. Chunk prose         src.pipeline.chunker           (chunks_prose.json)
+#   1. Chunk prose         scripts/chunker.py             (chunks_prose.json)
 #   2. Serialize tables    src.pipeline.table_serializer  (chunks_tables.json)
-#   3. Embed chunks        src.pipeline.embedder          (chunks_embedded.json)
+#   3. Embed chunks        scripts/embedder.py            (chunks_embedded.json)
 #   4. Apply schema        scripts/apply_schema.py        (remote DB — DDL)
-#   5. Index to Supabase   src.pipeline.indexer           (remote DB — chunks)
+#   5. Index to Supabase   scripts/indexer.py             (remote DB — chunks)
 #   6. Load lookup data    scripts/load_lookup_data.py    (remote DB — fields/tables)
-#   7. Generate eval set   src.pipeline.eval_gen          (eval_set.json)
-#   8. Run eval            src.pipeline.eval_run          (eval_results.json)
+#   7. Generate eval set   scripts/eval_gen.py            (eval_set.json)
+#   8. Run eval            scripts/eval_run.py            (eval_results.json)
 #
 # Usage:
 #   ./scripts/run_phase2.sh
@@ -80,24 +80,24 @@ STEP_NAME=(
 )
 # For script-based steps, leave MODULE empty and set SCRIPT path instead.
 STEP_MODULE=(
-  "src.pipeline.chunker"
+  ""
   "src.pipeline.table_serializer"
-  "src.pipeline.embedder"
   ""
-  "src.pipeline.indexer"
   ""
-  "src.pipeline.eval_gen"
-  "src.pipeline.eval_run"
+  ""
+  ""
+  ""
+  ""
 )
 STEP_SCRIPT=(
+  "scripts/chunker.py"
   ""
-  ""
-  ""
+  "scripts/embedder.py"
   "scripts/apply_schema.py"
-  ""
+  "scripts/indexer.py"
   "scripts/load_lookup_data.py"
-  ""
-  ""
+  "scripts/eval_gen.py"
+  "scripts/eval_run.py"
 )
 STEP_OUTPUTS=(
   "data/chunks_prose.json"
@@ -298,11 +298,16 @@ run_step() {
   local module="${STEP_MODULE[$idx]}"
   local outputs="${STEP_OUTPUTS[$idx]}"
   local inputs="${STEP_INPUTS[$idx]}"
+  local script="${STEP_SCRIPT[$idx]}"
 
   echo ""
   echo "=============================================================="
   echo "Step $((idx+1)): $name"
-  echo "  module:  python -m $module"
+  if [[ -n "$script" ]]; then
+    echo "  script:  $script"
+  else
+    echo "  module:  python -m $module"
+  fi
   echo "  outputs: $outputs"
   echo "=============================================================="
 
@@ -341,7 +346,6 @@ run_step() {
   fi
 
   # Run — script path takes precedence over -m module
-  local script="${STEP_SCRIPT[$idx]}"
   if [[ -n "$script" ]]; then
     echo "    running: ${PYTHON_BIN[*]} -u $script"
     if command -v stdbuf >/dev/null 2>&1; then

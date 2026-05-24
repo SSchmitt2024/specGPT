@@ -33,8 +33,7 @@ What we extract from the NVMe spec PDF and why each piece exists.
   "caption": "Identify – Identify Controller Data Structure",
   "printed_page": 322,
   "headers": ["Bytes", "I/O", "Admin", "Disc", "Description"],
-  "rows": [["76", "O", "O", "R", "Controller Multi-Path ..."], ...],K
-  
+  "rows": [["76", "O", "O", "R", "Controller Multi-Path ..."], ...],
   "raw_text": "<fallback plain text>"
 }
 ```
@@ -168,7 +167,7 @@ Cross-references also have a `strength` field:
 
 ---
 
-## How the Edges Get Used 
+## How the Edges Get Used
 
 The edges are **not** a general-purpose knowledge graph for browsing. They serve one purpose: **retrieval expansion**.
 
