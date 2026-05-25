@@ -82,6 +82,13 @@ class PipelineConfig:
     llm_max_context_tokens: int = 4000
     llm_max_output_tokens: int = 1024
 
+    # Agentic-mode parameters (only used when orchestrate(..., agentic=True))
+    agentic_model: str = "claude-opus-4-7"
+    agentic_max_context_tokens: int = 16000
+    agentic_max_output_tokens: int = 2048
+    agentic_max_followups: int = 3   # cap LLM-generated follow-up queries
+    agentic_rerank_topk: int = 14    # top-k after re-rerank (~2× normal)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -225,11 +232,103 @@ def hybrid_search(
     return merged, sub_trace
 
 
+_AGENTIC_GAP_SYSTEM = """You are a quality reviewer for an NVMe specification Q&A system.
+
+A retrieval pipeline produced an answer to a user question using the provided
+retrieved sections. Your job: decide whether the answer adequately covers the
+question given what was retrieved, and if not, produce 1-3 focused follow-up
+search queries that would surface the missing information.
+
+A follow-up is needed when the answer:
+  - admits "the context does not contain X" or "information about Y is missing"
+  - cites a section that wasn't actually retrieved (hallucinated reference)
+  - leaves a specific bit/field/figure mentioned in the question undefined
+  - mentions a related concept that wasn't itself retrieved
+
+Each follow-up query must be a complete, focused question on its own — the
+kind a spec engineer would phrase to look up a specific definition, field
+layout, or behavior. NEVER repeat the original query verbatim.
+
+Return JSON ONLY:
+  {
+    "needs_followup": true|false,
+    "reason": "one short sentence",
+    "queries": ["...", "..."]   // empty array if needs_followup is false
+  }
+"""
+
+
+def _agentic_gap_analysis(
+    *,
+    query: str,
+    answer: str,
+    used_chunks: list[dict],
+    citations: list[dict],
+    max_followups: int,
+) -> tuple[list[str], str]:
+    """Ask the classifier LLM if follow-up retrieval is needed; return queries + reason.
+
+    On any failure, returns ([], "<failure note>") so the agentic loop falls
+    back to the single-pass answer.
+    """
+    used_titles = "\n".join(
+        f"  - [{c.get('section_id','?')}] {c.get('section_title','')}"
+        for c in used_chunks[:20]
+    ) or "  (none)"
+    halluc = [c for c in citations if c.get("hallucinated")]
+    halluc_block = ""
+    if halluc:
+        halluc_block = "\nCitations not found in retrieved context:\n" + "\n".join(
+            f"  - Section {c.get('section_id')}" for c in halluc
+        )
+
+    user_prompt = (
+        f"Original question:\n  {query}\n\n"
+        f"Retrieved sections fed to the answerer:\n{used_titles}\n"
+        f"{halluc_block}\n"
+        f"Answer (first 1500 chars):\n<<<\n{(answer or '')[:1500]}\n>>>\n"
+    )
+
+    try:
+        parsed, _ = query_processor.generate_json(  # via the LLM client
+            user_prompt,
+            system=_AGENTIC_GAP_SYSTEM,
+            temperature=0.0,
+            max_output_tokens=300,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agentic gap-analysis failed: %s", e)
+        return [], f"gap-analysis failed ({type(e).__name__})"
+
+    if not isinstance(parsed, dict) or not parsed.get("needs_followup"):
+        return [], str(parsed.get("reason", "no follow-ups needed")) if isinstance(parsed, dict) else "non-dict gap response"
+
+    raw = parsed.get("queries") or []
+    if not isinstance(raw, list):
+        return [], "invalid queries field"
+    clean: list[str] = []
+    seen: set[str] = set()
+    qnorm = " ".join(query.split()).lower()
+    for q in raw:
+        s = " ".join(str(q).split())
+        if len(s) < 4 or len(s) > 400:
+            continue
+        if s.lower() == qnorm:
+            continue  # skip exact-duplicate of original
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(s)
+    return clean[:max_followups], str(parsed.get("reason", ""))
+
+
 def orchestrate(
     query: str,
     *,
     config: PipelineConfig | None = None,
     debug: bool = True,
+    agentic: bool = False,
 ) -> dict:
     """
     Execute the full retrieval + generation pipeline.
@@ -494,6 +593,142 @@ def orchestrate(
         ) from e
 
     # -------------------------------------------------------------------------
+    # Stage 5 (optional): Agentic refinement
+    #
+    # On request, ask a small LLM whether the answer covers the question given
+    # the retrieved chunks. If it identifies gaps, retrieve more (using the
+    # gap-derived follow-up queries), merge into the pool, re-rerank, and
+    # regenerate with the higher-tier model + larger context budget.
+    # -------------------------------------------------------------------------
+    if agentic:
+        start = time.time()
+        followups, gap_reason = _agentic_gap_analysis(
+            query=query,
+            answer=answer,
+            used_chunks=context_chunks,
+            citations=citations,
+            max_followups=config.agentic_max_followups,
+        )
+        took_gap = time.time() - start
+        trace.append(
+            PipelineStage(
+                stage="agentic.gap_analysis",
+                input={"answer_chars": len(answer or ""),
+                       "max_followups": config.agentic_max_followups},
+                output={"needs_followup": bool(followups), "reason": gap_reason,
+                        "queries": followups},
+                took_ms=took_gap * 1000,
+            )
+        )
+
+        if followups:
+            # Per-followup hybrid_search (same fan-out as the main path but
+            # without re-running the LLM-based decomposer; the gap analyser
+            # already produced focused queries).
+            extra_chunks: list[dict] = []
+            for fi, fq in enumerate(followups):
+                start = time.time()
+                fq_chunks, fq_trace = hybrid_search(fq, sub_queries=[fq], config=config)
+                took_fq = time.time() - start
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.followup_search_q{fi}",
+                        input={"query": fq},
+                        output={"chunk_count": len(fq_chunks)},
+                        took_ms=took_fq * 1000,
+                    )
+                )
+                trace.extend(fq_trace)
+                extra_chunks.extend(fq_chunks)
+
+            # Merge new chunks with the prior pool. We re-dedup against the
+            # full pre-rerank pool (`deduplicated` from stage 2c) so we keep
+            # the structured-lookup sources too.
+            start = time.time()
+            seen2: set = set()
+            expanded: list[dict] = []
+            for chunk in deduplicated + extra_chunks:
+                cid = chunk.get("id") or chunk.get("chunk_id")
+                if not cid:
+                    cid = ("__no_id__", chunk.get("section_id"),
+                           chunk.get("figure_number"), chunk.get("content_type"),
+                           (chunk.get("text_raw") or "")[:120])
+                if cid not in seen2:
+                    seen2.add(cid)
+                    expanded.append(chunk)
+            took_merge = time.time() - start
+
+            # Re-rerank the expanded pool against the original query, keeping
+            # a wider top-k so Opus has more material to synthesize.
+            start = time.time()
+            reranked2 = reranker.rerank(
+                query, expanded,
+                top_k=config.agentic_rerank_topk,
+                model_name=config.cross_encoder_model,
+                text_field="text_raw",
+            )
+            took_rr2 = time.time() - start
+            trace.append(
+                PipelineStage(
+                    stage="agentic.rerank",
+                    input={"chunk_count": len(expanded),
+                           "top_k": config.agentic_rerank_topk,
+                           "added_by_followups": len(extra_chunks)},
+                    output={"results": _result_summary(reranked2),
+                            "count": len(reranked2),
+                            "merge_ms": took_merge * 1000},
+                    took_ms=took_rr2 * 1000,
+                )
+            )
+
+            # Regenerate with Opus + larger context.
+            start = time.time()
+            try:
+                answer2, citations2, used2, tokens2 = generator.generate(
+                    query, reranked2,
+                    model=config.agentic_model,
+                    max_context_tokens=config.agentic_max_context_tokens,
+                    max_tokens=config.agentic_max_output_tokens,
+                )
+                took_g2 = time.time() - start
+                trace.append(
+                    PipelineStage(
+                        stage="agentic.regenerate",
+                        input={"chunk_count": len(reranked2),
+                               "model": config.agentic_model,
+                               "max_context_tokens": config.agentic_max_context_tokens},
+                        output={"answer_length": len(answer2),
+                                "citation_count": len(citations2),
+                                "tokens": tokens2,
+                                "context_used": [
+                                    {"section_id": c.get("section_id"),
+                                     "section_title": c.get("section_title"),
+                                     "content_type": c.get("content_type")}
+                                    for c in used2
+                                ]},
+                        took_ms=took_g2 * 1000,
+                    )
+                )
+                # Promote the agentic answer as the canonical result.
+                answer, citations, context_chunks = answer2, citations2, used2
+            except Exception as e:
+                # Agentic regenerate failed — keep the first-pass answer so the
+                # user still gets something. Log the cause prominently.
+                took_g2 = time.time() - start
+                logger.exception("Agentic regenerate failed after %.0fms: %s",
+                                 took_g2 * 1000, e)
+                trace.append(
+                    PipelineStage(
+                        stage="agentic.regenerate",
+                        input={"chunk_count": len(reranked2),
+                               "model": config.agentic_model},
+                        output={"error_type": type(e).__name__,
+                                "note": "kept first-pass answer"},
+                        took_ms=took_g2 * 1000,
+                    )
+                )
+
+    # -------------------------------------------------------------------------
     # Assemble final response
     # -------------------------------------------------------------------------
     return {
@@ -502,6 +737,7 @@ def orchestrate(
         "citations": citations,
         "sources": context_chunks,
         "config": config.to_dict(),
+        "agentic": agentic,
         "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
     }
 

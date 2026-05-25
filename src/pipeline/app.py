@@ -136,6 +136,11 @@ class QueryRequest(BaseModel):
     query: str
     config: dict | None = None
     debug: bool = True
+    # When true, after the normal pipeline finishes the orchestrator runs a
+    # gap-analysis LLM call, dispatches follow-up retrievals for any
+    # under-covered aspects, merges + re-reranks the expanded chunk pool,
+    # and regenerates with the agentic model. Adds ~30-60s + Opus cost.
+    agentic: bool = False
 
 
 class QueryResponse(BaseModel):
@@ -344,6 +349,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         # block the FastAPI event loop for the duration of the pipeline.
         result = await asyncio.to_thread(
             orchestrate, req.query, config=config, debug=debug_trace,
+            agentic=req.agentic,
         )
     except GenerationError as e:
         # Retrieval worked; generation failed. 502 (bad upstream gateway)
@@ -496,6 +502,41 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
         .config-toggle:hover {
             background: #7f8c8d;
+        }
+
+        /* ─── Agentic-mode toggle ─────────────────────────────────────── */
+        .agentic-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: #f4f6f7;
+            border-radius: 4px;
+            border-left: 3px solid #8e44ad;
+            font-size: 13px;
+            color: #555;
+        }
+        .agentic-row label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+        .agentic-row input[type="checkbox"] {
+            transform: scale(1.2);
+            cursor: pointer;
+        }
+        .agentic-row .agentic-hint {
+            color: #7f8c8d;
+            font-weight: normal;
+            font-size: 12px;
+        }
+        .agentic-row.active {
+            background: #f3e5f5;
+            border-left-color: #6c3483;
         }
 
         .config-panel {
@@ -715,6 +756,137 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 width: 100%;
             }
         }
+
+        /* ─── Markdown rendering inside .answer-text ──────────────────────
+           Subset of Claude.ai's style: comfortable spacing, bordered tables
+           with a subtle row-zebra, monospace code blocks, soft inline-code
+           chips. Scoped to .answer-text so the rest of the page is unaffected. */
+        .answer-text h1, .answer-text h2, .answer-text h3, .answer-text h4 {
+            color: #2c3e50;
+            margin: 1.1em 0 0.4em;
+            line-height: 1.3;
+        }
+        .answer-text h1 { font-size: 1.55em; }
+        .answer-text h2 { font-size: 1.35em; }
+        .answer-text h3 { font-size: 1.18em; }
+        .answer-text h4 { font-size: 1.05em; }
+        .answer-text > *:first-child { margin-top: 0; }
+        .answer-text > *:last-child  { margin-bottom: 0; }
+        .answer-text p { margin: 0.65em 0; }
+        .answer-text ul, .answer-text ol {
+            margin: 0.65em 0; padding-left: 1.6em;
+        }
+        .answer-text li { margin: 0.25em 0; }
+        .answer-text li > p { margin: 0.25em 0; }
+        .answer-text strong { color: #2c3e50; }
+        .answer-text em { color: #555; }
+        .answer-text blockquote {
+            border-left: 3px solid #bdc3c7;
+            color: #555;
+            margin: 0.8em 0;
+            padding: 0.2em 0.9em;
+            background: #f4f6f7;
+            border-radius: 0 3px 3px 0;
+        }
+        .answer-text code {
+            font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+            font-size: 0.9em;
+            background: #eef2f6;
+            padding: 1px 5px;
+            border-radius: 3px;
+            color: #2c3e50;
+            border: 1px solid #e1e6ec;
+        }
+        .answer-text pre {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 12px 14px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 0.8em 0;
+            line-height: 1.45;
+            font-size: 0.88em;
+        }
+        .answer-text pre code {
+            background: transparent;
+            border: 0;
+            padding: 0;
+            color: inherit;
+            font-size: 1em;
+        }
+        .answer-text table {
+            border-collapse: collapse;
+            margin: 0.9em 0;
+            width: 100%;
+            font-size: 0.94em;
+            background: white;
+            border: 1px solid #d0d7de;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .answer-text th, .answer-text td {
+            border: 1px solid #e1e6ec;
+            padding: 8px 11px;
+            text-align: left;
+            vertical-align: top;
+        }
+        .answer-text th {
+            background: #f4f6f7;
+            color: #2c3e50;
+            font-weight: 600;
+        }
+        .answer-text tr:nth-child(even) td { background: #fafbfc; }
+        .answer-text a {
+            color: #2980b9;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+        .answer-text hr {
+            border: 0;
+            border-top: 1px solid #d0d7de;
+            margin: 1.2em 0;
+        }
+
+        /* ─── Pipeline visualization (Mermaid DAG) ───────────────────── */
+        .viz-section {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 18px 18px 8px;
+            margin-top: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .viz-section h2 {
+            font-size: 18px;
+            color: #2c3e50;
+            margin: 0 0 4px;
+        }
+        .viz-section .viz-sub {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 14px;
+        }
+        .viz-container {
+            overflow-x: auto;
+            background: #fafbfc;
+            border: 1px solid #eef2f6;
+            border-radius: 6px;
+            padding: 16px;
+            min-height: 200px;
+        }
+        .viz-container .mermaid { text-align: center; }
+        .viz-container svg { max-width: 100%; height: auto; }
+        .viz-empty {
+            color: #888;
+            text-align: center;
+            font-size: 13px;
+            padding: 30px;
+            font-style: italic;
+        }
+        /* Mermaid node text — slightly larger for readability */
+        .viz-container .nodeLabel, .viz-container .label {
+            font-size: 12px !important;
+        }
     </style>
 </head>
 <body>
@@ -740,7 +912,19 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     autocomplete="off"
                 >
                 <button id="search-btn">Search</button>
-                <button id="config-toggle" class="config-toggle">⚙️ Config</button>
+                <button id="config-toggle" class="config-toggle">Config</button>
+            </div>
+
+            <div id="agentic-row" class="agentic-row">
+                <label>
+                    <input type="checkbox" id="agentic-toggle">
+                    <span>Agentic mode</span>
+                </label>
+                <span class="agentic-hint">
+                    Decomposes the answer, runs follow-up retrieval to fill
+                    gaps, then regenerates with Opus + larger context. Slower
+                    (~30-60s) and ~10× the cost leave off for routine queries.
+                </span>
             </div>
 
             <div id="config-panel" class="config-panel">
@@ -782,7 +966,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             <div id="error" class="error hidden"></div>
 
             <div id="loading" class="loading hidden">
-                ⏳ Running pipeline...
+                Running pipeline…
             </div>
 
             <div id="answer-section" class="results-section hidden">
@@ -802,15 +986,273 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <h2>Pipeline Trace</h2>
                     <div id="pipeline-stages"></div>
                 </div>
+
+                <div class="viz-section">
+                    <h2>Pipeline Flow</h2>
+                    <div class="viz-sub">
+                        Each color is a stage type. Branches show per-sub-query
+                        retrieval (vector / tsvector / BM25); all paths merge
+                        through RRF → dedup → rerank → generation.
+                    </div>
+                    <div id="pipeline-viz" class="viz-container">
+                        <div class="viz-empty">Run a query to see the pipeline flow.</div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
-    <footer>
-        <p>Built with FastAPI + Anthropic Claude. Source: <a href="https://github.com/SSchmitt2024/specGPT">SSchmitt2024/specGPT</a></p>
-    </footer>
+    <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
+         LLM output is partially user-influenced via prompt injection, so we
+         MUST sanitise the marked-generated HTML before injecting it into the
+         DOM. Pinned to specific versions so the URL is effectively immutable. -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.5/dist/purify.min.js"></script>
+
+    <!-- Mermaid: renders the pipeline_trace as a downward-facing DAG.
+         securityLevel:'strict' so any text we interpolate into node labels
+         is encoded; click events disabled. Mermaid's own renderer never
+         executes user-supplied HTML. -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
 
     <script>
+        // GitHub-flavored markdown (tables, fenced code, autolinks).
+        marked.setOptions({ gfm: true, breaks: false });
+
+        // Mermaid: strict mode so any interpolated label text is encoded by
+        // Mermaid itself; we also defensively scrub our own input.
+        if (typeof mermaid !== "undefined") {
+            mermaid.initialize({
+                startOnLoad: false,
+                securityLevel: "strict",
+                theme: "default",
+                flowchart: { curve: "basis", htmlLabels: true, useMaxWidth: true },
+            });
+        }
+
+        // ─── Pipeline trace → Mermaid graph definition ────────────────────
+        // Strips anything that would break Mermaid's label parser (newlines,
+        // pipes, quotes, brackets) and caps length so a giant entity list
+        // doesn't blow up the layout.
+        function _vizText(s, max = 50) {
+            if (s === null || s === undefined) return "";
+            return String(s)
+                .replace(/[\\n\\r]+/g, " ")
+                .replace(/[|"<>\\[\\]{}`]/g, "")
+                .trim()
+                .slice(0, max);
+        }
+        function _ms(stage) {
+            return (stage && typeof stage.took_ms === "number")
+                ? `${stage.took_ms.toFixed(0)}ms` : "";
+        }
+
+        function buildMermaidFromTrace(trace, query) {
+            const stages = {};
+            for (const s of trace) stages[s.stage] = s;
+
+            const L = ["flowchart TD"];
+            L.push(`  Q["Query<br/><i>${_vizText(query, 60)}</i>"]:::input`);
+
+            const qp = stages.query_processor;
+            if (!qp) {
+                L.push("  classDef input fill:#34495e,color:#fff,stroke:#2c3e50,stroke-width:2px");
+                return L.join("\\n");
+            }
+
+            const qpType = _vizText(qp.output.type, 20);
+            const qpEnts = (qp.output.entities || []).length;
+            const qpSubs = (qp.output.sub_queries || []).length;
+            L.push(`  QP["Query Processor<br/>type=<b>${qpType}</b><br/>${qpEnts} entities, ${qpSubs} sub-queries<br/>${_ms(qp)}"]:::stage_qp`);
+            L.push("  Q --> QP");
+
+            // Structured lookup — side branch that merges back into dedup
+            const sl = stages.structured_lookup;
+            let slActive = false;
+            if (sl) {
+                if (sl.output.skipped) {
+                    L.push(`  SL["Structured Lookup<br/><i>skipped</i><br/>${_vizText(sl.output.reason, 40)}"]:::stage_skipped`);
+                } else {
+                    slActive = true;
+                    const found = sl.output.found;
+                    const conf = _vizText(sl.output.confidence, 12);
+                    const flds = sl.output.field_count || 0;
+                    const tbls = sl.output.table_count || 0;
+                    L.push(`  SL["Structured Lookup<br/>found=<b>${found}</b> conf=${conf}<br/>${flds} fields · ${tbls} tables<br/>${_ms(sl)}"]:::stage_struct`);
+                }
+                L.push("  QP --> SL");
+            }
+
+            // Per-sub-query branches: vector + tsvector + BM25
+            const subIds = new Set();
+            for (const s of trace) {
+                const m = s.stage.match(/^hybrid_search\\.\\w+_q(\\d+)$/);
+                if (m) subIds.add(parseInt(m[1], 10));
+            }
+            const sortedSubs = [...subIds].sort((a, b) => a - b);
+
+            const rrf = stages["hybrid_search.rrf_merge"];
+            for (const i of sortedSubs) {
+                const v = stages[`hybrid_search.vector_search_q${i}`];
+                const t = stages[`hybrid_search.tsvector_search_q${i}`];
+                const b = stages[`hybrid_search.bm25_search_q${i}`];
+                const sqText = (v && v.input && v.input.query) || `q${i}`;
+                L.push(`  SQ${i}{{"Sub-query ${i}<br/><i>${_vizText(sqText, 60)}</i>"}}:::stage_subq`);
+                L.push(`  QP --> SQ${i}`);
+
+                if (v) {
+                    L.push(`  V${i}["Vector (Voyage)<br/>${v.output.count || 0} hits<br/>${_ms(v)}"]:::stage_vector`);
+                    L.push(`  SQ${i} --> V${i}`);
+                    if (rrf) L.push(`  V${i} --> RRF`);
+                }
+                if (t) {
+                    L.push(`  T${i}["tsvector (Postgres)<br/>${t.output.count || 0} hits<br/>${_ms(t)}"]:::stage_tsv`);
+                    L.push(`  SQ${i} --> T${i}`);
+                    if (rrf) L.push(`  T${i} --> RRF`);
+                }
+                if (b) {
+                    L.push(`  B${i}["BM25 (Okapi)<br/>${b.output.count || 0} hits<br/>${_ms(b)}"]:::stage_bm25`);
+                    L.push(`  SQ${i} --> B${i}`);
+                    if (rrf) L.push(`  B${i} --> RRF`);
+                }
+            }
+
+            if (rrf) {
+                L.push(`  RRF["RRF Merge<br/>${rrf.output.count || 0} merged<br/>${_ms(rrf)}"]:::stage_rrf`);
+            }
+
+            const dd = stages.result_dedup;
+            if (dd) {
+                L.push(`  DEDUP["Dedup<br/>${dd.output.deduped_count || 0} chunks<br/>${_ms(dd)}"]:::stage_dedup`);
+                if (rrf) L.push("  RRF --> DEDUP");
+                if (slActive) L.push("  SL --> DEDUP");
+            }
+
+            const rr = stages.final_rerank;
+            if (rr) {
+                L.push(`  RR["Cross-encoder Rerank<br/>top ${rr.output.count || 0}<br/>${_ms(rr)}"]:::stage_rerank`);
+                if (dd) L.push("  DEDUP --> RR");
+            }
+
+            const gen = stages.generation;
+            if (gen) {
+                const cits = (gen.output.citation_count !== undefined) ? gen.output.citation_count : "?";
+                const ans = gen.output.answer_length || 0;
+                L.push(`  GEN["Generation (Claude)<br/>${ans} chars · ${cits} citations<br/>${_ms(gen)}"]:::stage_gen`);
+                if (rr) L.push("  RR --> GEN");
+            }
+
+            // ─── Agentic refinement branch (only present when agentic=true) ───
+            const gap = stages["agentic.gap_analysis"];
+            const ag_rr = stages["agentic.rerank"];
+            const ag_gen = stages["agentic.regenerate"];
+            let agAnswerNode = "GEN"; // node whose output is the final answer
+            if (gap) {
+                const needs = gap.output && gap.output.needs_followup;
+                const reason = _vizText((gap.output && gap.output.reason) || "", 60);
+                L.push(`  GAP{"Gap Analysis<br/>needs_followup=<b>${!!needs}</b><br/><i>${reason}</i><br/>${_ms(gap)}"}:::stage_gap`);
+                if (gen) L.push("  GEN --> GAP");
+
+                if (needs) {
+                    // Per-followup retrieval branches
+                    const fqIds = new Set();
+                    for (const s of trace) {
+                        const m = s.stage.match(/^agentic\\.followup_search_q(\\d+)$/);
+                        if (m) fqIds.add(parseInt(m[1], 10));
+                    }
+                    for (const i of [...fqIds].sort((a, b) => a - b)) {
+                        const fq = stages[`agentic.followup_search_q${i}`];
+                        const qText = (fq && fq.input && fq.input.query) || `gap-q${i}`;
+                        L.push(`  FQ${i}{{"Follow-up ${i}<br/><i>${_vizText(qText, 60)}</i><br/>${(fq && fq.output && fq.output.chunk_count) || 0} chunks<br/>${_ms(fq)}"}}:::stage_followup`);
+                        L.push(`  GAP --> FQ${i}`);
+                        if (ag_rr) L.push(`  FQ${i} --> RR2`);
+                    }
+                    if (ag_rr) {
+                        L.push(`  RR2["Agentic Rerank<br/>top ${(ag_rr.output && ag_rr.output.count) || 0}<br/>+${(ag_rr.input && ag_rr.input.added_by_followups) || 0} new chunks<br/>${_ms(ag_rr)}"]:::stage_rerank`);
+                    }
+                    if (ag_gen) {
+                        const c2 = (ag_gen.output && ag_gen.output.citation_count !== undefined) ? ag_gen.output.citation_count : "?";
+                        const a2 = (ag_gen.output && ag_gen.output.answer_length) || 0;
+                        const errType = ag_gen.output && ag_gen.output.error_type;
+                        const label = errType
+                            ? `Agentic Regenerate<br/><i>${_vizText(errType, 30)}</i> — fell back<br/>${_ms(ag_gen)}`
+                            : `Agentic Regenerate (Opus)<br/>${a2} chars · ${c2} citations<br/>${_ms(ag_gen)}`;
+                        L.push(`  GEN2["${label}"]:::stage_agen`);
+                        if (ag_rr) L.push("  RR2 --> GEN2");
+                        if (!errType) agAnswerNode = "GEN2";
+                    }
+                }
+            }
+
+            L.push('  ANS(["Final Answer"]):::output');
+            L.push(`  ${agAnswerNode} --> ANS`);
+
+            // Color palette — distinct per stage type, readable on light bg
+            L.push("  classDef input    fill:#34495e,color:#fff,stroke:#2c3e50,stroke-width:2px");
+            L.push("  classDef output   fill:#27ae60,color:#fff,stroke:#229954,stroke-width:2px");
+            L.push("  classDef stage_qp     fill:#9b59b6,color:#fff,stroke:#7d3c98,stroke-width:1px");
+            L.push("  classDef stage_struct fill:#16a085,color:#fff,stroke:#117a65,stroke-width:1px");
+            L.push("  classDef stage_skipped fill:#ecf0f1,color:#7f8c8d,stroke:#bdc3c7,stroke-width:1px,stroke-dasharray:4 3");
+            L.push("  classDef stage_subq   fill:#2980b9,color:#fff,stroke:#1f618d,stroke-width:1px");
+            L.push("  classDef stage_vector fill:#3498db,color:#fff");
+            L.push("  classDef stage_tsv    fill:#5dade2,color:#fff");
+            L.push("  classDef stage_bm25   fill:#85c1e2,color:#1b2631");
+            L.push("  classDef stage_rrf    fill:#e67e22,color:#fff,stroke:#ba6817,stroke-width:1px");
+            L.push("  classDef stage_dedup  fill:#d35400,color:#fff");
+            L.push("  classDef stage_rerank fill:#e74c3c,color:#fff,stroke:#922b21,stroke-width:1px");
+            L.push("  classDef stage_gen    fill:#c0392b,color:#fff,stroke:#641e16,stroke-width:1px");
+            // Agentic-branch colors — purple family to set them apart from the
+            // normal-path warm colors and tie back to the toggle's accent.
+            L.push("  classDef stage_gap      fill:#8e44ad,color:#fff,stroke:#6c3483,stroke-width:1px");
+            L.push("  classDef stage_followup fill:#af7ac5,color:#fff,stroke:#7d3c98,stroke-width:1px");
+            L.push("  classDef stage_agen     fill:#4a235a,color:#fff,stroke:#1b4f72,stroke-width:2px");
+
+            return L.join("\\n");
+        }
+
+        let _vizCounter = 0;
+        async function renderPipelineViz(trace, query) {
+            const host = document.getElementById("pipeline-viz");
+            if (!trace || !trace.length) {
+                host.innerHTML = '<div class="viz-empty">No pipeline trace returned — set <code>DEBUG_PIPELINE=1</code> on the server to enable.</div>';
+                return;
+            }
+            if (typeof mermaid === "undefined") {
+                host.innerHTML = '<div class="viz-empty">Mermaid failed to load (CDN blocked?). The expanded trace above still has every stage.</div>';
+                return;
+            }
+            const id = `viz-${++_vizCounter}`;
+            const def = buildMermaidFromTrace(trace, query);
+            try {
+                const { svg } = await mermaid.render(id, def);
+                host.innerHTML = svg;
+            } catch (err) {
+                console.error("mermaid render failed:", err, def);
+                host.innerHTML = `<div class="viz-empty">Could not render flow: ${escapeHtml(err.message || String(err))}</div>`;
+            }
+        }
+
+        function renderMarkdown(md) {
+            if (typeof md !== "string") return "";
+            const html = marked.parse(md);
+            return DOMPurify.sanitize(html, {
+                // Whitelist the tags + attributes Claude actually emits. The
+                // default DOMPurify whitelist already strips <script>, event
+                // handlers, javascript: URLs, etc. This narrows it further so
+                // a malicious answer can't, say, drop a giant <iframe>.
+                ALLOWED_TAGS: [
+                    "p", "br", "hr", "strong", "em", "code", "pre",
+                    "ul", "ol", "li", "blockquote",
+                    "h1", "h2", "h3", "h4", "h5", "h6",
+                    "table", "thead", "tbody", "tr", "th", "td",
+                    "a", "del", "ins", "sup", "sub", "span"
+                ],
+                ALLOWED_ATTR: ["href", "title", "align", "colspan", "rowspan"],
+                ALLOW_DATA_ATTR: false,
+                FORBID_ATTR: ["style", "onerror", "onload", "onclick"],
+            });
+        }
+
         const queryInput = document.getElementById("query-input");
         const searchBtn = document.getElementById("search-btn");
         const configToggle = document.getElementById("config-toggle");
@@ -819,6 +1261,11 @@ FRONTEND_HTML = """<!DOCTYPE html>
         const loadingDiv = document.getElementById("loading");
         const errorDiv = document.getElementById("error");
         const answerSection = document.getElementById("answer-section");
+        const agenticToggle = document.getElementById("agentic-toggle");
+        const agenticRow = document.getElementById("agentic-row");
+        agenticToggle.addEventListener("change", () => {
+            agenticRow.classList.toggle("active", agenticToggle.checked);
+        });
 
         // Config panel toggle
         configToggle.addEventListener("click", () => {
@@ -856,11 +1303,18 @@ FRONTEND_HTML = """<!DOCTYPE html>
             errorDiv.classList.add("hidden");
             answerSection.classList.add("hidden");
 
+            const agentic = agenticToggle.checked;
+            if (agentic) {
+                loadingDiv.innerHTML = "Running pipeline (agentic mode this can take 30–60s)…";
+            } else {
+                loadingDiv.textContent = "Running pipeline…";
+            }
+
             try {
                 const response = await fetch("/api/query", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query, config, debug: true }),
+                    body: JSON.stringify({ query, config, debug: true, agentic }),
                 });
 
                 if (response.status === 401) {
@@ -894,9 +1348,17 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
 
         function displayResults(data) {
-            // Answer
-            document.getElementById("answer-text").textContent = data.answer;
-            document.getElementById("latency").textContent = `⏱️ ${data.latency_ms.toFixed(0)}ms`;
+            // Render the answer through marked → DOMPurify so markdown tables,
+            // headers, code blocks, and lists display the way Claude.ai does.
+            // textContent fallback if either lib failed to load (network issue,
+            // CDN block, offline) so the user still sees the raw answer.
+            const answerEl = document.getElementById("answer-text");
+            if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+                answerEl.innerHTML = renderMarkdown(data.answer || "");
+            } else {
+                answerEl.textContent = data.answer || "";
+            }
+            document.getElementById("latency").textContent = `${data.latency_ms.toFixed(0)}ms`;
 
             // Citations — escape attacker-controlled fields (section_id /
             // section_title flow back from PDF text) before HTML interpolation.
@@ -908,7 +1370,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         const sid = escapeHtml(c.section_id);
                         const title = escapeHtml(c.section_title);
                         const flag = c.hallucinated
-                            ? ' <span class="citation-section" title="Cited section not found in retrieved context">⚠ not in context</span>'
+                            ? ' <span class="citation-section" title="Cited section not found in retrieved context">(not in context)</span>'
                             : "";
                         return `<div class="citation-item"><span class="citation-section">[§${sid}]</span> ${title}${flag}</div>`;
                     })
@@ -936,7 +1398,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         </div>
                     `)
                     .join("");
+            } else {
+                stagesDiv.innerHTML = '';
             }
+
+            // Pipeline visualization (Mermaid DAG)
+            renderPipelineViz(data.pipeline_trace, data.query);
 
             answerSection.classList.remove("hidden");
         }
