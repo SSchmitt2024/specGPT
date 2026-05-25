@@ -1,42 +1,97 @@
 """
 Phase 2 - Step 2.5: Web Application (FastAPI Backend)
 
-Exposes the full retrieval + generation pipeline as a web service.
+Exposes the full retrieval + generation pipeline as a web service, gated
+by a shared-password login (see src/pipeline/auth.py for the threat model).
 
-Endpoints:
-  POST /api/query — run pipeline, return answer + pipeline trace
-  GET / — serve web frontend
-  GET /api/config — get default config
+Endpoints (auth-gated unless marked public):
+  GET  /healthz       — public liveness check (Railway/k8s healthcheck)
+  GET  /login         — public; renders the password form
+  POST /login         — public; validates password, sets session cookie
+  POST /logout        — public; clears session cookie
+  GET  /              — gated; serves the web UI (or redirects to /login)
+  POST /api/query     — gated; runs the pipeline
+  GET  /api/config    — gated; returns default PipelineConfig
 
-Environment:
-  DEBUG_PIPELINE — set to "1" to include full trace in responses (default: on)
-  PORT — server port (default: 8000)
-  HOST — server host (default: 127.0.0.1)
+Required env vars:
+  APP_PASSWORD     — plaintext shared password (hashed at startup, wiped from memory)
+  SESSION_SECRET   — ≥16-byte string used as HMAC key for session cookies
+  SUPABASE_URL / SUPABASE_KEY / VOYAGE_API_KEY / ANTHROPIC_API_KEY — pipeline backends
+
+Optional env vars:
+  DEBUG_PIPELINE   — "1" to include full trace in responses (default: off)
+  PORT             — server port (default: 8000)
+  HOST             — server host (default: 127.0.0.1)
+  COOKIE_SECURE    — "0" to allow non-HTTPS cookies for local dev (default: on)
+  LOG_LEVEL        — Python logging level (default: INFO)
 
 Run:
   python -m src.pipeline.app
   Then visit http://localhost:8000
-
-Architecture:
-  - FastAPI backend orchestrates the pipeline
-  - Frontend is vanilla HTML/CSS/JS for visualization
-  - Config passed from frontend to backend
-  - Pipeline trace returned for debugging
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
 import os
 import time
-from typing import Any
+import uuid
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from src.pipeline.orchestrator import orchestrate, PipelineConfig
+from src.pipeline.auth import (
+    SESSION_COOKIE,
+    SESSION_LIFETIME_SECONDS,
+    LoginThrottle,
+    create_session_token,
+    hash_password,
+    verify_password,
+    verify_session_token,
+)
+from src.pipeline.orchestrator import GenerationError, orchestrate, PipelineConfig
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+
+# ============================================================================
+# Auth: read + hash + wipe at module load (fail loud if missing)
+# ============================================================================
+
+def _bootstrap_auth() -> tuple[str, bytes, bool]:
+    """
+    Read auth env vars, hash the password, return ``(hash, secret_bytes, cookie_secure)``.
+
+    Raises RuntimeError at import time if either secret is missing so the
+    server never starts in a half-authenticated state. The plaintext
+    password is dropped from the local namespace once hashed.
+    """
+    plain = os.getenv("APP_PASSWORD")
+    secret = os.getenv("SESSION_SECRET")
+    if not plain:
+        raise RuntimeError(
+            "APP_PASSWORD is not set. Pick a password and set it in the environment "
+            "(or .env). The plaintext is hashed at startup and never written to disk."
+        )
+    if not secret or len(secret.encode("utf-8")) < 16:
+        raise RuntimeError(
+            "SESSION_SECRET must be set to a string of at least 16 bytes. Generate one with:\n"
+            "  python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        )
+    hashed = hash_password(plain)
+    # Be defensive about leaving the plaintext in module-globals or env.
+    # (os.environ.pop is best-effort: any subprocess we spawned before now
+    # would already have inherited it. For a single-process app it suffices.)
+    os.environ.pop("APP_PASSWORD", None)
+    return hashed, secret.encode("utf-8"), os.getenv("COOKIE_SECURE", "1").lower() in ("1", "true", "yes")
+
+
+_PASSWORD_HASH, _SESSION_SECRET_BYTES, _COOKIE_SECURE = _bootstrap_auth()
+_throttle = LoginThrottle()
 
 
 # ============================================================================
@@ -70,16 +125,167 @@ app = FastAPI(
     version="2.0",
 )
 
-# Configuration
-DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "1").lower() in ("1", "true", "yes")
+# Configuration: trace exposes chunk previews, model names, and timings, so
+# default to OFF. Set DEBUG_PIPELINE=1 only in development.
+DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "0").lower() in ("1", "true", "yes")
+
+
+# ============================================================================
+# Auth helpers + endpoints
+# ============================================================================
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP. Trusts X-Forwarded-For only if explicitly opted in
+    via TRUST_PROXY_HEADERS=1 — otherwise the throttle can be bypassed by
+    spoofing the header."""
+    if os.getenv("TRUST_PROXY_HEADERS", "0").lower() in ("1", "true", "yes"):
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_LIFETIME_SECONDS,
+        httponly=True,
+        secure=_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+
+
+def require_auth(
+    request: Request,
+    specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> bool:
+    """FastAPI dependency: 401 (JSON) if the session cookie is missing or invalid.
+
+    Use on API routes. For HTML routes prefer the explicit cookie check +
+    303 redirect to /login (see `frontend`).
+    """
+    del request  # only here to satisfy callers that want the request context
+    if verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
+        return True
+    raise HTTPException(status_code=401, detail={"error": "auth_required"})
+
+
+def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
+    """Standalone login page. Same look-and-feel as the main UI."""
+    import html as _html
+    error_html = (
+        f'<div class="error">{_html.escape(error)}</div>' if error else ""
+    )
+    next_attr = _html.escape(next_path or "/", quote=True)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>specGPT — sign in</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5; color: #333; margin: 0;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+    .card {{ background: white; padding: 32px 28px; border-radius: 8px;
+             box-shadow: 0 2px 6px rgba(0,0,0,0.08); width: 320px; }}
+    h1 {{ font-size: 22px; margin: 0 0 6px; color: #2c3e50; }}
+    p.sub {{ font-size: 13px; color: #666; margin: 0 0 20px; }}
+    label {{ display: block; font-size: 12px; font-weight: 600;
+             text-transform: uppercase; color: #555; margin-bottom: 6px; }}
+    input[type=password] {{ width: 100%; box-sizing: border-box; padding: 10px;
+                             border: 2px solid #e0e0e0; border-radius: 4px;
+                             font-size: 16px; }}
+    input[type=password]:focus {{ outline: none; border-color: #3498db; }}
+    button {{ margin-top: 16px; width: 100%; padding: 12px;
+              background: #3498db; color: white; border: none;
+              border-radius: 4px; font-size: 16px; font-weight: 600;
+              cursor: pointer; }}
+    button:hover {{ background: #2980b9; }}
+    .error {{ background: #fdecea; color: #c0392b;
+              padding: 10px 12px; border-radius: 4px;
+              border-left: 3px solid #e74c3c;
+              font-size: 13px; margin-bottom: 16px; }}
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/login" autocomplete="off">
+    <h1>specGPT</h1>
+    <p class="sub">Enter the access password to continue.</p>
+    {error_html}
+    <input type="hidden" name="next" value="{next_attr}">
+    <label for="password">Password</label>
+    <input id="password" type="password" name="password" autocomplete="current-password"
+           required autofocus>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>"""
 
 
 # ============================================================================
 # Endpoints
 # ============================================================================
 
+@app.get("/healthz")
+async def healthz() -> dict:
+    """Liveness check — intentionally unauthenticated so external healthchecks work.
+
+    Does NOT exercise Supabase/Voyage/Anthropic — those have cost. It just
+    confirms the process is up and importing. Add a /readyz if you ever
+    want a deep healthcheck.
+    """
+    return {"ok": True}
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(next: str = "/") -> HTMLResponse:
+    return HTMLResponse(_login_html(next_path=next))
+
+
+@app.post("/login")
+async def login(
+    request: Request,
+    password: str = Form(...),
+    next: str = Form(default="/"),
+) -> Response:
+    ip = _client_ip(request)
+    delay = _throttle.delay_for(ip)
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    if not verify_password(password, _PASSWORD_HASH):
+        _throttle.record_failure(ip)
+        logger.info("Failed login from %s", ip)
+        return HTMLResponse(
+            _login_html("Incorrect password.", next_path=next),
+            status_code=401,
+        )
+
+    _throttle.clear(ip)
+    # Sanitise the next-URL so a phishing redirect can't pivot off the login.
+    safe_next = next if isinstance(next, str) and next.startswith("/") and not next.startswith("//") else "/"
+    token = create_session_token(_SESSION_SECRET_BYTES)
+    resp = RedirectResponse(url=safe_next, status_code=303)
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.api_route("/logout", methods=["GET", "POST"])
+async def logout() -> Response:
+    resp = RedirectResponse(url="/login", status_code=303)
+    _clear_session_cookie(resp)
+    return resp
+
+
 @app.post("/api/query")
-async def query_endpoint(req: QueryRequest) -> QueryResponse:
+async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> QueryResponse:
     """
     Run the full retrieval + generation pipeline.
 
@@ -89,14 +295,43 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=400, detail="query cannot be empty")
 
     # Parse config from request, use defaults if not provided
-    config_dict = req.config or {}
-    config = PipelineConfig(**config_dict)
+    try:
+        config_dict = req.config or {}
+        config = PipelineConfig(**config_dict)
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid config: {e}")
+
+    debug_trace = req.debug and DEBUG_PIPELINE
+    request_id = uuid.uuid4().hex[:12]
 
     start = time.time()
     try:
-        result = orchestrate(req.query, config=config, debug=req.debug and DEBUG_PIPELINE)
+        # orchestrate() is synchronous and CPU/IO-heavy (Voyage, Supabase,
+        # cross-encoder, Anthropic). Run it in a worker thread so we don't
+        # block the FastAPI event loop for the duration of the pipeline.
+        result = await asyncio.to_thread(
+            orchestrate, req.query, config=config, debug=debug_trace,
+        )
+    except GenerationError as e:
+        # Retrieval worked; generation failed. 502 (bad upstream gateway)
+        # is more accurate than 500 here, and the trace can still be returned
+        # in debug mode so callers can see what *was* retrieved.
+        logger.warning("Generation failure [%s]: %s", request_id, e.cause)
+        detail: dict = {
+            "error": "generation_failed",
+            "request_id": request_id,
+            "cause_type": type(e.cause).__name__,
+        }
+        if debug_trace:
+            detail["pipeline_trace"] = e.trace
+        raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+        logger.exception("Pipeline error [%s]: %s", request_id, e)
+        # Don't leak internal error text to the client; surface only an id.
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "pipeline_error", "request_id": request_id},
+        )
     latency_ms = (time.time() - start) * 1000
 
     return QueryResponse(
@@ -104,21 +339,25 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         answer=result["answer"],
         citations=result["citations"],
         config=result["config"],
-        pipeline_trace=result.get("pipeline_trace") if req.debug else None,
+        pipeline_trace=result.get("pipeline_trace") if debug_trace else None,
         latency_ms=latency_ms,
     )
 
 
 @app.get("/api/config")
-async def config_endpoint() -> dict:
+async def config_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Return default PipelineConfig."""
     return PipelineConfig().to_dict()
 
 
 @app.get("/", response_class=HTMLResponse)
-async def frontend() -> str:
-    """Serve the web frontend."""
-    return FRONTEND_HTML
+async def frontend(
+    specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> Response:
+    """Serve the web frontend, or redirect to /login if not signed in."""
+    if not verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
+        return RedirectResponse(url="/login", status_code=303)
+    return HTMLResponse(FRONTEND_HTML)
 
 
 # ============================================================================
@@ -447,9 +686,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
 </head>
 <body>
     <header>
-        <div class="container">
-            <h1>specGPT</h1>
-            <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
+        <div class="container" style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1>specGPT</h1>
+                <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
+            </div>
+            <form method="post" action="/logout" style="margin: 0;">
+                <button type="submit" class="config-toggle" style="background:#34495e;">Sign out</button>
+            </form>
         </div>
     </header>
 
@@ -586,9 +830,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     body: JSON.stringify({ query, config, debug: true }),
                 });
 
+                if (response.status === 401) {
+                    // Session expired mid-flight — bounce to login.
+                    window.location.href = "/login?next=" + encodeURIComponent(window.location.pathname);
+                    return;
+                }
                 if (!response.ok) {
                     const err = await response.json();
-                    throw new Error(err.detail || "Request failed");
+                    throw new Error(typeof err.detail === "string" ? err.detail : "Request failed");
                 }
 
                 const data = await response.json();
@@ -601,36 +850,55 @@ FRONTEND_HTML = """<!DOCTYPE html>
             }
         }
 
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return "";
+            return String(value)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
         function displayResults(data) {
             // Answer
             document.getElementById("answer-text").textContent = data.answer;
             document.getElementById("latency").textContent = `⏱️ ${data.latency_ms.toFixed(0)}ms`;
 
-            // Citations
+            // Citations — escape attacker-controlled fields (section_id /
+            // section_title flow back from PDF text) before HTML interpolation.
             const citationsList = document.getElementById("citations-list");
             const citationsBox = document.getElementById("citations-box");
             if (data.citations && data.citations.length > 0) {
                 citationsList.innerHTML = data.citations
-                    .map(c => `<div class="citation-item"><span class="citation-section">[§${c.section_id}]</span> ${c.section_title}`)
+                    .map(c => {
+                        const sid = escapeHtml(c.section_id);
+                        const title = escapeHtml(c.section_title);
+                        const flag = c.hallucinated
+                            ? ' <span class="citation-section" title="Cited section not found in retrieved context">⚠ not in context</span>'
+                            : "";
+                        return `<div class="citation-item"><span class="citation-section">[§${sid}]</span> ${title}${flag}</div>`;
+                    })
                     .join("");
                 citationsBox.classList.remove("hidden");
             } else {
                 citationsBox.classList.add("hidden");
             }
 
-            // Pipeline trace
+            // Pipeline trace — JSON.stringify is safe content but interpolating
+            // it into innerHTML still requires escaping the angle brackets.
             const stagesDiv = document.getElementById("pipeline-stages");
             if (data.pipeline_trace) {
                 stagesDiv.innerHTML = data.pipeline_trace
                     .map((stage, idx) => `
                         <div class="pipeline-stage">
                             <div class="stage-header" onclick="toggleStage(this)">
-                                <span class="stage-name">${idx + 1}. ${formatStageName(stage.stage)}</span>
+                                <span class="stage-name">${idx + 1}. ${escapeHtml(formatStageName(stage.stage))}</span>
                                 <span class="stage-time">${stage.took_ms.toFixed(0)}ms</span>
                                 <span class="stage-toggle">▼</span>
                             </div>
                             <div class="stage-content">
-                                <div class="stage-json">${JSON.stringify(stage, null, 2)}</div>
+                                <div class="stage-json">${escapeHtml(JSON.stringify(stage, null, 2))}</div>
                             </div>
                         </div>
                     `)
@@ -665,7 +933,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
+    # Default to loopback so debug builds aren't exposed to the local network.
+    # Override with HOST=0.0.0.0 explicitly when deploying behind a proxy.
+    host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))
 
     print(f"\n{'='*60}")

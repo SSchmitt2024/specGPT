@@ -32,12 +32,30 @@ All high-impact tunable parameters are exposed as config:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any
 
 from src.pipeline import query_processor, retriever, search, reranker, generator
 from src.pipeline.query_processor import QueryDecomposition
+
+logger = logging.getLogger(__name__)
+
+
+class GenerationError(RuntimeError):
+    """Raised when context retrieval succeeded but generation failed.
+
+    Carries the partial pipeline trace + the underlying cause so the web
+    layer can decide how to surface the failure (e.g., HTTP 502 with a
+    request id while still serving the retrieval trace for debugging).
+    """
+
+    def __init__(self, message: str, *, cause: Exception, trace: list[dict] | None = None,
+                 retrieved_chunks: list[dict] | None = None):
+        super().__init__(message)
+        self.cause = cause
+        self.trace = trace or []
+        self.retrieved_chunks = retrieved_chunks or []
 
 
 @dataclass
@@ -58,6 +76,11 @@ class PipelineConfig:
 
     # Query decomposition parameters
     max_subqueries: int = 3
+
+    # Generation parameters
+    llm_model: str = "claude-sonnet-4-5"
+    llm_max_context_tokens: int = 4000
+    llm_max_output_tokens: int = 1024
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -249,7 +272,7 @@ def orchestrate(
                 "type": decomp.type,
                 "entities": _entity_list_to_dict(decomp.entities),
                 "sub_queries": decomp.sub_queries,
-                "notes": decomp.notes,
+                "rationale": decomp.rationale,
             },
             took_ms=took_qp * 1000,
         )
@@ -259,9 +282,8 @@ def orchestrate(
     # Stage 2a: Structured Lookup (always attempt if lookup query)
     # -------------------------------------------------------------------------
     structured_chunks: list[dict] = []
-    struct_found: bool = False
 
-    if decomp.type == "lookup" and decomp.entities:
+    if (decomp.type or "").lower() == "lookup" and decomp.entities:
         start = time.time()
         struct_result = retriever.structured_lookup(
             decomp,
@@ -270,7 +292,6 @@ def orchestrate(
         )
         took_struct = time.time() - start
 
-        struct_found = struct_result.found
         structured_chunks = struct_result.sources if struct_result.found else []
 
         trace.append(
@@ -312,14 +333,29 @@ def orchestrate(
     # Stage 2b: Hybrid Search (always run; vector + BM25 + RRF, no rerank yet)
     # -------------------------------------------------------------------------
     start = time.time()
+    # Always include the verbatim original query so RRF can pick up direct
+    # phrase matches the LLM's reworded sub-queries miss.
+    search_queries: list[str] = [query]
+    for sq in decomp.sub_queries or []:
+        if sq and sq.strip() and sq.strip() != query.strip() and sq not in search_queries:
+            search_queries.append(sq)
+
     hybrid_chunks, hybrid_trace = hybrid_search(
         query,
-        sub_queries=decomp.sub_queries if decomp.sub_queries else None,
+        sub_queries=search_queries,
         config=config,
     )
     took_hybrid = time.time() - start
 
     trace.extend(hybrid_trace)
+    trace.append(
+        PipelineStage(
+            stage="hybrid_search.total",
+            input={"sub_queries": search_queries},
+            output={"chunk_count": len(hybrid_chunks)},
+            took_ms=took_hybrid * 1000,
+        )
+    )
 
     # -------------------------------------------------------------------------
     # Stage 2c: Merge results from both paths
@@ -327,11 +363,22 @@ def orchestrate(
     start = time.time()
     all_chunks = structured_chunks + hybrid_chunks
 
-    # Deduplicate by id, keeping first occurrence (structured has priority)
+    # Deduplicate by id, keeping first occurrence (structured has priority).
+    # Chunks missing an id (e.g. structured_lookup synthetic rows) must NOT
+    # collide on the shared None key — fall back to chunk_id, then a
+    # content-derived surrogate so each missing-id chunk is treated as unique.
     seen_ids: set = set()
     deduplicated: list[dict] = []
     for chunk in all_chunks:
-        chunk_id = chunk.get("id")
+        chunk_id = chunk.get("id") or chunk.get("chunk_id")
+        if not chunk_id:
+            surrogate = (
+                chunk.get("section_id"),
+                chunk.get("figure_number"),
+                chunk.get("content_type"),
+                (chunk.get("text_raw") or "")[:120],
+            )
+            chunk_id = ("__no_id__", surrogate)
         if chunk_id not in seen_ids:
             seen_ids.add(chunk_id)
             deduplicated.append(chunk)
@@ -393,8 +440,9 @@ def orchestrate(
         answer, citations, context_used, tokens_used = generator.generate(
             query,
             retrieved_chunks,
-            model="claude-3-5-sonnet-20241022",
-            max_context_tokens=4000,
+            model=config.llm_model,
+            max_context_tokens=config.llm_max_context_tokens,
+            max_tokens=config.llm_max_output_tokens,
         )
         took_gen = time.time() - start
 
@@ -404,6 +452,7 @@ def orchestrate(
                 input={
                     "query": query,
                     "chunk_count": len(retrieved_chunks),
+                    "model": config.llm_model,
                 },
                 output={
                     "answer_length": len(answer),
@@ -423,35 +472,26 @@ def orchestrate(
         )
         context_chunks = context_used  # For response metadata
     except Exception as e:
-        answer = f"Generation failed: {type(e).__name__}: {str(e)}"
-        citations = []
-        context_chunks = retrieved_chunks
         took_gen = time.time() - start
-        tokens_used = {"prompt": 0, "completion": 0}
-
+        # Trace the failure so debug callers still see what happened, then
+        # re-raise as GenerationError. The caller (app.py) converts to 5xx
+        # so the user doesn't get the raw error string as their "answer".
+        logger.exception("Generation failed after %.0fms: %s", took_gen * 1000, e)
         trace.append(
             PipelineStage(
                 stage="generation",
-                input={"query": query, "chunk_count": len(retrieved_chunks)},
-                output={"error": str(e)},
+                input={"query": query, "chunk_count": len(retrieved_chunks),
+                       "model": config.llm_model},
+                output={"error_type": type(e).__name__},
                 took_ms=took_gen * 1000,
             )
         )
-
-    trace.append(
-        PipelineStage(
-            stage="generation",
-            input={
-                "query": query,
-                "context_length": len(context_text),
-            },
-            output={
-                "answer_length": len(answer),
-                "citation_count": len(citations),
-            },
-            took_ms=took_gen * 1000,
-        )
-    )
+        raise GenerationError(
+            f"Generation failed: {type(e).__name__}",
+            cause=e,
+            trace=[s.to_dict() for s in trace],
+            retrieved_chunks=retrieved_chunks,
+        ) from e
 
     # -------------------------------------------------------------------------
     # Assemble final response

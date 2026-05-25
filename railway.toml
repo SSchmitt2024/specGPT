@@ -3,6 +3,6 @@ builder = "dockerfile"
 
 [deploy]
 startCommand = "uvicorn src.pipeline.app:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/api/config"
+healthcheckPath = "/healthz"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"

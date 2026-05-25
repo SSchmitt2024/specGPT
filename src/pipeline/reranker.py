@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -37,13 +38,30 @@ except ImportError:
     sys.exit(1)
 
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_TOP_K = 7
+
+# Score floor for chunks with empty/missing text — the cross-encoder will
+# happily score the (query, "") pair, and the resulting score can outrank
+# legitimate chunks. We mark them with -inf so they sort last while still
+# being included in the trace.
+_EMPTY_TEXT_SCORE = float("-inf")
 
 
 @lru_cache(maxsize=2)
 def _load_model(model_name: str) -> CrossEncoder:
     return CrossEncoder(model_name)
+
+
+def _ensure_shape(item: dict, *, rerank_score: float | None, prior_method: str | None) -> dict:
+    """Always-attached output shape so downstream consumers see consistent keys."""
+    out = dict(item)
+    out["rerank_score"] = rerank_score
+    out["prior_method"] = prior_method
+    out["method"] = "rerank"
+    return out
 
 
 def rerank(
@@ -69,24 +87,50 @@ def rerank(
     Returns:
         Reordered list (length min(len(results), top_k)). Each result gains:
           - `rerank_score`: float (cross-encoder logit; higher = more relevant)
+              or None if reranking was skipped / failed.
           - `method`: "rerank"
           - `prior_method`: the method before reranking (provenance)
     """
-    if not results or not query.strip():
-        return list(results)
+    if not results:
+        return []
 
-    pairs = [(query, str(r.get(text_field) or "")) for r in results]
-    model = _load_model(model_name)
-    scores = model.predict(pairs)
+    # Empty query → preserve original order but keep the output shape stable
+    # so downstream code can index `rerank_score` / `prior_method` blindly.
+    if not query or not query.strip():
+        return [
+            _ensure_shape(r, rerank_score=None, prior_method=r.get("method"))
+            for r in (results[:top_k] if top_k is not None else results)
+        ]
+
+    # Empty text_field values get an explicit -inf score so they don't
+    # outrank legitimate hits via cross-encoder noise on empty pairs.
+    pairs: list[tuple[str, str]] = []
+    is_empty: list[bool] = []
+    for r in results:
+        text = str(r.get(text_field) or "").strip()
+        pairs.append((query, text))
+        is_empty.append(not text)
+
+    try:
+        model = _load_model(model_name)
+        raw_scores = model.predict(pairs)
+    except Exception:  # OOM, CUDA OOM, model load fail, etc.
+        # logger.exception captures the traceback — we want that for any
+        # cross-encoder failure since the failure modes (CUDA OOM, model
+        # download, etc.) are notoriously hard to diagnose without it.
+        logger.exception("reranker.predict failed — preserving prior order")
+        return [
+            _ensure_shape(r, rerank_score=None, prior_method=r.get("method"))
+            for r in (results[:top_k] if top_k is not None else results)
+        ]
 
     reranked: list[dict] = []
-    for r, score in zip(results, scores):
-        out = dict(r)
-        out["rerank_score"] = float(score)
-        out["prior_method"] = r.get("method")
-        out["method"] = "rerank"
-        reranked.append(out)
+    for r, raw_score, empty in zip(results, raw_scores, is_empty):
+        score = _EMPTY_TEXT_SCORE if empty else float(raw_score)
+        reranked.append(_ensure_shape(r, rerank_score=score, prior_method=r.get("method")))
 
+    # All scores are floats here (empty/missing text gets -inf, model
+    # successes get the cross-encoder logit); a direct sort is safe.
     reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
     if top_k is not None:
         reranked = reranked[:top_k]

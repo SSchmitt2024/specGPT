@@ -18,3 +18,4 @@ openai
 fastapi
 uvicorn[standard]
 pydantic
+python-multipart
