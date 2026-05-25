@@ -70,10 +70,10 @@ def _get_client():
 
 def _fields_row(record: dict) -> dict:
     return {
-        "name":          str(record.get("name") or "").upper().strip(),
+        "name":          str(record.get("field_name") or "").upper().strip(),
         "description":   record.get("description"),
         "offset":        str(record.get("offset") or "") or None,
-        "figure_number": str(record.get("figure_number") or "") or None,
+        "figure_number": str(record.get("parent_figure") or "") or None,
         "section_id":    record.get("section_id"),
         "data":          record,
     }
@@ -119,10 +119,10 @@ def _upsert_batched(client, table: str, rows: list[dict], conflict_col: str | No
     for i in range(0, total, BATCH_SIZE):
         batch_num = i // BATCH_SIZE + 1
         batch = rows[i : i + BATCH_SIZE]
-        q = client.table(table).upsert(batch)
         if conflict_col:
-            q = q.on_conflict(conflict_col)
-        q.execute()
+            client.table(table).upsert(batch, on_conflict=conflict_col).execute()
+        else:
+            client.table(table).upsert(batch).execute()
         uploaded += len(batch)
         print(f"  batch {batch_num}/{batches} — {uploaded}/{total}")
     return uploaded
@@ -131,9 +131,20 @@ def _upsert_batched(client, table: str, rows: list[dict], conflict_col: str | No
 def load_fields(client, data_dir: Path) -> None:
     path = data_dir / "fields.json"
     records = json.loads(path.read_text(encoding="utf-8"))
-    rows = [_fields_row(r) for r in records if r.get("name")]
+    rows = [_fields_row(r) for r in records if r.get("field_name")]
     # Remove rows with empty name after normalization
     rows = [r for r in rows if r["name"]]
+    # The same field name can appear in multiple registers; spec_fields uses
+    # name as PRIMARY KEY, so keep the first occurrence. field_index.json is
+    # the authoritative store for "same name, multiple locations".
+    seen: set = set()
+    deduped: list[dict] = []
+    for r in rows:
+        if r["name"] in seen:
+            continue
+        seen.add(r["name"])
+        deduped.append(r)
+    rows = deduped
     print(f"spec_fields: upserting {len(rows)} rows...")
     n = _upsert_batched(client, "spec_fields", rows, conflict_col="name")
     print(f"  done — {n} rows")

@@ -82,11 +82,25 @@ def _load(path: Path) -> list | dict:
 # ---------------------------------------------------------------------------
 # Lookup items — deterministic, no LLM
 
-def _build_lookup_items(fields: list[dict], field_index: dict, n: int) -> list[dict]:
+def _build_figure_to_section(cards: list[dict]) -> dict[str, str]:
+    """Map figure_number → section_id using cards.json `tables` field."""
+    out: dict[str, str] = {}
+    for card in cards:
+        sid = card.get("section_id")
+        if not sid:
+            continue
+        for fig in card.get("tables") or []:
+            key = str(fig)
+            if key not in out:
+                out[key] = sid
+    return out
+
+
+def _build_lookup_items(fields: list[dict], field_index: dict, n: int, fig_to_section: dict[str, str] | None = None) -> list[dict]:
     good = [
         f for f in fields
-        if f.get("name")
-        and len(f.get("description", "")) > 25
+        if f.get("field_name")
+        and len(f.get("description") or "") > 25
         and f.get("offset")
     ]
 
@@ -94,7 +108,7 @@ def _build_lookup_items(fields: list[dict], field_index: dict, n: int) -> list[d
     seen: set = set()
     unique: list[dict] = []
     for f in good:
-        key = f["name"].upper()
+        key = f["field_name"].upper()
         if key not in seen:
             seen.add(key)
             unique.append(f)
@@ -104,14 +118,19 @@ def _build_lookup_items(fields: list[dict], field_index: dict, n: int) -> list[d
 
     items: list[dict] = []
     for i, f in enumerate(sample):
-        name = f["name"]
+        name = f["field_name"]
         description = f["description"].strip()
         offset = f.get("offset", "")
-        figure = str(f.get("figure_number", ""))
+        figure = str(f.get("parent_figure", ""))
 
-        # Expected sections from field_index (best-effort)
+        # Expected sections: prefer field_index section_id if present, else
+        # derive from the field's parent_figure via cards.json (built once).
         index_entries = field_index.get(name.upper(), [])
         expected_sections = list({e["section_id"] for e in index_entries if e.get("section_id")})
+        if not expected_sections and fig_to_section and figure:
+            sid = fig_to_section.get(str(figure))
+            if sid:
+                expected_sections = [sid]
 
         gold = (
             f"{name} (bits {offset}, Figure {figure}): {description}"
@@ -257,7 +276,8 @@ def generate_eval_set(
 
     if "lookup" in active_types:
         print("\nBuilding lookup items (from fields.json)...")
-        items += _build_lookup_items(fields, field_index, type_counts["lookup"])
+        fig_to_section = _build_figure_to_section(cards)
+        items += _build_lookup_items(fields, field_index, type_counts["lookup"], fig_to_section)
         print(f"  {sum(1 for x in items if x['type'] == 'lookup')} lookup items")
 
     for qtype in ("structural", "relational", "procedural"):

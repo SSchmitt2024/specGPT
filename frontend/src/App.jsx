@@ -2,6 +2,7 @@ import { useState } from 'react'
 import SearchBar from './components/SearchBar'
 import Answer from './components/Answer'
 import Sources from './components/Sources'
+import ModelInfoPanel from './components/ModelInfoPanel'
 import { querySpec } from './api'
 import './App.css'
 
@@ -43,6 +44,7 @@ function App() {
 
         <Answer result={result} />
         <Sources sources={result?.sources} />
+        <ModelInfoPanel tokensUsed={result?.tokens_used} isAgentic={result?.agentic ?? false} />
       </main>
 
       <footer className="app-footer">

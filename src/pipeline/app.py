@@ -151,6 +151,7 @@ class QueryResponse(BaseModel):
     config: dict
     pipeline_trace: list[dict] | None = None
     latency_ms: float
+    tokens_used: dict | None = None
 
 
 # ============================================================================
@@ -380,6 +381,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         config=result["config"],
         pipeline_trace=result.get("pipeline_trace") if debug_trace else None,
         latency_ms=latency_ms,
+        tokens_used=result.get("tokens_used"),
     )
 
 
@@ -387,6 +389,42 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
 async def config_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Return default PipelineConfig."""
     return PipelineConfig().to_dict()
+
+
+@app.get("/api/models")
+async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
+    """Return model info and per-token pricing for all pipeline stages."""
+    cfg = PipelineConfig()
+    return {
+        "embedding": {
+            "model": "voyage-3-lite",
+            "provider": "Voyage AI",
+            "price_per_1m_input": 0.02,
+            "price_per_1m_output": None,
+            "note": "Query embedding only; doc embeddings pre-computed",
+        },
+        "reranker": {
+            "model": cfg.cross_encoder_model,
+            "provider": "Local (HuggingFace)",
+            "price_per_1m_input": 0.0,
+            "price_per_1m_output": None,
+            "note": "Runs locally, no API cost",
+        },
+        "llm": {
+            "model": cfg.llm_model,
+            "provider": "Anthropic",
+            "price_per_1m_input": 3.0,
+            "price_per_1m_output": 15.0,
+            "note": "Standard queries",
+        },
+        "agentic_llm": {
+            "model": cfg.agentic_model,
+            "provider": "Anthropic",
+            "price_per_1m_input": 15.0,
+            "price_per_1m_output": 75.0,
+            "note": "Agentic mode only",
+        },
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -537,6 +575,21 @@ FRONTEND_HTML = """<!DOCTYPE html>
         .agentic-row.active {
             background: #f3e5f5;
             border-left-color: #6c3483;
+        }
+
+        /* Sub-panel of agentic knobs, shown only when toggle is on. */
+        .agentic-config {
+            background: #f3e5f5;
+            padding: 12px 14px;
+            border-radius: 4px;
+            margin-top: 6px;
+            border-left: 3px solid #6c3483;
+        }
+        .agentic-config.hidden {
+            display: none;
+        }
+        .agentic-config .config-item label {
+            color: #2c3e50;
         }
 
         .config-panel {
@@ -887,6 +940,88 @@ FRONTEND_HTML = """<!DOCTYPE html>
         .viz-container .nodeLabel, .viz-container .label {
             font-size: 12px !important;
         }
+
+        /* ─── Model info panel ────────────────────────────────────────── */
+        .model-panel {
+            margin-top: 24px;
+            border: 1px solid #dce1e7;
+            border-radius: 8px;
+            overflow: hidden;
+            font-size: 13px;
+        }
+        .model-panel-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #f4f6f7;
+            padding: 9px 14px;
+            cursor: pointer;
+            user-select: none;
+            border: none;
+            width: 100%;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+            color: #444;
+        }
+        .model-panel-header:hover { background: #eaecee; }
+        .model-panel-badge {
+            margin-left: auto;
+            background: #eafaf1;
+            color: #1e8449;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+        .model-panel-chevron { font-size: 10px; color: #999; }
+        .model-panel-body {
+            display: none;
+            padding: 14px;
+            background: white;
+            overflow-x: auto;
+        }
+        .model-panel-body.open { display: block; }
+        .model-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .model-table th {
+            text-align: left;
+            padding: 5px 8px;
+            border-bottom: 2px solid #e0e0e0;
+            color: #666;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .model-table td {
+            padding: 5px 8px;
+            border-bottom: 1px solid #f2f2f2;
+            vertical-align: middle;
+        }
+        .model-table code {
+            background: #f5f5f5;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+        .model-row-active td { background: #eaf4ff; font-weight: 600; }
+        .model-note { color: #999; font-style: italic; }
+        .model-cost-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #eee;
+            font-size: 12px;
+            color: #555;
+        }
+        .model-cost-label { font-weight: 700; color: #333; }
+        .model-cost-sep { color: #bbb; }
+        .model-cost-total { font-weight: 700; color: #1e8449; font-size: 13px; }
     </style>
 </head>
 <body>
@@ -925,6 +1060,37 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     gaps, then regenerates with Opus + larger context. Slower
                     (~30-60s) and ~10× the cost leave off for routine queries.
                 </span>
+            </div>
+
+            <div id="agentic-config" class="agentic-config hidden">
+                <div class="config-grid">
+                    <div class="config-item">
+                        <label>Max Follow-ups</label>
+                        <input type="number" id="config-agentic_max_followups" value="3" min="0" max="5">
+                    </div>
+                    <div class="config-item">
+                        <label>Agentic Rerank Top-K</label>
+                        <input type="number" id="config-agentic_rerank_topk" value="14" min="5" max="25">
+                    </div>
+                    <div class="config-item">
+                        <label>Context Tokens</label>
+                        <input type="number" id="config-agentic_max_context_tokens" value="16000" min="4000" max="24000" step="1000">
+                    </div>
+                    <div class="config-item">
+                        <label>Output Tokens</label>
+                        <input type="number" id="config-agentic_max_output_tokens" value="2048" min="512" max="4096" step="256">
+                    </div>
+                    <div class="config-item">
+                        <label><input type="checkbox" id="config-agentic_targeted_fetch" checked> Targeted Fetch</label>
+                    </div>
+                    <div class="config-item">
+                        <label><input type="checkbox" id="config-agentic_recursive"> Recursive</label>
+                    </div>
+                    <div class="config-item">
+                        <label>Max Iterations</label>
+                        <input type="number" id="config-agentic_max_iterations" value="5" min="1" max="10">
+                    </div>
+                </div>
             </div>
 
             <div id="config-panel" class="config-panel">
@@ -998,6 +1164,28 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         <div class="viz-empty">Run a query to see the pipeline flow.</div>
                     </div>
                 </div>
+
+                <div class="model-panel" id="model-panel">
+                    <button class="model-panel-header" onclick="toggleModelPanel()">
+                        ⚙ Models &amp; Cost
+                        <span class="model-panel-badge" id="model-cost-badge" style="display:none"></span>
+                        <span class="model-panel-chevron" id="model-panel-chevron">▼</span>
+                    </button>
+                    <div class="model-panel-body" id="model-panel-body">
+                        <table class="model-table" id="model-table">
+                            <thead>
+                                <tr>
+                                    <th>Stage</th><th>Model</th><th>Provider</th>
+                                    <th>$/1M in</th><th>$/1M out</th><th>Note</th>
+                                </tr>
+                            </thead>
+                            <tbody id="model-table-body">
+                                <tr><td colspan="6" style="color:#aaa;font-style:italic">Loading…</td></tr>
+                            </tbody>
+                        </table>
+                        <div class="model-cost-row" id="model-cost-row" style="display:none"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1029,6 +1217,85 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 flowchart: { curve: "basis", htmlLabels: true, useMaxWidth: true },
             });
         }
+
+        // ─── Model panel ──────────────────────────────────────────────────
+        const MODEL_STAGE_LABELS = {
+            embedding: "Embedding",
+            reranker: "Reranker",
+            llm: "LLM (standard)",
+            agentic_llm: "LLM (agentic)",
+        };
+        let _modelsData = null;
+        let _lastIsAgentic = false;
+
+        function toggleModelPanel() {
+            const body = document.getElementById("model-panel-body");
+            const chevron = document.getElementById("model-panel-chevron");
+            const open = body.classList.toggle("open");
+            chevron.textContent = open ? "▲" : "▼";
+        }
+
+        function _fmtPrice(v) {
+            if (v === null || v === undefined) return "—";
+            if (v === 0) return "free";
+            return "$" + v;
+        }
+
+        function _fmtCost(dollars) {
+            if (dollars === null || dollars === undefined) return "—";
+            if (dollars < 0.0001) return "<$0.0001";
+            return "$" + dollars.toFixed(4);
+        }
+
+        function renderModelTable(isAgentic) {
+            if (!_modelsData) return;
+            const tbody = document.getElementById("model-table-body");
+            tbody.innerHTML = Object.entries(_modelsData).map(([key, info]) => {
+                const active = (key === "llm" && !isAgentic) || (key === "agentic_llm" && isAgentic);
+                return `<tr class="${active ? "model-row-active" : ""}">
+                    <td>${MODEL_STAGE_LABELS[key] || key}</td>
+                    <td><code>${escapeHtml(info.model)}</code></td>
+                    <td>${escapeHtml(info.provider)}</td>
+                    <td>${_fmtPrice(info.price_per_1m_input)}</td>
+                    <td>${_fmtPrice(info.price_per_1m_output)}</td>
+                    <td class="model-note">${escapeHtml(info.note || "")}</td>
+                </tr>`;
+            }).join("");
+        }
+
+        function renderModelCost(tokensUsed, isAgentic) {
+            if (!tokensUsed || !_modelsData) return;
+            const llm = isAgentic ? _modelsData.agentic_llm : _modelsData.llm;
+            if (!llm) return;
+            const inCost  = (tokensUsed.prompt     / 1e6) * llm.price_per_1m_input;
+            const outCost = (tokensUsed.completion  / 1e6) * llm.price_per_1m_output;
+            const total   = inCost + outCost;
+
+            const badge = document.getElementById("model-cost-badge");
+            badge.textContent = _fmtCost(total) + " / query";
+            badge.style.display = "";
+
+            const row = document.getElementById("model-cost-row");
+            row.style.display = "flex";
+            row.innerHTML = `
+                <span class="model-cost-label">Last query:</span>
+                <span>${tokensUsed.prompt.toLocaleString()} in → ${_fmtCost(inCost)}</span>
+                <span class="model-cost-sep">+</span>
+                <span>${tokensUsed.completion.toLocaleString()} out → ${_fmtCost(outCost)}</span>
+                <span class="model-cost-sep">=</span>
+                <span class="model-cost-total">${_fmtCost(total)}</span>
+            `;
+        }
+
+        // Fetch model info once on page load
+        fetch("/api/models")
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (!data) return;
+                _modelsData = data;
+                renderModelTable(false);
+            })
+            .catch(() => {});
 
         // ─── Pipeline trace → Mermaid graph definition ────────────────────
         // Strips anything that would break Mermaid's label parser (newlines,
@@ -1284,8 +1551,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
         const answerSection = document.getElementById("answer-section");
         const agenticToggle = document.getElementById("agentic-toggle");
         const agenticRow = document.getElementById("agentic-row");
+        const agenticConfig = document.getElementById("agentic-config");
         agenticToggle.addEventListener("change", () => {
             agenticRow.classList.toggle("active", agenticToggle.checked);
+            agenticConfig.classList.toggle("hidden", !agenticToggle.checked);
         });
 
         // Config panel toggle
@@ -1316,6 +1585,13 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
                 final_rerank_topk: parseInt(document.getElementById("config-final_rerank_topk").value),
                 max_subqueries: parseInt(document.getElementById("config-max_subqueries").value),
+                agentic_max_followups: parseInt(document.getElementById("config-agentic_max_followups").value),
+                agentic_rerank_topk: parseInt(document.getElementById("config-agentic_rerank_topk").value),
+                agentic_max_context_tokens: parseInt(document.getElementById("config-agentic_max_context_tokens").value),
+                agentic_max_output_tokens: parseInt(document.getElementById("config-agentic_max_output_tokens").value),
+                agentic_targeted_fetch: document.getElementById("config-agentic_targeted_fetch").checked,
+                agentic_recursive: document.getElementById("config-agentic_recursive").checked,
+                agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
             };
 
             // Show loading
@@ -1326,7 +1602,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             const agentic = agenticToggle.checked;
             if (agentic) {
-                loadingDiv.innerHTML = "Running pipeline (agentic mode this can take 30–60s)…";
+                loadingDiv.innerHTML = "Running pipeline (agentic mode this can take 30-60s)…";
             } else {
                 loadingDiv.textContent = "Running pipeline…";
             }
@@ -1425,6 +1701,11 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             // Pipeline visualization (Mermaid DAG)
             renderPipelineViz(data.pipeline_trace, data.query);
+
+            // Model panel — update active row + cost
+            const isAgentic = !!data.agentic;
+            renderModelTable(isAgentic);
+            renderModelCost(data.tokens_used, isAgentic);
 
             answerSection.classList.remove("hidden");
         }

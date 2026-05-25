@@ -98,6 +98,13 @@ class PipelineConfig:
     # Supabase lookup per requested artifact.
     agentic_targeted_fetch: bool = True
 
+    # Recursive agentic mode: when True, re-run gap-analysis on each newly
+    # regenerated answer and loop until the model stops requesting more
+    # context (or `agentic_max_iterations` is hit). When False (default),
+    # behavior is the original single-pass refinement.
+    agentic_recursive: bool = False
+    agentic_max_iterations: int = 5
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -791,35 +798,54 @@ def orchestrate(
     # regenerate with the higher-tier model + larger context budget.
     # -------------------------------------------------------------------------
     if agentic:
-        start = time.time()
-        followups, gap_reason, requested = _agentic_gap_analysis(
-            query=query,
-            answer=answer,
-            used_chunks=context_chunks,
-            citations=citations,
-            max_followups=config.agentic_max_followups,
-        )
-        took_gap = time.time() - start
-        # Only honor targeted-fetch requests if the config flag allows it.
-        targeted_requested = (
-            requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
-        )
-        gap_has_work = bool(followups) or any(targeted_requested.values())
-        trace.append(
-            PipelineStage(
-                stage="agentic.gap_analysis",
-                input={"answer_chars": len(answer or ""),
-                       "max_followups": config.agentic_max_followups,
-                       "targeted_fetch_enabled": config.agentic_targeted_fetch},
-                output={"needs_followup": gap_has_work,
-                        "reason": gap_reason,
-                        "queries": followups,
-                        "requested_resources": targeted_requested},
-                took_ms=took_gap * 1000,
-            )
-        )
+        # Recursive mode loops up to `agentic_max_iterations`; single-pass
+        # mode is iter 0 only (original behavior). When non-recursive, stage
+        # names omit the `.iterN` suffix so existing trace consumers see no
+        # diff.
+        max_iters = max(1, config.agentic_max_iterations) if config.agentic_recursive else 1
+        # Pool accumulates across iterations so we never lose chunks already
+        # retrieved (each rerank sees everything fetched so far).
+        expanded_pool: list[dict] = list(deduplicated)
+        last_gap_reason = ""
+        converged = False
 
-        if gap_has_work:
+        for iteration in range(max_iters):
+            suffix = f".iter{iteration}" if config.agentic_recursive else ""
+
+            start = time.time()
+            followups, gap_reason, requested = _agentic_gap_analysis(
+                query=query,
+                answer=answer,
+                used_chunks=context_chunks,
+                citations=citations,
+                max_followups=config.agentic_max_followups,
+            )
+            took_gap = time.time() - start
+            last_gap_reason = gap_reason
+            # Only honor targeted-fetch requests if the config flag allows it.
+            targeted_requested = (
+                requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
+            )
+            gap_has_work = bool(followups) or any(targeted_requested.values())
+            trace.append(
+                PipelineStage(
+                    stage=f"agentic.gap_analysis{suffix}",
+                    input={"answer_chars": len(answer or ""),
+                           "max_followups": config.agentic_max_followups,
+                           "targeted_fetch_enabled": config.agentic_targeted_fetch,
+                           "iteration": iteration},
+                    output={"needs_followup": gap_has_work,
+                            "reason": gap_reason,
+                            "queries": followups,
+                            "requested_resources": targeted_requested},
+                    took_ms=took_gap * 1000,
+                )
+            )
+
+            if not gap_has_work:
+                converged = True
+                break
+
             extra_chunks: list[dict] = []
 
             # ─── Targeted resource fetch (direct table/field lookup) ─────
@@ -841,7 +867,7 @@ def orchestrate(
                     by_method[ch.get("method", "?")] = by_method.get(ch.get("method", "?"), 0) + 1
                 trace.append(
                     PipelineStage(
-                        stage="agentic.targeted_fetch",
+                        stage=f"agentic.targeted_fetch{suffix}",
                         input={"requested": targeted_requested,
                                "totals": {k: len(v) for k, v in targeted_requested.items()}},
                         output={"fetched_count": len(fetched),
@@ -866,7 +892,7 @@ def orchestrate(
                 took_fq = time.time() - start
                 trace.append(
                     PipelineStage(
-                        stage=f"agentic.followup_search_q{fi}",
+                        stage=f"agentic.followup_search_q{fi}{suffix}",
                         input={"query": fq},
                         output={"chunk_count": len(fq_chunks)},
                         took_ms=took_fq * 1000,
@@ -875,13 +901,13 @@ def orchestrate(
                 trace.extend(fq_trace)
                 extra_chunks.extend(fq_chunks)
 
-            # Merge new chunks with the prior pool. We re-dedup against the
-            # full pre-rerank pool (`deduplicated` from stage 2c) so we keep
-            # the structured-lookup sources too.
+            # Merge new chunks with the running pool so each iteration's
+            # rerank sees everything we've collected so far (not just this
+            # iteration's fetches).
             start = time.time()
             seen2: set = set()
-            expanded: list[dict] = []
-            for chunk in deduplicated + extra_chunks:
+            merged_pool: list[dict] = []
+            for chunk in expanded_pool + extra_chunks:
                 cid = chunk.get("id") or chunk.get("chunk_id")
                 if not cid:
                     cid = ("__no_id__", chunk.get("section_id"),
@@ -889,14 +915,15 @@ def orchestrate(
                            (chunk.get("text_raw") or "")[:120])
                 if cid not in seen2:
                     seen2.add(cid)
-                    expanded.append(chunk)
+                    merged_pool.append(chunk)
+            expanded_pool = merged_pool
             took_merge = time.time() - start
 
             # Re-rerank the expanded pool against the original query, keeping
             # a wider top-k so Opus has more material to synthesize.
             start = time.time()
             reranked2 = reranker.rerank(
-                query, expanded,
+                query, expanded_pool,
                 top_k=config.agentic_rerank_topk,
                 model_name=config.cross_encoder_model,
                 text_field="text_raw",
@@ -904,8 +931,8 @@ def orchestrate(
             took_rr2 = time.time() - start
             trace.append(
                 PipelineStage(
-                    stage="agentic.rerank",
-                    input={"chunk_count": len(expanded),
+                    stage=f"agentic.rerank{suffix}",
+                    input={"chunk_count": len(expanded_pool),
                            "top_k": config.agentic_rerank_topk,
                            "added_by_followups": len(extra_chunks)},
                     output={"results": _result_summary(reranked2),
@@ -927,7 +954,7 @@ def orchestrate(
                 took_g2 = time.time() - start
                 trace.append(
                     PipelineStage(
-                        stage="agentic.regenerate",
+                        stage=f"agentic.regenerate{suffix}",
                         input={"chunk_count": len(reranked2),
                                "model": config.agentic_model,
                                "max_context_tokens": config.agentic_max_context_tokens},
@@ -943,24 +970,41 @@ def orchestrate(
                         took_ms=took_g2 * 1000,
                     )
                 )
-                # Promote the agentic answer as the canonical result.
-                answer, citations, context_chunks = answer2, citations2, used2
+                # Promote the agentic answer as the canonical result so the
+                # next iteration's gap analysis evaluates the latest output.
+                answer, citations, context_chunks, tokens_used = answer2, citations2, used2, tokens2
             except Exception as e:
-                # Agentic regenerate failed — keep the first-pass answer so the
-                # user still gets something. Log the cause prominently.
+                # Agentic regenerate failed — keep the most recent good answer
+                # so the user still gets something. Stop looping; don't retry
+                # on broken generation.
                 took_g2 = time.time() - start
                 logger.exception("Agentic regenerate failed after %.0fms: %s",
                                  took_g2 * 1000, e)
                 trace.append(
                     PipelineStage(
-                        stage="agentic.regenerate",
+                        stage=f"agentic.regenerate{suffix}",
                         input={"chunk_count": len(reranked2),
                                "model": config.agentic_model},
                         output={"error_type": type(e).__name__,
-                                "note": "kept first-pass answer"},
+                                "note": "kept prior answer"},
                         took_ms=took_g2 * 1000,
                     )
                 )
+                break
+
+        # When recursive mode runs to the cap without natural convergence,
+        # surface a warning stage so the trace makes it obvious.
+        if config.agentic_recursive and not converged:
+            trace.append(
+                PipelineStage(
+                    stage="agentic.cap_reached",
+                    input={"max_iterations": max_iters},
+                    output={"iterations_run": max_iters,
+                            "last_gap_reason": last_gap_reason,
+                            "note": "stopped at max_iterations before model declared done"},
+                    took_ms=0.0,
+                )
+            )
 
     # -------------------------------------------------------------------------
     # Assemble final response
@@ -972,6 +1016,7 @@ def orchestrate(
         "sources": context_chunks,
         "config": config.to_dict(),
         "agentic": agentic,
+        "tokens_used": tokens_used,
         "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
     }
 

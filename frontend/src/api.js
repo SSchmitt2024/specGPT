@@ -39,6 +39,12 @@
 
 const API_BASE = '/api'
 
+export async function getModels() {
+  const res = await fetch(`${API_BASE}/models`)
+  if (!res.ok) throw new Error(`Models fetch failed (${res.status})`)
+  return res.json()
+}
+
 export async function querySpec(question) {
   const res = await fetch(`${API_BASE}/query`, {
     method: 'POST',
