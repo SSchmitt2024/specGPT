@@ -219,10 +219,22 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     citations: list[dict] = []
     seen_sections: set = set()
 
-    # Anchored digit-segment pattern: "Section 5.2.1" or "Section 5".
-    # The terminating segment must NOT consume trailing punctuation, so the
-    # final segment is `\d+` followed by a non-`.` lookahead.
-    section_pattern = r"Section\s+(\d+(?:\.\d+)*)(?!\.\d)"
+    # Match numeric sections ("5.2.1") and appendix-style sections that
+    # start with a single uppercase letter and have at least one sub-segment
+    # ("A.1", "B.3.4"). Bare single letters are excluded because too many
+    # false positives ("Section B" mid-prose). Trailing punctuation is NOT
+    # consumed: the negative lookahead requires a non-word char after the
+    # captured id.
+    #
+    # Accept both singular and plural ("Section 5.2.1", "Sections 5.2.1 and
+    # 5.2.2") and the "Appendix" prefix that the LLM sometimes uses
+    # interchangeably with "Section" for letter-prefixed ids.
+    section_pattern = (
+        # Sections? — singular + regular plural
+        # Append(?:ix(?:es)?|ices) — Appendix / Appendixes / Appendices (irregular)
+        r"(?:Sections?|Append(?:ix(?:es)?|ices))\s+"
+        r"(\d+(?:\.\w+)*|[A-Z]\.\w+(?:\.\w+)*)(?!\.\w)"
+    )
     chunk_sections = {c.get("section_id"): c for c in context_chunks}
 
     for match in re.finditer(section_pattern, answer, re.IGNORECASE):

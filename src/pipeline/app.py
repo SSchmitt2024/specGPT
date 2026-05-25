@@ -37,6 +37,39 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
+
+
+def _load_dotenv(path: str = ".env") -> int:
+    """Populate `os.environ` from a KEY=value file. Production env vars win.
+
+    Only meaningful for local dev — Railway/Cloudflare/etc. inject vars
+    directly and there is no .env file to find. Without this, the Anthropic
+    SDK (which reads `ANTHROPIC_API_KEY` from `os.environ`) and any other
+    consumer of plain `os.environ` can't see `.env` settings, even though
+    src/pipeline/search.py's `_load_env_var` happily reads them via its own
+    helper. Loading once at import unifies the two.
+    """
+    env_path = Path(path)
+    if not env_path.exists():
+        return 0
+    loaded = 0
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:  # explicit env wins
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+        loaded += 1
+    return loaded
+
+
+# Must run before anything imports `Anthropic()` or reads ANTHROPIC_API_KEY.
+_load_dotenv()
+
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response

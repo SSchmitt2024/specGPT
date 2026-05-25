@@ -94,6 +94,62 @@ def test_extract_citations_flags_hallucinated_sections():
     assert cits[0]["hallucinated"] is True
 
 
+def test_extract_citations_handles_alphabetic_appendix_sections():
+    """Bug found during local boot: appendix sections (A.1, B.3, ...) were
+    silently dropped because the regex only matched purely numeric IDs."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [
+        {"section_id": "A.1", "section_title": "Appendix A1", "content_type": "prose"},
+        {"section_id": "B.3", "section_title": "Appendix B3", "content_type": "prose"},
+    ]
+    cits = _extract_citations(
+        "See Section A.1 and per Section B.3 the spec defines this.", ctx
+    )
+    ids = sorted(c["section_id"] for c in cits)
+    assert ids == ["A.1", "B.3"], ids
+    assert all(c["hallucinated"] is False for c in cits)
+
+
+def test_extract_citations_matches_plural_sections_keyword():
+    """Bug found during local boot: the LLM writes 'Sections X, Y' (plural)
+    when citing multiple — previously the regex required singular only."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [
+        {"section_id": "5.2.13.2.11", "section_title": "X", "content_type": "prose"},
+    ]
+    cits = _extract_citations(
+        "See Sections 5.2.13.2.11 for details.", ctx
+    )
+    assert [c["section_id"] for c in cits] == ["5.2.13.2.11"]
+
+
+def test_extract_citations_matches_appendix_prefix():
+    """The LLM sometimes writes 'Appendix A.1' instead of 'Section A.1'."""
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "Per Appendix B.3 this defines... and Appendices A.1 contain...",
+        [
+            {"section_id": "B.3", "section_title": "X", "content_type": "prose"},
+            {"section_id": "A.1", "section_title": "Y", "content_type": "prose"},
+        ],
+    )
+    ids = sorted(c["section_id"] for c in cits)
+    assert ids == ["A.1", "B.3"]
+
+
+def test_extract_citations_skips_bare_single_letter():
+    """`Section B` (no sub-section) would generate too many false positives
+    mid-prose, so the regex requires at least one dotted sub-segment after
+    the alphabetic prefix."""
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "Section B is the appendix; per Section B.1 the rule is...",
+        [{"section_id": "B.1", "section_title": "B1", "content_type": "prose"}],
+    )
+    ids = [c["section_id"] for c in cits]
+    assert ids == ["B.1"]
+
+
 def test_assemble_context_continues_past_oversized_chunks():
     """Audit item: budget loop used to `break` on first oversized chunk; now
     it `continue`s so a smaller later chunk still gets included."""
