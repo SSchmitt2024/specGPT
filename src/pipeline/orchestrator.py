@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
-from src.pipeline import query_processor, retriever, search, reranker, generator
+from src.pipeline import query_processor, retriever, search, reranker, generator, table_serializer
 from src.pipeline.query_processor import QueryDecomposition
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,14 @@ class PipelineConfig:
     agentic_max_output_tokens: int = 2048
     agentic_max_followups: int = 3   # cap LLM-generated follow-up queries
     agentic_rerank_topk: int = 14    # top-k after re-rerank (~2× normal)
+
+    # When True, the agentic gap-analyser can ALSO request specific figures /
+    # fields / sections by name; the orchestrator fetches those directly from
+    # the structured-lookup tables and merges them into the rerank pool.
+    # Much more reliable than hoping a natural-language follow-up rediscovers
+    # them, but costs an extra LLM round-trip to parse the request and one
+    # Supabase lookup per requested artifact.
+    agentic_targeted_fetch: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -236,8 +245,23 @@ _AGENTIC_GAP_SYSTEM = """You are a quality reviewer for an NVMe specification Q&
 
 A retrieval pipeline produced an answer to a user question using the provided
 retrieved sections. Your job: decide whether the answer adequately covers the
-question given what was retrieved, and if not, produce 1-3 focused follow-up
-search queries that would surface the missing information.
+question given what was retrieved, and if not, identify TWO complementary
+forms of follow-up:
+
+  (1) Free-form search QUERIES — focused questions a spec engineer would
+      phrase. The pipeline runs each through hybrid retrieval (vector + BM25 +
+      tsvector). Use these for "I need to know more about X concept".
+
+  (2) Targeted REQUESTED_RESOURCES — specific figures, fields, or section IDs
+      the answer mentions by NAME as missing or under-defined. The pipeline
+      fetches each directly from the structured lookup tables (much faster,
+      guaranteed hit when the artifact exists). Use these whenever the
+      answer says things like:
+        - "the context does not include Figure 630"
+        - "Figure N is not provided / not in the retrieved context"
+        - "the exact byte/field layout of <FIELD> is missing"
+        - "Section X.Y.Z is not retrieved"
+        - "the encoding/format of <FIELD> within Figure N is missing"
 
 A follow-up is needed when the answer:
   - admits "the context does not contain X" or "information about Y is missing"
@@ -245,17 +269,71 @@ A follow-up is needed when the answer:
   - leaves a specific bit/field/figure mentioned in the question undefined
   - mentions a related concept that wasn't itself retrieved
 
-Each follow-up query must be a complete, focused question on its own — the
-kind a spec engineer would phrase to look up a specific definition, field
-layout, or behavior. NEVER repeat the original query verbatim.
+Each free-form query must be a complete, focused question. NEVER repeat the
+original query verbatim. Cap at 3 queries.
 
-Return JSON ONLY:
+Return JSON ONLY, matching this schema exactly. Omit a field rather than
+guessing if you have no candidates for it.
+
   {
     "needs_followup": true|false,
     "reason": "one short sentence",
-    "queries": ["...", "..."]   // empty array if needs_followup is false
+    "queries": ["..."],                 // 0-3 free-form follow-ups
+    "requested_resources": {
+      "figures":  ["630", "631"],       // figure numbers as strings (no "Figure" prefix)
+      "fields":   ["PPI", "CDP"],       // uppercase identifiers, no qualifiers
+      "sections": ["8.20.1"]            // dotted section ids
+    }
   }
 """
+
+
+def _parse_requested_resources(parsed: object) -> dict[str, list[str]]:
+    """Defensively coerce the LLM's `requested_resources` block into a
+    {figures, fields, sections} dict of clean string lists.
+
+    Accepts any of: missing keys, wrong types, non-string members, integers
+    instead of strings. Strips empties and dedupes (preserving order).
+    """
+    out = {"figures": [], "fields": [], "sections": []}
+    if not isinstance(parsed, dict):
+        return out
+    req = parsed.get("requested_resources")
+    if not isinstance(req, dict):
+        return out
+
+    # Strip leading "Figure ", "Fig.", "Fig ", "Section ", "§", "Appendix "
+    # (case-insensitive, with or without trailing punctuation).
+    _PREFIX_RE = re.compile(
+        r"^\s*(?:figure|fig\.?|section|sect\.?|appendix|app\.?|§)\s*\.?\s*",
+        re.IGNORECASE,
+    )
+
+    def _clean_list(raw, *, upper: bool = False, cap: int = 16) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        seen: set[str] = set()
+        items: list[str] = []
+        for v in raw:
+            if v is None:
+                continue
+            s = _PREFIX_RE.sub("", str(v)).strip()
+            if not s or len(s) > 60:
+                continue
+            if upper:
+                s = s.upper()
+            if s in seen:
+                continue
+            seen.add(s)
+            items.append(s)
+            if len(items) >= cap:
+                break
+        return items
+
+    out["figures"]  = _clean_list(req.get("figures"),  upper=False, cap=8)
+    out["fields"]   = _clean_list(req.get("fields"),   upper=True,  cap=8)
+    out["sections"] = _clean_list(req.get("sections"), upper=False, cap=5)
+    return out
 
 
 def _agentic_gap_analysis(
@@ -265,11 +343,12 @@ def _agentic_gap_analysis(
     used_chunks: list[dict],
     citations: list[dict],
     max_followups: int,
-) -> tuple[list[str], str]:
-    """Ask the classifier LLM if follow-up retrieval is needed; return queries + reason.
+) -> tuple[list[str], str, dict[str, list[str]]]:
+    """Ask the classifier LLM if follow-up retrieval is needed.
 
-    On any failure, returns ([], "<failure note>") so the agentic loop falls
-    back to the single-pass answer.
+    Returns ``(followup_queries, reason, requested_resources)``. On any
+    failure, returns ``([], "<failure note>", {empty})`` so the agentic loop
+    falls back to the single-pass answer.
     """
     used_titles = "\n".join(
         f"  - [{c.get('section_id','?')}] {c.get('section_title','')}"
@@ -294,18 +373,27 @@ def _agentic_gap_analysis(
             user_prompt,
             system=_AGENTIC_GAP_SYSTEM,
             temperature=0.0,
-            max_output_tokens=300,
+            max_output_tokens=400,  # slightly larger to fit requested_resources
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("agentic gap-analysis failed: %s", e)
-        return [], f"gap-analysis failed ({type(e).__name__})"
+        return [], f"gap-analysis failed ({type(e).__name__})", {"figures": [], "fields": [], "sections": []}
 
-    if not isinstance(parsed, dict) or not parsed.get("needs_followup"):
-        return [], str(parsed.get("reason", "no follow-ups needed")) if isinstance(parsed, dict) else "non-dict gap response"
+    if not isinstance(parsed, dict):
+        return [], "non-dict gap response", {"figures": [], "fields": [], "sections": []}
+
+    requested = _parse_requested_resources(parsed)
+    has_resources = any(requested.values())
+
+    # If the LLM explicitly says no follow-ups but named resources, treat as
+    # "yes, follow up by fetching those resources" — the model often forgets
+    # the boolean when the resources block is populated.
+    if not parsed.get("needs_followup") and not has_resources:
+        return [], str(parsed.get("reason", "no follow-ups needed")), requested
 
     raw = parsed.get("queries") or []
     if not isinstance(raw, list):
-        return [], "invalid queries field"
+        return [], "invalid queries field", requested
     clean: list[str] = []
     seen: set[str] = set()
     qnorm = " ".join(query.split()).lower()
@@ -320,7 +408,109 @@ def _agentic_gap_analysis(
             continue
         seen.add(key)
         clean.append(s)
-    return clean[:max_followups], str(parsed.get("reason", ""))
+    return clean[:max_followups], str(parsed.get("reason", "")), requested
+
+
+def _resolve_requested_resources(
+    requested: dict[str, list[str]],
+    *,
+    enable_section_fallback: bool = True,
+) -> list[dict]:
+    """Direct-fetch chunks for specific figures/fields/sections.
+
+    Returns chunk dicts matching the standard shape (compatible with the
+    dedup/rerank pool). Tags ``method="agentic_fetch_*"`` so the trace can
+    distinguish them from hybrid-search hits.
+    """
+    chunks: list[dict] = []
+    if not any(requested.values()):
+        return chunks
+
+    try:
+        tables_by_fig = retriever.load_tables_by_figure()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agentic targeted-fetch: tables load failed: %s", e)
+        tables_by_fig = {}
+
+    def _chunk_from_table(table: dict, *, src_tag: str, source: str) -> dict | None:
+        fig = table.get("figure_number") or table.get("parent_figure")
+        if fig is None:
+            return None
+        fig_s = str(fig)
+        section_id = table.get("parent_section") or ""
+        try:
+            text = table_serializer.serialize_table(table)
+        except Exception:
+            text = table.get("raw_text") or ""
+        return {
+            "id": f"agentic_fetch:{src_tag}",
+            "chunk_id": f"agentic_fetch:{src_tag}",
+            "section_id": section_id,
+            "section_title": table.get("caption") or f"Figure {fig_s}",
+            "content_type": "table",
+            "text_raw": text,
+            "pdf_pages": [table.get("pdf_page")] if table.get("pdf_page") else [],
+            "figure_number": fig_s,
+            "has_normative": "shall" in (table.get("raw_text") or "").lower(),
+            "score": 1.0,
+            "method": source,
+        }
+
+    # ── Figures: direct table lookup ────────────────────────────────────
+    for fig in requested.get("figures") or []:
+        keys = {str(fig).strip(),
+                str(fig).strip().lstrip("0") or str(fig).strip(),
+                str(fig).strip().upper()}
+        table = next((tables_by_fig[k] for k in keys if k in tables_by_fig), None)
+        if not table:
+            continue
+        ch = _chunk_from_table(table, src_tag=f"fig{fig}", source="agentic_fetch_figure")
+        if ch:
+            chunks.append(ch)
+
+    # ── Fields: resolve to parent figure(s) ─────────────────────────────
+    try:
+        field_index = retriever.load_field_index()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("agentic targeted-fetch: field_index load failed: %s", e)
+        field_index = {}
+
+    for name in requested.get("fields") or []:
+        recs = field_index.get(name) or field_index.get(name.upper()) or []
+        if not isinstance(recs, list):
+            recs = [recs]
+        for rec in recs[:3]:
+            parent = rec.get("parent_figure") if isinstance(rec, dict) else None
+            if parent is None:
+                continue
+            table = tables_by_fig.get(str(parent))
+            if not table:
+                continue
+            ch = _chunk_from_table(table, src_tag=f"field:{name}@fig{parent}",
+                                   source="agentic_fetch_field")
+            if ch:
+                chunks.append(ch)
+
+    # ── Sections: fall back to tsvector search keyed on the section id ──
+    if enable_section_fallback:
+        for sid in requested.get("sections") or []:
+            try:
+                hits = search.tsvector_search(sid, top_k=3,
+                                              filter={"section_prefix": sid})
+            except Exception:
+                hits = []
+            if not hits:
+                try:
+                    hits = search.tsvector_search(f"Section {sid}", top_k=3)
+                except Exception:
+                    hits = []
+            for h in hits:
+                h = dict(h)
+                h["method"] = "agentic_fetch_section"
+                h["score"] = max(float(h.get("score") or 0.0), 0.9)
+                chunks.append(h)
+
+    return chunks
 
 
 def orchestrate(
@@ -602,7 +792,7 @@ def orchestrate(
     # -------------------------------------------------------------------------
     if agentic:
         start = time.time()
-        followups, gap_reason = _agentic_gap_analysis(
+        followups, gap_reason, requested = _agentic_gap_analysis(
             query=query,
             answer=answer,
             used_chunks=context_chunks,
@@ -610,22 +800,66 @@ def orchestrate(
             max_followups=config.agentic_max_followups,
         )
         took_gap = time.time() - start
+        # Only honor targeted-fetch requests if the config flag allows it.
+        targeted_requested = (
+            requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
+        )
+        gap_has_work = bool(followups) or any(targeted_requested.values())
         trace.append(
             PipelineStage(
                 stage="agentic.gap_analysis",
                 input={"answer_chars": len(answer or ""),
-                       "max_followups": config.agentic_max_followups},
-                output={"needs_followup": bool(followups), "reason": gap_reason,
-                        "queries": followups},
+                       "max_followups": config.agentic_max_followups,
+                       "targeted_fetch_enabled": config.agentic_targeted_fetch},
+                output={"needs_followup": gap_has_work,
+                        "reason": gap_reason,
+                        "queries": followups,
+                        "requested_resources": targeted_requested},
                 took_ms=took_gap * 1000,
             )
         )
 
-        if followups:
-            # Per-followup hybrid_search (same fan-out as the main path but
-            # without re-running the LLM-based decomposer; the gap analyser
-            # already produced focused queries).
+        if gap_has_work:
             extra_chunks: list[dict] = []
+
+            # ─── Targeted resource fetch (direct table/field lookup) ─────
+            # Runs before the natural-language follow-ups so we always have
+            # at least the figures/fields the LLM explicitly named, even if
+            # the broader retrieval below times out or fails.
+            if any(targeted_requested.values()):
+                start = time.time()
+                try:
+                    fetched = _resolve_requested_resources(targeted_requested)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("agentic targeted-fetch failed: %s", e)
+                    fetched = []
+                took_fetch = time.time() - start
+                # Bucket counts for the trace (so the viz can show
+                # "3 figures / 1 field / 0 sections" per-bucket).
+                by_method: dict[str, int] = {}
+                for ch in fetched:
+                    by_method[ch.get("method", "?")] = by_method.get(ch.get("method", "?"), 0) + 1
+                trace.append(
+                    PipelineStage(
+                        stage="agentic.targeted_fetch",
+                        input={"requested": targeted_requested,
+                               "totals": {k: len(v) for k, v in targeted_requested.items()}},
+                        output={"fetched_count": len(fetched),
+                                "by_method": by_method,
+                                "fetched": [
+                                    {"id": c.get("id"),
+                                     "section_id": c.get("section_id"),
+                                     "section_title": c.get("section_title"),
+                                     "figure_number": c.get("figure_number"),
+                                     "method": c.get("method")}
+                                    for c in fetched[:10]
+                                ]},
+                        took_ms=took_fetch * 1000,
+                    )
+                )
+                extra_chunks.extend(fetched)
+
+            # ─── Natural-language follow-up retrievals ───────────────────
             for fi, fq in enumerate(followups):
                 start = time.time()
                 fq_chunks, fq_trace = hybrid_search(fq, sub_queries=[fq], config=config)

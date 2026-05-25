@@ -326,6 +326,43 @@ def test_generation_error_carries_cause_and_trace():
 
 
 # ---------------------------------------------------------------------------
+# Agentic targeted-fetch: requested-resources parsing
+
+def test_parse_requested_resources_strips_prefixes_and_dedupes():
+    from src.pipeline.orchestrator import _parse_requested_resources
+    out = _parse_requested_resources({"requested_resources": {
+        "figures": ["630", 631, "Figure 634", "fig.635", "FIG. 636", "Fig 637",
+                    "  ", None, "Figure 630"],  # dedupe last one
+        "fields": ["PPI", "cdp", "PPI", "  ", "MQES"],
+        "sections": ["Section 8.20.1", "§5.2", "SECTION 6.7", "appendix A.3", None],
+    }})
+    assert out["figures"] == ["630", "631", "634", "635", "636", "637"]
+    assert out["fields"] == ["PPI", "CDP", "MQES"]
+    assert out["sections"] == ["8.20.1", "5.2", "6.7", "A.3"]
+
+
+def test_parse_requested_resources_defensive_on_garbage():
+    from src.pipeline.orchestrator import _parse_requested_resources
+    empty = {"figures": [], "fields": [], "sections": []}
+    assert _parse_requested_resources(None) == empty
+    assert _parse_requested_resources({}) == empty
+    assert _parse_requested_resources({"requested_resources": "string"}) == empty
+    assert _parse_requested_resources({"requested_resources": {"figures": "not-a-list"}}) == empty
+    # Caps respected
+    big = {"requested_resources": {"figures": [str(i) for i in range(50)]}}
+    assert len(_parse_requested_resources(big)["figures"]) == 8
+
+
+def test_pipeline_config_has_agentic_targeted_fetch_default():
+    from src.pipeline.orchestrator import PipelineConfig
+    cfg = PipelineConfig()
+    assert cfg.agentic_targeted_fetch is True
+    # Other agentic defaults still in place
+    assert cfg.agentic_model == "claude-opus-4-7"
+    assert cfg.agentic_max_context_tokens == 16000
+
+
+# ---------------------------------------------------------------------------
 # Allow `python tests/test_pipeline_units.py` (no pytest) to validate fast.
 
 if __name__ == "__main__":

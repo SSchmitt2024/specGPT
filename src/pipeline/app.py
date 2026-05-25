@@ -1144,6 +1144,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             // ─── Agentic refinement branch (only present when agentic=true) ───
             const gap = stages["agentic.gap_analysis"];
+            const tfetch = stages["agentic.targeted_fetch"];
             const ag_rr = stages["agentic.rerank"];
             const ag_gen = stages["agentic.regenerate"];
             let agAnswerNode = "GEN"; // node whose output is the final answer
@@ -1154,7 +1155,24 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 if (gen) L.push("  GEN --> GAP");
 
                 if (needs) {
-                    // Per-followup retrieval branches
+                    // (a) Targeted resource fetch — direct table/field lookup
+                    if (tfetch) {
+                        const req = (tfetch.input && tfetch.input.requested) || {};
+                        const figs = (req.figures || []).length;
+                        const flds = (req.fields || []).length;
+                        const secs = (req.sections || []).length;
+                        const got = (tfetch.output && tfetch.output.fetched_count) || 0;
+                        const reqSummary = [
+                            figs ? `${figs} fig${figs===1?"":"s"}` : "",
+                            flds ? `${flds} field${flds===1?"":"s"}` : "",
+                            secs ? `${secs} section${secs===1?"":"s"}` : "",
+                        ].filter(Boolean).join(" · ") || "(none)";
+                        L.push(`  TFETCH[/"Targeted Fetch<br/>requested: ${reqSummary}<br/>fetched: <b>${got}</b> chunks<br/>${_ms(tfetch)}"/]:::stage_tfetch`);
+                        L.push("  GAP --> TFETCH");
+                        if (ag_rr) L.push("  TFETCH --> RR2");
+                    }
+
+                    // (b) Per-followup natural-language retrieval branches
                     const fqIds = new Set();
                     for (const s of trace) {
                         const m = s.stage.match(/^agentic\\.followup_search_q(\\d+)$/);
@@ -1206,6 +1224,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
             L.push("  classDef stage_gap      fill:#8e44ad,color:#fff,stroke:#6c3483,stroke-width:1px");
             L.push("  classDef stage_followup fill:#af7ac5,color:#fff,stroke:#7d3c98,stroke-width:1px");
             L.push("  classDef stage_agen     fill:#4a235a,color:#fff,stroke:#1b4f72,stroke-width:2px");
+            // Targeted-fetch — a different family (teal) to visually distinguish
+            // "direct table lookup" from "natural-language search".
+            L.push("  classDef stage_tfetch   fill:#117a65,color:#fff,stroke:#0e6251,stroke-width:1px");
 
             return L.join("\\n");
         }
