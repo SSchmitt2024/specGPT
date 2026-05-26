@@ -4,22 +4,28 @@ The FastAPI web app (§2.5) is now complete. You can ask questions about the NVM
 
 ## Prerequisites
 
-1. **Environment variables** (in `.env` or shell):
+1. **Environment variables** — copy `.env.example` to `.env` and fill in values. At a minimum you need:
    ```
+   APP_PASSWORD=pick-something-strong
+   SESSION_SECRET=<32+ random bytes; generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"`>
    SUPABASE_URL=https://your-project.supabase.co
    SUPABASE_KEY=your-anon-key
    VOYAGE_API_KEY=your-voyage-key
+   ANTHROPIC_API_KEY=your-anthropic-key
+   LLM_PROVIDER=gemini
+   GEMINI_API_KEY=your-gemini-key     # or OPENAI_API_KEY if LLM_PROVIDER=openai
    ```
+
+   The app **refuses to start** if `APP_PASSWORD` or `SESSION_SECRET` are missing — that's intentional, the gate is required.
 
 2. **Python dependencies**:
    ```bash
    pip install -r requirements.txt
-   pip install fastapi uvicorn anthropic
    ```
 
 3. **Data must be indexed** (Phase 1 output in Supabase):
    - Chunks indexed with embeddings
-   - Field index loaded
+   - Field index loaded (`scripts/load_lookup_data.py`)
    - Tables available in data/
 
 ## Running the Server
@@ -39,7 +45,20 @@ Output:
 ============================================================
 ```
 
-Then open your browser to **http://localhost:8000**.
+Then open your browser to **http://localhost:8000**. You'll be redirected to a password form on first visit; after signing in, the session cookie is good for 30 days (or until you `/logout`, or until you rotate `SESSION_SECRET`).
+
+### Authenticated routes
+
+All real routes require the session cookie. Only these are public:
+
+| Route | Purpose |
+|-------|---------|
+| `GET /healthz` | Liveness check for Railway / k8s healthchecks |
+| `GET /login`   | Renders the password form |
+| `POST /login`  | Validates password, sets session cookie |
+| `GET/POST /logout` | Clears the session cookie |
+
+Failed logins are rate-limited per source IP (1s → 60s sliding-window backoff after a few rapid misses).
 
 ## Web Interface
 
@@ -120,20 +139,15 @@ Response:
 
 ## Environment Variables
 
-- **DEBUG_PIPELINE** (default: "1"): Include full pipeline trace in responses. Set to "0" to disable.
-  ```bash
-  DEBUG_PIPELINE=0 python -m src.pipeline.app
-  ```
+See `.env.example` for the canonical list. The frequently-touched ones:
 
-- **PORT** (default: "8000"): Server port
-  ```bash
-  PORT=8080 python -m src.pipeline.app
-  ```
-
-- **HOST** (default: "127.0.0.1"): Server host. Use "0.0.0.0" for external access.
-  ```bash
-  HOST=0.0.0.0 PORT=8000 python -m src.pipeline.app
-  ```
+- **APP_PASSWORD** (required): Shared password for the login gate. Hashed at startup, wiped from env. App refuses to boot if unset.
+- **SESSION_SECRET** (required, ≥16 bytes): HMAC key for session cookies. Generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Rotating it invalidates every session immediately.
+- **DEBUG_PIPELINE** (default: "0"): Set to "1" to include the full pipeline trace in `/api/query` responses. Off by default because the trace exposes chunk previews, model names, and timings.
+- **PORT** (default: "8000"): Server port.
+- **HOST** (default: "127.0.0.1"): Server host. Use "0.0.0.0" only inside a container behind a reverse proxy.
+- **COOKIE_SECURE** (default: "1"): Cookies are only sent over HTTPS. Set to "0" for local HTTP testing, never in production.
+- **TRUST_PROXY_HEADERS** (default: "0"): Set to "1" if you're behind a proxy that strips spoofed `X-Forwarded-For` (Railway, Cloudflare). Otherwise the login throttle uses the direct socket peer.
 
 ## Common Issues
 

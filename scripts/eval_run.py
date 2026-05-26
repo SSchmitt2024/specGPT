@@ -55,10 +55,20 @@ _NO_CONTEXT_PHRASES = [
 # Scoring
 
 def _answer_present(answer: str) -> bool:
+    """
+    Treat as present unless the answer is too short or *dominantly* a refusal.
+    A refusal phrase in the first 200 chars (or in a short answer) counts; a
+    single hedge sentence buried in an otherwise long, useful answer does not.
+    """
     if not answer or len(answer.strip()) < 20:
         return False
     lower = answer.lower()
-    return not any(phrase in lower for phrase in _NO_CONTEXT_PHRASES)
+    head = lower[:200]
+    if any(phrase in head for phrase in _NO_CONTEXT_PHRASES):
+        return False
+    if len(answer.strip()) < 400 and any(phrase in lower for phrase in _NO_CONTEXT_PHRASES):
+        return False
+    return True
 
 
 def _citation_hit(citations: list[dict], expected_sections: list[str]) -> bool:

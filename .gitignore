@@ -10,3 +10,5 @@ CLAUDE.md
 /data
 .env
 /Backups
+ruvector.db
+*.db

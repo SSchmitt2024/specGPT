@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS spec_chunks_figure_number_idx ON spec_chunks (figure_
 -- Returns the top match_count rows by cosine similarity to query_embedding,
 -- after applying the filter object's optional constraints.
 CREATE OR REPLACE FUNCTION match_spec_chunks(
-  query_embedding vector(1024),
+  query_embedding vector(512),
   match_count     int   DEFAULT 10,
   filter          jsonb DEFAULT '{}'::jsonb
 ) RETURNS TABLE (
@@ -124,7 +124,7 @@ $$;
 CREATE TABLE IF NOT EXISTS spec_fields (
     name          TEXT PRIMARY KEY,
     description   TEXT,
-    offset        TEXT,
+    "offset"      TEXT,
     figure_number TEXT,
     section_id    TEXT,
     data          JSONB NOT NULL

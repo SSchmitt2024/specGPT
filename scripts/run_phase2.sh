@@ -127,7 +127,7 @@ STEP_API=(
   "supabase"
   "supabase"
   "gemini"
-  "supabase gemini anthropic"
+  "supabase gemini anthropic voyage"
 )
 
 NUM_STEPS=${#STEP_NAME[@]}

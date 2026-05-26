@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -35,11 +36,47 @@ from typing import Any
 from src.pipeline.query_processor import Entity, QueryDecomposition, process_query
 from src.pipeline.table_serializer import serialize_table
 
+logger = logging.getLogger(__name__)
+
 
 DATA_DIR = Path("data")
 FIELD_INDEX_PATH = DATA_DIR / "field_index.json"
 FIELDS_PATH = DATA_DIR / "fields.json"
 TABLES_PATH = DATA_DIR / "tables.json"
+
+# Page size for paginated Supabase reads. PostgREST may impose a server-side
+# `db-max-rows` cap below this, so loaders advance by the actual rows
+# returned and terminate on the first empty batch.
+_LOOKUP_PAGE_SIZE = 1000
+
+
+def _paginate(table: str, columns: str, *, order_col: str) -> list[dict]:
+    """Page through `table` selecting `columns`, ordered by `order_col`.
+
+    Robust against PostgREST max-rows truncation: advance by actual batch
+    size and stop only on empty batch.
+    """
+    from src.pipeline.search import supabase_client
+
+    client = supabase_client()
+    rows: list[dict] = []
+    start = 0
+    while True:
+        resp = (
+            client.table(table)
+            .select(columns)
+            .order(order_col)
+            .range(start, start + _LOOKUP_PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        if not batch:
+            break
+        rows.extend(batch)
+        start += len(batch)
+        if start > 10_000_000:
+            break
+    return rows
 
 
 _RE_BIT_RANGE = re.compile(
@@ -82,13 +119,25 @@ def _supabase_available() -> bool:
 
 @lru_cache(maxsize=1)
 def load_field_index() -> dict[str, list[dict]]:
+    """
+    Map field_name → list of field records.
+
+    When Supabase is configured, the read is paginated so PostgREST's
+    server-side row cap can't silently truncate the field index. Falls
+    back to the local JSON snapshot when Supabase isn't configured.
+    """
     if _supabase_available():
-        from src.pipeline.search import supabase_client
-        rows = supabase_client().table("spec_field_index").select("field_name, data").execute().data or []
-        result: dict[str, list[dict]] = {}
-        for row in rows:
-            result.setdefault(row["field_name"], []).append(row["data"])
-        return result
+        try:
+            rows = _paginate("spec_field_index", "field_name, data", order_col="id")
+            result: dict[str, list[dict]] = {}
+            for row in rows:
+                result.setdefault(row["field_name"], []).append(row["data"])
+            if result:
+                return result
+            # Empty table → fall through to JSON snapshot rather than
+            # serving an empty index for the rest of the process lifetime.
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
     with open(FIELD_INDEX_PATH, encoding="utf-8") as f:
         return json.load(f)
 
@@ -96,9 +145,13 @@ def load_field_index() -> dict[str, list[dict]]:
 @lru_cache(maxsize=1)
 def load_fields() -> list[dict]:
     if _supabase_available():
-        from src.pipeline.search import supabase_client
-        rows = supabase_client().table("spec_fields").select("data").execute().data or []
-        return [row["data"] for row in rows]
+        try:
+            rows = _paginate("spec_fields", "data", order_col="name")
+            result = [row["data"] for row in rows]
+            if result:
+                return result
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
     with open(FIELDS_PATH, encoding="utf-8") as f:
         return json.load(f)
 
@@ -106,12 +159,23 @@ def load_fields() -> list[dict]:
 @lru_cache(maxsize=1)
 def load_tables_by_figure() -> dict[str, dict]:
     if _supabase_available():
-        from src.pipeline.search import supabase_client
-        rows = supabase_client().table("spec_tables").select("figure_number, data").execute().data or []
-        return {str(r["figure_number"]): r["data"] for r in rows if r.get("figure_number")}
+        try:
+            rows = _paginate("spec_tables", "figure_number, data", order_col="figure_number")
+            result = {str(r["figure_number"]): r["data"] for r in rows if r.get("figure_number")}
+            if result:
+                return result
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
     with open(TABLES_PATH, encoding="utf-8") as f:
         tables = json.load(f)
     return {str(t.get("figure_number")): t for t in tables if t.get("figure_number") is not None}
+
+
+def reload_lookup_caches() -> None:
+    """Drop cached field/table loaders. Call after a re-ingest run to pick up new data."""
+    load_field_index.cache_clear()
+    load_fields.cache_clear()
+    load_tables_by_figure.cache_clear()
 
 
 def _entity_to_dict(entity: Entity | dict) -> dict:
@@ -467,17 +531,39 @@ def rrf_merge(
     methods: dict[Any, list[str]] = {}
     ranks: dict[Any, dict[str, int]] = {}
 
+    def _doc_key(item: dict) -> Any:
+        """Stable per-document key. Falls back to a content-derived
+        surrogate so id-less chunks (e.g. structured_lookup synthetic rows)
+        don't all collide under a shared None key and get dropped."""
+        doc_id = item.get("id") or item.get("chunk_id")
+        if doc_id:
+            return doc_id
+        return (
+            "__no_id__",
+            item.get("section_id"),
+            item.get("figure_number"),
+            item.get("content_type"),
+            (item.get("text_raw") or "")[:120],
+        )
+
     for results in result_lists:
         seen: set = set()
         for rank, item in enumerate(results, start=1):
-            doc_id = item.get("id")
-            if doc_id is None or doc_id in seen:
+            doc_id = _doc_key(item)
+            if doc_id in seen:
                 continue
             seen.add(doc_id)
 
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
 
-            method = str(item.get("method") or "unknown")
+            # Surface upstream gaps loudly: an item missing a method field
+            # is a contract violation in search.py / structured_lookup, not
+            # something to paper over with "unknown".
+            method = item.get("method")
+            if not method:
+                method = "missing_method"
+            method = str(method)
+
             method_list = methods.setdefault(doc_id, [])
             if method not in method_list:
                 method_list.append(method)

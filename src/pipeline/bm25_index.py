@@ -19,6 +19,7 @@ held in memory. `lru_cache` means rebuild only on process restart.
 
 from __future__ import annotations
 
+import logging
 import re
 from functools import lru_cache
 
@@ -29,21 +30,44 @@ except ImportError as e:
 
 from src.pipeline.search import supabase_client
 
+logger = logging.getLogger(__name__)
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
-# Intentionally small — over-filtering would strip terms that matter in
-# spec text (e.g. "read", "write", "all", "any"). Includes only true
-# noise words.
+# Aligned with Postgres' `english` text-search config used by the tsvector
+# path so the two keyword retrievers don't disagree on what counts as a
+# stopword. Kept conservative — over-filtering strips terms that matter
+# in spec text (e.g. "read", "write", "all", "any").
+# Reference: src/postgres english_stop.sample (Snowball stop list).
 _STOPWORDS = frozenset({
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that",
-    "the", "to", "was", "were", "will", "with",
+    "a", "about", "above", "after", "again", "against", "all", "am", "an",
+    "and", "any", "are", "as", "at", "be", "because", "been", "before",
+    "being", "below", "between", "both", "but", "by", "could", "did",
+    "do", "does", "doing", "down", "during", "each", "few", "for", "from",
+    "further", "had", "has", "have", "having", "he", "her", "here", "hers",
+    "herself", "him", "himself", "his", "how", "i", "if", "in", "into",
+    "is", "it", "its", "itself", "just", "me", "more", "most", "my",
+    "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only",
+    "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same",
+    "she", "should", "so", "some", "such", "than", "that", "the", "their",
+    "theirs", "them", "themselves", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too", "under", "until", "up",
+    "very", "was", "we", "were", "what", "when", "where", "which", "while",
+    "who", "whom", "why", "will", "with", "would", "you", "your", "yours",
+    "yourself", "yourselves",
 })
 
-# Repeat the section title N times in the doc so title hits weight higher,
-# mirroring the 'A' weight on title vs 'B' weight on body in the
-# tsvector setweight() expression.
-_TITLE_BOOST = 2
+# Additive title-match bonus. Each query token that appears in a doc's title
+# adds this amount to the doc's BM25 score. We apply it at score time
+# instead of repeating title tokens in the indexed body — repetition
+# inflates |d| and skews avgdl across the whole corpus, partially
+# cancelling the boost and distorting BM25 length normalization.
+_TITLE_BOOST_PER_MATCH = 1.0
+
+# Treat any score with magnitude below this as "no overlap" — avoids brittle
+# float-equality checks on BM25 scores that can be negative for very common
+# terms but should sort above true non-overlapping documents.
+_SCORE_EPS = 1e-9
 
 # Columns needed to build the index and shape downstream results.
 _CORPUS_COLS = (
@@ -60,9 +84,8 @@ def tokenize(text: str | None) -> list[str]:
 
 
 def _doc_tokens(row: dict) -> list[str]:
-    title_toks = tokenize(row.get("section_title"))
-    body_toks  = tokenize(row.get("text_raw"))
-    return title_toks * _TITLE_BOOST + body_toks
+    """Body-only tokens for BM25 indexing; title bonus is applied at score time."""
+    return tokenize(row.get("text_raw"))
 
 
 def _matches_filter(row: dict, filt: dict) -> bool:
@@ -87,7 +110,15 @@ def _matches_filter(row: dict, filt: dict) -> bool:
 
 
 def _fetch_corpus() -> list[dict]:
-    """Page through spec_chunks; Supabase caps single requests at 1000 rows."""
+    """
+    Page through spec_chunks with stable ordering.
+
+    Robust against server-side max-rows caps (PostgREST `db-max-rows` can
+    silently truncate a single response below the requested page size). We
+    always advance `start` by the actual rows returned, terminate on the
+    first empty batch, and rely on `.order("id")` for deterministic page
+    boundaries that don't shift if rows are inserted between calls.
+    """
     client = supabase_client()
     rows: list[dict] = []
     page_size = 1000
@@ -96,14 +127,20 @@ def _fetch_corpus() -> list[dict]:
         resp = (
             client.table("spec_chunks")
             .select(_CORPUS_COLS)
+            .order("id")
             .range(start, start + page_size - 1)
             .execute()
         )
         batch = resp.data or []
-        rows.extend(batch)
-        if len(batch) < page_size:
+        if not batch:
             break
-        start += page_size
+        rows.extend(batch)
+        start += len(batch)
+        # Hard cap to avoid pathological loops if the table grows unbounded
+        # or the server returns the same page repeatedly.
+        if start > 10_000_000:
+            logger.warning("bm25_index pagination exceeded 10M rows; stopping")
+            break
     return rows
 
 
@@ -111,6 +148,9 @@ class BM25Index:
     def __init__(self, corpus: list[dict]):
         self.corpus = corpus
         self._tokens = [_doc_tokens(r) for r in corpus]
+        self._title_token_sets: list[frozenset[str]] = [
+            frozenset(tokenize(r.get("section_title"))) for r in corpus
+        ]
         self.bm25 = BM25Okapi(self._tokens)
 
     def search(
@@ -122,20 +162,31 @@ class BM25Index:
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
+
         scores = self.bm25.get_scores(q_tokens)
+
+        # Additive per-doc title bonus — independent of doc length so it
+        # doesn't interact with BM25's length normalization.
+        q_unique = set(q_tokens)
+        if _TITLE_BOOST_PER_MATCH:
+            for i, title_set in enumerate(self._title_token_sets):
+                matches = len(q_unique & title_set)
+                if matches:
+                    scores[i] += matches * _TITLE_BOOST_PER_MATCH
+
         if filter:
             candidates = [i for i in range(len(self.corpus))
                           if _matches_filter(self.corpus[i], filter)]
         else:
             candidates = list(range(len(self.corpus)))
         candidates.sort(key=lambda i: scores[i], reverse=True)
+
         out: list[tuple[dict, float]] = []
         for i in candidates:
-            # Exactly 0 means no query token overlapped this doc — skip.
-            # Negative scores can happen for terms appearing in >50% of
-            # docs under rank_bm25's Robertson-Spärck-Jones IDF; keep
-            # those, they still rank above non-overlapping docs.
-            if scores[i] == 0:
+            # Magnitude below epsilon means no body OR title overlap; skip.
+            # Negative scores (very common query terms under rank_bm25's
+            # Robertson-Spärck-Jones IDF) still beat the non-overlap floor.
+            if abs(scores[i]) <= _SCORE_EPS:
                 continue
             out.append((self.corpus[i], float(scores[i])))
             if len(out) >= top_k:
@@ -143,6 +194,14 @@ class BM25Index:
         return out
 
 
+# Cache the index for one process lifetime, but expose `reload_index` for
+# explicit reindex without a restart (e.g. after a re-embed run or migration).
 @lru_cache(maxsize=1)
 def get_index() -> BM25Index:
     return BM25Index(_fetch_corpus())
+
+
+def reload_index() -> BM25Index:
+    """Drop the cached index and rebuild it from Supabase. Returns the new index."""
+    get_index.cache_clear()
+    return get_index()

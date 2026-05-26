@@ -27,6 +27,13 @@ All three return a list of normalized result dicts:
     "method":        "vector" | "tsvector" | "bm25",
   }
 
+Downstream stages add their own method tags to this shape:
+  - retriever.structured_lookup  → method="structured_lookup"
+  - retriever.rrf_merge          → method="rrf" + contributing_methods=[...]
+  - reranker.rerank              → method="rerank" + prior_method=<prev>
+  - reranker.rerank (empty path) → preserves prior method but still adds
+                                   rerank_score=None / method="rerank"
+
 Optional `filter` dict (applied inside both RPCs to scope candidates):
 
   {
@@ -52,8 +59,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import random
+import re
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -68,6 +79,35 @@ try:
 except ImportError:
     print("Missing dependency: pip install voyageai")
     sys.exit(1)
+
+
+logger = logging.getLogger(__name__)
+
+# A query must contain at least one alphanumeric run after stripping
+# punctuation/whitespace, otherwise embedding/tsquery wastes a network call.
+_NON_EMPTY_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _is_empty_query(query: str | None) -> bool:
+    return not (query and _NON_EMPTY_RE.search(query))
+
+
+def _retry(callable_, *, label: str, attempts: int = 3, base_delay: float = 0.5):
+    """Call `callable_` with bounded retry/backoff on transient errors."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return callable_()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i == attempts - 1:
+                break
+            sleep = base_delay * (2 ** i) + random.uniform(0, 0.25)
+            logger.warning("%s failed (attempt %d/%d): %s — retrying in %.2fs",
+                           label, i + 1, attempts, e, sleep)
+            time.sleep(sleep)
+    assert last is not None
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +142,10 @@ def supabase_client() -> Client:
     url = _load_env_var("SUPABASE_URL")
     key = _load_env_var("SUPABASE_KEY")
     if not url or not key:
-        sys.exit("ERROR: SUPABASE_URL and SUPABASE_KEY must be set (env or .env)")
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_KEY must be set (env or .env). "
+            "Pipeline cannot run without Supabase credentials."
+        )
     return create_client(url, key)
 
 
@@ -110,7 +153,10 @@ def supabase_client() -> Client:
 def voyage_client() -> "voyageai.Client":
     key = _load_env_var("VOYAGE_API_KEY")
     if not key:
-        sys.exit("ERROR: VOYAGE_API_KEY must be set (env or .env)")
+        raise RuntimeError(
+            "VOYAGE_API_KEY must be set (env or .env). "
+            "Pipeline cannot run without Voyage credentials."
+        )
     return voyageai.Client(api_key=key)
 
 
@@ -166,23 +212,34 @@ def vector_search(
     """
     Embed the query (Voyage `input_type="query"`, asymmetric to the indexed
     documents) and return top_k chunks ordered by cosine similarity.
+
+    Returns ``[]`` on transient embedding/RPC failure so the rest of the
+    hybrid pipeline (tsvector + BM25) can still produce results.
     """
-    if not query.strip():
+    if _is_empty_query(query):
         return []
 
-    embed_resp = voyage_client().embed(
-        [query], model=VOYAGE_MODEL, input_type="query"
-    )
-    qvec = embed_resp.embeddings[0]
+    try:
+        embed_resp = _retry(
+            lambda: voyage_client().embed([query], model=VOYAGE_MODEL, input_type="query"),
+            label="voyage.embed",
+        )
+        qvec = embed_resp.embeddings[0]
 
-    resp = supabase_client().rpc(
-        RPC_VECTOR,
-        {
-            "query_embedding": qvec,
-            "match_count":     top_k,
-            "filter":          _filter_to_jsonb(filter),
-        },
-    ).execute()
+        resp = _retry(
+            lambda: supabase_client().rpc(
+                RPC_VECTOR,
+                {
+                    "query_embedding": qvec,
+                    "match_count":     top_k,
+                    "filter":          _filter_to_jsonb(filter),
+                },
+            ).execute(),
+            label="supabase.rpc.match_spec_chunks",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("vector_search failed: %s", e)
+        return []
 
     rows = resp.data or []
     return [_shape(r, r.get("similarity", 0.0), "vector") for r in rows]
@@ -202,17 +259,24 @@ def tsvector_search(
     filter: dict | None = None,
 ) -> list[dict]:
     """Full-text search via Postgres tsvector + websearch_to_tsquery."""
-    if not query.strip():
+    if _is_empty_query(query):
         return []
 
-    resp = supabase_client().rpc(
-        RPC_TSVECTOR,
-        {
-            "query_text":  query,
-            "match_count": top_k,
-            "filter":      _filter_to_jsonb(filter),
-        },
-    ).execute()
+    try:
+        resp = _retry(
+            lambda: supabase_client().rpc(
+                RPC_TSVECTOR,
+                {
+                    "query_text":  query,
+                    "match_count": top_k,
+                    "filter":      _filter_to_jsonb(filter),
+                },
+            ).execute(),
+            label="supabase.rpc.search_spec_chunks_text",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("tsvector_search failed: %s", e)
+        return []
 
     rows = resp.data or []
     return [_shape(r, r.get("rank", 0.0), "tsvector") for r in rows]
@@ -231,12 +295,17 @@ def bm25_search(
     filter: dict | None = None,
 ) -> list[dict]:
     """True Okapi BM25 over an in-memory index of spec_chunks."""
-    if not query.strip():
+    if _is_empty_query(query):
         return []
 
     from src.pipeline import bm25_index  # local import: avoid load on cold paths
 
-    hits = bm25_index.get_index().search(query, top_k=top_k, filter=filter)
+    try:
+        hits = bm25_index.get_index().search(query, top_k=top_k, filter=filter)
+    except Exception as e:  # noqa: BLE001
+        logger.error("bm25_search failed: %s", e)
+        return []
+
     return [_shape(row, score, "bm25") for row, score in hits]
 
 

@@ -43,6 +43,26 @@ def get_card_prefix(card: dict | None) -> str:
     return f"[{card['section_id']} — {card['title']}] {card['summary']}"
 
 
+def _normalize_row(row, n_cols: int) -> list[str]:
+    """Pad or truncate `row` to `n_cols` cells so columns align with headers.
+
+    Misaligned rows (rows with fewer cells than the header) would silently
+    shift every cell one column left in the serialized table, which causes
+    the LLM to attribute values to the wrong field — a high-impact correctness
+    bug for spec lookups.
+    """
+    cells = [str(cell) for cell in row] if row else []
+    if n_cols <= 0:
+        return cells
+    if len(cells) < n_cols:
+        cells = cells + [""] * (n_cols - len(cells))
+    elif len(cells) > n_cols:
+        # Join overflow into the last header's cell rather than dropping data.
+        head, tail = cells[: n_cols - 1], cells[n_cols - 1:]
+        cells = head + [" ".join(tail)]
+    return cells
+
+
 def serialize_table(table: dict) -> str:
     """Serialize a full table to text (used by retriever.py structured lookup)."""
     lines = []
@@ -53,15 +73,17 @@ def serialize_table(table: dict) -> str:
     elif caption:
         lines.append(caption)
 
-    headers = table.get("headers", [])
-    rows = table.get("rows", [])
+    headers = table.get("headers", []) or []
+    rows = table.get("rows", []) or []
+    n_cols = len(headers)
 
     if headers:
-        lines.append(" | ".join(headers))
+        lines.append(" | ".join(str(h) for h in headers))
         lines.append("---")
 
     for row in rows:
-        lines.append(" | ".join(str(cell) for cell in row))
+        cells = _normalize_row(row, n_cols) if n_cols else [str(cell) for cell in (row or [])]
+        lines.append(" | ".join(cells))
 
     return "\n".join(lines)
 
@@ -135,13 +157,20 @@ def make_table_chunks(table: dict, card: dict | None, table_index: int) -> list[
         return [_make_chunk(table, card, serialized, 0, 0, len(rows) - 1, table_index)]
 
     header_block = _header_block(table)
+    headers = table.get("headers", []) or []
+    n_cols = len(headers)
     chunks: list[dict] = []
 
     for chunk_index, start in enumerate(range(0, len(rows), ROWS_PER_CHUNK)):
         row_group = rows[start : start + ROWS_PER_CHUNK]
         end = start + len(row_group) - 1
 
-        row_lines = [" | ".join(str(cell) for cell in row) for row in row_group]
+        row_lines = [
+            " | ".join(
+                _normalize_row(row, n_cols) if n_cols else [str(cell) for cell in (row or [])]
+            )
+            for row in row_group
+        ]
         serialized = f"{header_block}\n" + "\n".join(row_lines)
 
         chunks.append(_make_chunk(table, card, serialized, chunk_index, start, end, table_index))

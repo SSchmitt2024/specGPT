@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -65,15 +66,28 @@ class LLMResult:
 # Shared pacing
 
 _last_call_ts: float = 0.0
+# FastAPI runs orchestrate() in asyncio.to_thread, so concurrent requests
+# share this module-level state. Without the lock, two threads can both
+# read _last_call_ts==X, sleep concurrently, and burst-trip provider
+# rate limits despite "pacing" being configured.
+_pace_lock = threading.Lock()
 
 
 def _pace() -> None:
     global _last_call_ts
-    now = time.monotonic()
-    elapsed = now - _last_call_ts
-    if elapsed < MIN_SECONDS_BETWEEN_CALLS:
-        time.sleep(MIN_SECONDS_BETWEEN_CALLS - elapsed)
-    _last_call_ts = time.monotonic()
+    with _pace_lock:
+        now = time.monotonic()
+        elapsed = now - _last_call_ts
+        if elapsed < MIN_SECONDS_BETWEEN_CALLS:
+            sleep_for = MIN_SECONDS_BETWEEN_CALLS - elapsed
+        else:
+            sleep_for = 0.0
+        # Reserve our slot *before* releasing the lock so a second thread
+        # waiting on the lock will see the updated timestamp and pace itself
+        # against ours rather than against the previous caller's.
+        _last_call_ts = now + sleep_for
+    if sleep_for > 0:
+        time.sleep(sleep_for)
 
 
 # ---------------------------------------------------------------------------
