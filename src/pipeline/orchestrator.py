@@ -105,6 +105,14 @@ class PipelineConfig:
     agentic_recursive: bool = False
     agentic_max_iterations: int = 5
 
+    # When True and agentic mode is OFF, still run a one-shot gap analysis
+    # after the first-pass answer and surface the result as `gap_hint` in
+    # the response. Costs one extra LLM call per non-agentic query but lets
+    # the UI prompt the user to opt into agentic refinement when the model
+    # is asking for more context. Has no effect when agentic mode is on
+    # (the agentic loop is the gap analyser).
+    auto_gap_check: bool = True
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -520,12 +528,313 @@ def _resolve_requested_resources(
     return chunks
 
 
+def _run_stage5_and_finalize(
+    *,
+    query: str,
+    config: PipelineConfig,
+    debug: bool,
+    agentic: bool,
+    trace: list,
+    deduplicated: list[dict],
+    answer: str,
+    citations: list[dict],
+    context_chunks: list[dict],
+    tokens_used: dict | None,
+) -> dict:
+    """Run Stage 5 (agentic refinement loop) + Stage 6 (non-agentic gap hint)
+    and assemble the response. Extracted so /api/refine can reuse it on top
+    of a seeded first-pass state without redoing Stages 1–4.
+    """
+    if agentic:
+        # Recursive mode loops up to `agentic_max_iterations`; single-pass
+        # mode is iter 0 only (original behavior). When non-recursive, stage
+        # names omit the `.iterN` suffix so existing trace consumers see no
+        # diff.
+        max_iters = max(1, config.agentic_max_iterations) if config.agentic_recursive else 1
+        # Pool accumulates across iterations so we never lose chunks already
+        # retrieved (each rerank sees everything fetched so far).
+        expanded_pool: list[dict] = list(deduplicated)
+        last_gap_reason = ""
+        converged = False
+
+        for iteration in range(max_iters):
+            suffix = f".iter{iteration}" if config.agentic_recursive else ""
+
+            start = time.time()
+            followups, gap_reason, requested = _agentic_gap_analysis(
+                query=query,
+                answer=answer,
+                used_chunks=context_chunks,
+                citations=citations,
+                max_followups=config.agentic_max_followups,
+            )
+            took_gap = time.time() - start
+            last_gap_reason = gap_reason
+            targeted_requested = (
+                requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
+            )
+            gap_has_work = bool(followups) or any(targeted_requested.values())
+            trace.append(
+                PipelineStage(
+                    stage=f"agentic.gap_analysis{suffix}",
+                    input={"answer_chars": len(answer or ""),
+                           "max_followups": config.agentic_max_followups,
+                           "targeted_fetch_enabled": config.agentic_targeted_fetch,
+                           "iteration": iteration},
+                    output={"needs_followup": gap_has_work,
+                            "reason": gap_reason,
+                            "queries": followups,
+                            "requested_resources": targeted_requested},
+                    took_ms=took_gap * 1000,
+                )
+            )
+
+            if not gap_has_work:
+                converged = True
+                break
+
+            extra_chunks: list[dict] = []
+
+            if any(targeted_requested.values()):
+                start = time.time()
+                try:
+                    fetched = _resolve_requested_resources(targeted_requested)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("agentic targeted-fetch failed: %s", e)
+                    fetched = []
+                took_fetch = time.time() - start
+                by_method: dict[str, int] = {}
+                for ch in fetched:
+                    by_method[ch.get("method", "?")] = by_method.get(ch.get("method", "?"), 0) + 1
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.targeted_fetch{suffix}",
+                        input={"requested": targeted_requested,
+                               "totals": {k: len(v) for k, v in targeted_requested.items()}},
+                        output={"fetched_count": len(fetched),
+                                "by_method": by_method,
+                                "fetched": [
+                                    {"id": c.get("id"),
+                                     "section_id": c.get("section_id"),
+                                     "section_title": c.get("section_title"),
+                                     "figure_number": c.get("figure_number"),
+                                     "method": c.get("method")}
+                                    for c in fetched[:10]
+                                ]},
+                        took_ms=took_fetch * 1000,
+                    )
+                )
+                extra_chunks.extend(fetched)
+
+            for fi, fq in enumerate(followups):
+                # Mirror Stage 1 for each follow-up: classify + decompose +
+                # entity-extract before retrieval. Previously we passed the
+                # follow-up verbatim into hybrid_search with sub_queries=[fq],
+                # skipping decomposition entirely — multi-part follow-ups got
+                # the same shallow retrieval as a one-shot keyword search.
+                start = time.time()
+                try:
+                    fq_decomp = query_processor.process_query(
+                        fq, use_llm=True, max_subqueries=config.max_subqueries,
+                    )
+                    fq_subs = fq_decomp.sub_queries or [fq]
+                    fq_decomp_summary = {
+                        "type": fq_decomp.type,
+                        "entities": _entity_list_to_dict(fq_decomp.entities),
+                        "sub_queries": fq_subs,
+                        "rationale": fq_decomp.rationale,
+                    }
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("agentic follow-up decomp failed (%s): falling back to verbatim", e)
+                    fq_subs = [fq]
+                    fq_decomp_summary = {"error": type(e).__name__, "sub_queries": fq_subs}
+                took_decomp = time.time() - start
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.followup_decomp_q{fi}{suffix}",
+                        input={"query": fq},
+                        output=fq_decomp_summary,
+                        took_ms=took_decomp * 1000,
+                    )
+                )
+
+                start = time.time()
+                fq_chunks, fq_trace = hybrid_search(fq, sub_queries=fq_subs, config=config)
+                took_fq = time.time() - start
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.followup_search_q{fi}{suffix}",
+                        input={"query": fq, "sub_queries": fq_subs},
+                        output={"chunk_count": len(fq_chunks)},
+                        took_ms=took_fq * 1000,
+                    )
+                )
+                # Namespace the follow-up's hybrid_search sub-stages so they
+                # don't collide with the MAIN query's hybrid_search.* stages
+                # (both emit names like `hybrid_search.vector_search_q0`).
+                # Without this, the viz's stage-dict lookup is last-wins and
+                # the main query's retrieval nodes get silently overwritten
+                # by follow-up data.
+                ns_prefix = f"agentic.followup_q{fi}{suffix}"
+                for sub in fq_trace:
+                    trace.append(
+                        PipelineStage(
+                            stage=f"{ns_prefix}.{sub.stage}",
+                            input=sub.input,
+                            output=sub.output,
+                            took_ms=sub.took_ms,
+                        )
+                    )
+                extra_chunks.extend(fq_chunks)
+
+            start = time.time()
+            seen2: set = set()
+            merged_pool: list[dict] = []
+            for chunk in expanded_pool + extra_chunks:
+                cid = chunk.get("id") or chunk.get("chunk_id")
+                if not cid:
+                    cid = ("__no_id__", chunk.get("section_id"),
+                           chunk.get("figure_number"), chunk.get("content_type"),
+                           (chunk.get("text_raw") or "")[:120])
+                if cid not in seen2:
+                    seen2.add(cid)
+                    merged_pool.append(chunk)
+            expanded_pool = merged_pool
+            took_merge = time.time() - start
+
+            start = time.time()
+            reranked2 = reranker.rerank(
+                query, expanded_pool,
+                top_k=config.agentic_rerank_topk,
+                model_name=config.cross_encoder_model,
+                text_field="text_raw",
+            )
+            took_rr2 = time.time() - start
+            trace.append(
+                PipelineStage(
+                    stage=f"agentic.rerank{suffix}",
+                    input={"chunk_count": len(expanded_pool),
+                           "top_k": config.agentic_rerank_topk,
+                           "added_by_followups": len(extra_chunks)},
+                    output={"results": _result_summary(reranked2),
+                            "count": len(reranked2),
+                            "merge_ms": took_merge * 1000},
+                    took_ms=took_rr2 * 1000,
+                )
+            )
+
+            start = time.time()
+            try:
+                answer2, citations2, used2, tokens2 = generator.generate(
+                    query, reranked2,
+                    model=config.agentic_model,
+                    max_context_tokens=config.agentic_max_context_tokens,
+                    max_tokens=config.agentic_max_output_tokens,
+                )
+                took_g2 = time.time() - start
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.regenerate{suffix}",
+                        input={"chunk_count": len(reranked2),
+                               "model": config.agentic_model,
+                               "max_context_tokens": config.agentic_max_context_tokens},
+                        output={"answer_length": len(answer2),
+                                "citation_count": len(citations2),
+                                "tokens": tokens2,
+                                "context_used": [
+                                    {"section_id": c.get("section_id"),
+                                     "section_title": c.get("section_title"),
+                                     "content_type": c.get("content_type")}
+                                    for c in used2
+                                ]},
+                        took_ms=took_g2 * 1000,
+                    )
+                )
+                answer, citations, context_chunks, tokens_used = answer2, citations2, used2, tokens2
+                # Keep the cached pool in sync so the refine cache (or a later
+                # iteration) sees the post-merge pool, not just first-pass.
+                deduplicated = expanded_pool
+            except Exception as e:
+                took_g2 = time.time() - start
+                logger.exception("Agentic regenerate failed after %.0fms: %s",
+                                 took_g2 * 1000, e)
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.regenerate{suffix}",
+                        input={"chunk_count": len(reranked2),
+                               "model": config.agentic_model},
+                        output={"error_type": type(e).__name__,
+                                "note": "kept prior answer"},
+                        took_ms=took_g2 * 1000,
+                    )
+                )
+                break
+
+        if config.agentic_recursive and not converged:
+            trace.append(
+                PipelineStage(
+                    stage="agentic.cap_reached",
+                    input={"max_iterations": max_iters},
+                    output={"iterations_run": max_iters,
+                            "last_gap_reason": last_gap_reason,
+                            "note": "stopped at max_iterations before model declared done"},
+                    took_ms=0.0,
+                )
+            )
+
+    # Stage 6: non-agentic gap hint
+    gap_hint: dict | None = None
+    if not agentic and config.auto_gap_check:
+        start = time.time()
+        try:
+            gh_followups, gh_reason, gh_requested = _agentic_gap_analysis(
+                query=query,
+                answer=answer,
+                used_chunks=context_chunks,
+                citations=citations,
+                max_followups=config.agentic_max_followups,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("auto_gap_check failed: %s", e)
+            gh_followups, gh_reason, gh_requested = [], "", {"figures": [], "fields": [], "sections": []}
+        took_gh = time.time() - start
+        needs = bool(gh_followups) or any(gh_requested.values())
+        gap_hint = {
+            "needs_followup": needs,
+            "reason": gh_reason,
+            "queries": gh_followups,
+            "requested_resources": gh_requested,
+        }
+        trace.append(
+            PipelineStage(
+                stage="gap_hint",
+                input={"agentic": False, "auto_gap_check": True},
+                output=gap_hint,
+                took_ms=took_gh * 1000,
+            )
+        )
+
+    return {
+        "query": query,
+        "answer": answer,
+        "citations": citations,
+        "sources": context_chunks,
+        "deduplicated": deduplicated,
+        "config": config.to_dict(),
+        "agentic": agentic,
+        "gap_hint": gap_hint,
+        "tokens_used": tokens_used,
+        "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
+    }
+
+
 def orchestrate(
     query: str,
     *,
     config: PipelineConfig | None = None,
     debug: bool = True,
     agentic: bool = False,
+    refine_seed: dict | None = None,
 ) -> dict:
     """
     Execute the full retrieval + generation pipeline.
@@ -534,20 +843,66 @@ def orchestrate(
         query: the user's question.
         config: PipelineConfig with tunable parameters. Defaults to PipelineConfig().
         debug: if True, include full pipeline_trace in response.
+        refine_seed: when provided, skip Stages 1–4 and seed Stage 5 with the
+            prior first-pass state. Shape:
+                {"deduplicated": [chunk...],
+                 "answer": str,
+                 "citations": [...],
+                 "context_chunks": [...],
+                 "tokens_used": dict | None}
+            Forces ``agentic=True`` regardless of the flag.
 
     Returns:
         {
             "answer": str,
-            "citations": [{"text": ..., "source": ...}, ...],
+            "citations": [...],
             "sources": [chunk dicts],
-            "config": config used,
-            "pipeline_trace": [PipelineStage dicts] if debug else [],
+            "deduplicated": [chunk dicts],    # pre-rerank pool, for refine cache
+            "config": ...,
+            "agentic": bool,
+            "gap_hint": dict | None,
+            "tokens_used": dict | None,
+            "pipeline_trace": [...] if debug else [],
         }
     """
     if config is None:
         config = PipelineConfig()
 
     trace: list[PipelineStage] = []
+    tokens_used: dict | None = None
+
+    # -------------------------------------------------------------------------
+    # Refine fast-path: skip Stages 1–4 and jump straight to Stage 5 with the
+    # prior first-pass state. Used by /api/refine when the user clicks
+    # "Run agentic refinement" from the sidebar — avoids re-doing the work
+    # we already did for the initial query.
+    # -------------------------------------------------------------------------
+    if refine_seed is not None:
+        agentic = True
+        deduplicated = list(refine_seed.get("deduplicated") or [])
+        answer = refine_seed.get("answer") or ""
+        citations = list(refine_seed.get("citations") or [])
+        context_chunks = list(refine_seed.get("context_chunks") or [])
+        tokens_used = refine_seed.get("tokens_used")
+        trace.append(
+            PipelineStage(
+                stage="refine.seed",
+                input={"reason": "skipping Stages 1–4 with cached first-pass state"},
+                output={"deduplicated_count": len(deduplicated),
+                        "context_chunk_count": len(context_chunks),
+                        "answer_chars": len(answer),
+                        "citation_count": len(citations)},
+                took_ms=0.0,
+            )
+        )
+        # Jump straight to Stage 5 — see below.
+        return _run_stage5_and_finalize(
+            query=query, config=config, debug=debug,
+            agentic=agentic, trace=trace,
+            deduplicated=deduplicated, answer=answer,
+            citations=citations, context_chunks=context_chunks,
+            tokens_used=tokens_used,
+        )
 
     # -------------------------------------------------------------------------
     # Stage 1: Query Processor (classify + decompose + extract entities)
@@ -797,228 +1152,15 @@ def orchestrate(
     # gap-derived follow-up queries), merge into the pool, re-rerank, and
     # regenerate with the higher-tier model + larger context budget.
     # -------------------------------------------------------------------------
-    if agentic:
-        # Recursive mode loops up to `agentic_max_iterations`; single-pass
-        # mode is iter 0 only (original behavior). When non-recursive, stage
-        # names omit the `.iterN` suffix so existing trace consumers see no
-        # diff.
-        max_iters = max(1, config.agentic_max_iterations) if config.agentic_recursive else 1
-        # Pool accumulates across iterations so we never lose chunks already
-        # retrieved (each rerank sees everything fetched so far).
-        expanded_pool: list[dict] = list(deduplicated)
-        last_gap_reason = ""
-        converged = False
-
-        for iteration in range(max_iters):
-            suffix = f".iter{iteration}" if config.agentic_recursive else ""
-
-            start = time.time()
-            followups, gap_reason, requested = _agentic_gap_analysis(
-                query=query,
-                answer=answer,
-                used_chunks=context_chunks,
-                citations=citations,
-                max_followups=config.agentic_max_followups,
-            )
-            took_gap = time.time() - start
-            last_gap_reason = gap_reason
-            # Only honor targeted-fetch requests if the config flag allows it.
-            targeted_requested = (
-                requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
-            )
-            gap_has_work = bool(followups) or any(targeted_requested.values())
-            trace.append(
-                PipelineStage(
-                    stage=f"agentic.gap_analysis{suffix}",
-                    input={"answer_chars": len(answer or ""),
-                           "max_followups": config.agentic_max_followups,
-                           "targeted_fetch_enabled": config.agentic_targeted_fetch,
-                           "iteration": iteration},
-                    output={"needs_followup": gap_has_work,
-                            "reason": gap_reason,
-                            "queries": followups,
-                            "requested_resources": targeted_requested},
-                    took_ms=took_gap * 1000,
-                )
-            )
-
-            if not gap_has_work:
-                converged = True
-                break
-
-            extra_chunks: list[dict] = []
-
-            # ─── Targeted resource fetch (direct table/field lookup) ─────
-            # Runs before the natural-language follow-ups so we always have
-            # at least the figures/fields the LLM explicitly named, even if
-            # the broader retrieval below times out or fails.
-            if any(targeted_requested.values()):
-                start = time.time()
-                try:
-                    fetched = _resolve_requested_resources(targeted_requested)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("agentic targeted-fetch failed: %s", e)
-                    fetched = []
-                took_fetch = time.time() - start
-                # Bucket counts for the trace (so the viz can show
-                # "3 figures / 1 field / 0 sections" per-bucket).
-                by_method: dict[str, int] = {}
-                for ch in fetched:
-                    by_method[ch.get("method", "?")] = by_method.get(ch.get("method", "?"), 0) + 1
-                trace.append(
-                    PipelineStage(
-                        stage=f"agentic.targeted_fetch{suffix}",
-                        input={"requested": targeted_requested,
-                               "totals": {k: len(v) for k, v in targeted_requested.items()}},
-                        output={"fetched_count": len(fetched),
-                                "by_method": by_method,
-                                "fetched": [
-                                    {"id": c.get("id"),
-                                     "section_id": c.get("section_id"),
-                                     "section_title": c.get("section_title"),
-                                     "figure_number": c.get("figure_number"),
-                                     "method": c.get("method")}
-                                    for c in fetched[:10]
-                                ]},
-                        took_ms=took_fetch * 1000,
-                    )
-                )
-                extra_chunks.extend(fetched)
-
-            # ─── Natural-language follow-up retrievals ───────────────────
-            for fi, fq in enumerate(followups):
-                start = time.time()
-                fq_chunks, fq_trace = hybrid_search(fq, sub_queries=[fq], config=config)
-                took_fq = time.time() - start
-                trace.append(
-                    PipelineStage(
-                        stage=f"agentic.followup_search_q{fi}{suffix}",
-                        input={"query": fq},
-                        output={"chunk_count": len(fq_chunks)},
-                        took_ms=took_fq * 1000,
-                    )
-                )
-                trace.extend(fq_trace)
-                extra_chunks.extend(fq_chunks)
-
-            # Merge new chunks with the running pool so each iteration's
-            # rerank sees everything we've collected so far (not just this
-            # iteration's fetches).
-            start = time.time()
-            seen2: set = set()
-            merged_pool: list[dict] = []
-            for chunk in expanded_pool + extra_chunks:
-                cid = chunk.get("id") or chunk.get("chunk_id")
-                if not cid:
-                    cid = ("__no_id__", chunk.get("section_id"),
-                           chunk.get("figure_number"), chunk.get("content_type"),
-                           (chunk.get("text_raw") or "")[:120])
-                if cid not in seen2:
-                    seen2.add(cid)
-                    merged_pool.append(chunk)
-            expanded_pool = merged_pool
-            took_merge = time.time() - start
-
-            # Re-rerank the expanded pool against the original query, keeping
-            # a wider top-k so Opus has more material to synthesize.
-            start = time.time()
-            reranked2 = reranker.rerank(
-                query, expanded_pool,
-                top_k=config.agentic_rerank_topk,
-                model_name=config.cross_encoder_model,
-                text_field="text_raw",
-            )
-            took_rr2 = time.time() - start
-            trace.append(
-                PipelineStage(
-                    stage=f"agentic.rerank{suffix}",
-                    input={"chunk_count": len(expanded_pool),
-                           "top_k": config.agentic_rerank_topk,
-                           "added_by_followups": len(extra_chunks)},
-                    output={"results": _result_summary(reranked2),
-                            "count": len(reranked2),
-                            "merge_ms": took_merge * 1000},
-                    took_ms=took_rr2 * 1000,
-                )
-            )
-
-            # Regenerate with Opus + larger context.
-            start = time.time()
-            try:
-                answer2, citations2, used2, tokens2 = generator.generate(
-                    query, reranked2,
-                    model=config.agentic_model,
-                    max_context_tokens=config.agentic_max_context_tokens,
-                    max_tokens=config.agentic_max_output_tokens,
-                )
-                took_g2 = time.time() - start
-                trace.append(
-                    PipelineStage(
-                        stage=f"agentic.regenerate{suffix}",
-                        input={"chunk_count": len(reranked2),
-                               "model": config.agentic_model,
-                               "max_context_tokens": config.agentic_max_context_tokens},
-                        output={"answer_length": len(answer2),
-                                "citation_count": len(citations2),
-                                "tokens": tokens2,
-                                "context_used": [
-                                    {"section_id": c.get("section_id"),
-                                     "section_title": c.get("section_title"),
-                                     "content_type": c.get("content_type")}
-                                    for c in used2
-                                ]},
-                        took_ms=took_g2 * 1000,
-                    )
-                )
-                # Promote the agentic answer as the canonical result so the
-                # next iteration's gap analysis evaluates the latest output.
-                answer, citations, context_chunks, tokens_used = answer2, citations2, used2, tokens2
-            except Exception as e:
-                # Agentic regenerate failed — keep the most recent good answer
-                # so the user still gets something. Stop looping; don't retry
-                # on broken generation.
-                took_g2 = time.time() - start
-                logger.exception("Agentic regenerate failed after %.0fms: %s",
-                                 took_g2 * 1000, e)
-                trace.append(
-                    PipelineStage(
-                        stage=f"agentic.regenerate{suffix}",
-                        input={"chunk_count": len(reranked2),
-                               "model": config.agentic_model},
-                        output={"error_type": type(e).__name__,
-                                "note": "kept prior answer"},
-                        took_ms=took_g2 * 1000,
-                    )
-                )
-                break
-
-        # When recursive mode runs to the cap without natural convergence,
-        # surface a warning stage so the trace makes it obvious.
-        if config.agentic_recursive and not converged:
-            trace.append(
-                PipelineStage(
-                    stage="agentic.cap_reached",
-                    input={"max_iterations": max_iters},
-                    output={"iterations_run": max_iters,
-                            "last_gap_reason": last_gap_reason,
-                            "note": "stopped at max_iterations before model declared done"},
-                    took_ms=0.0,
-                )
-            )
-
-    # -------------------------------------------------------------------------
-    # Assemble final response
-    # -------------------------------------------------------------------------
-    return {
-        "query": query,
-        "answer": answer,
-        "citations": citations,
-        "sources": context_chunks,
-        "config": config.to_dict(),
-        "agentic": agentic,
-        "tokens_used": tokens_used,
-        "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
-    }
+    # Stage 5 (agentic loop) + Stage 6 (non-agentic gap hint) + assembly.
+    # Extracted so /api/refine can call this same helper with a seeded
+    # first-pass state and skip Stages 1–4 entirely.
+    return _run_stage5_and_finalize(
+        query=query, config=config, debug=debug, agentic=agentic,
+        trace=trace, deduplicated=deduplicated,
+        answer=answer, citations=citations, context_chunks=context_chunks,
+        tokens_used=tokens_used,
+    )
 
 
 if __name__ == "__main__":
