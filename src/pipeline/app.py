@@ -276,34 +276,73 @@ def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>specGPT - sign in</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5; color: #333; margin: 0;
-            min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
-    .card {{ background: white; padding: 32px 28px; border-radius: 8px;
-             box-shadow: 0 2px 6px rgba(0,0,0,0.08); width: 320px; }}
-    h1 {{ font-size: 22px; margin: 0 0 6px; color: #2c3e50; }}
-    p.sub {{ font-size: 13px; color: #666; margin: 0 0 20px; }}
-    label {{ display: block; font-size: 12px; font-weight: 600;
-             text-transform: uppercase; color: #555; margin-bottom: 6px; }}
-    input[type=password] {{ width: 100%; box-sizing: border-box; padding: 10px;
-                             border: 2px solid #e0e0e0; border-radius: 4px;
-                             font-size: 16px; }}
-    input[type=password]:focus {{ outline: none; border-color: #3498db; }}
-    button {{ margin-top: 16px; width: 100%; padding: 12px;
-              background: #3498db; color: white; border: none;
-              border-radius: 4px; font-size: 16px; font-weight: 600;
-              cursor: pointer; }}
-    button:hover {{ background: #2980b9; }}
-    .error {{ background: #fdecea; color: #c0392b;
-              padding: 10px 12px; border-radius: 4px;
-              border-left: 3px solid #e74c3c;
-              font-size: 13px; margin-bottom: 16px; }}
+    :root {{
+      --bg: #ffffff; --bg-soft: #fafaf9; --bg-muted: #f5f5f4;
+      --border: #e7e5e4; --border-strong: #d6d3d1;
+      --text: #1c1917; --text-muted: #57534e; --text-subtle: #78716c; --text-faint: #a8a29e;
+      --accent: #1c1917; --danger: #b91c1c;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: var(--font-sans);
+            font-feature-settings: "cv11", "ss01";
+            background: var(--bg-soft); color: var(--text);
+            font-size: 14px; line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            letter-spacing: -0.005em;
+            margin: 0; min-height: 100vh;
+            display: flex; align-items: center; justify-content: center; }}
+    .card {{ background: var(--bg); padding: 28px 26px;
+             border: 1px solid var(--border); border-radius: 8px;
+             box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+             width: 340px; }}
+    .brand {{ display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }}
+    .brand-mark {{ width: 22px; height: 22px; border-radius: 5px;
+                   background: var(--accent); color: white;
+                   display: grid; place-items: center;
+                   font-family: var(--font-mono);
+                   font-size: 11px; font-weight: 700; letter-spacing: -0.02em; }}
+    h1 {{ font-size: 14px; font-weight: 600; margin: 0;
+          color: var(--text); letter-spacing: -0.01em; }}
+    p.sub {{ font-size: 12.5px; color: var(--text-subtle);
+             margin: 0 0 18px; line-height: 1.45; }}
+    label {{ display: block; font-size: 10.5px; font-weight: 500;
+             text-transform: uppercase; color: var(--text-subtle);
+             margin-bottom: 5px; letter-spacing: 0.05em; }}
+    input[type=password] {{ width: 100%; padding: 9px 11px;
+                             border: 1px solid var(--border);
+                             border-radius: 4px; font-size: 14px;
+                             background: var(--bg); color: var(--text);
+                             font-family: var(--font-mono);
+                             letter-spacing: -0.005em;
+                             transition: border-color 0.12s, box-shadow 0.12s; }}
+    input[type=password]:focus {{ outline: none;
+                                   border-color: var(--accent);
+                                   box-shadow: 0 0 0 3px rgba(28,25,23,0.08); }}
+    button {{ margin-top: 16px; width: 100%; padding: 10px 12px;
+              background: var(--accent); color: white; border: 1px solid var(--accent);
+              border-radius: 4px; font-size: 13px; font-weight: 500;
+              cursor: pointer; font-family: inherit;
+              letter-spacing: -0.005em;
+              transition: background 0.12s, border-color 0.12s; }}
+    button:hover {{ background: #000; border-color: #000; }}
+    .error {{ background: #fef2f2; color: var(--danger);
+              padding: 9px 12px; border-radius: 4px;
+              border: 1px solid #fecaca;
+              font-size: 12.5px; margin-bottom: 14px; }}
   </style>
 </head>
 <body>
   <form class="card" method="post" action="/login" autocomplete="off">
-    <h1>specGPT</h1>
+    <div class="brand">
+      <div class="brand-mark">sG</div>
+      <h1>specGPT</h1>
+    </div>
     <p class="sub">Enter the access password to continue.</p>
     {error_html}
     <input type="hidden" name="next" value="{next_attr}">
@@ -586,308 +625,352 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>specGPT - NVMe Spec Q&A</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        /* ─── Minimalist internal-tool theme ────────────────────────────
+           Adapted from the Claude Design handoff bundle: Linear/Vercel/Stripe
+           dashboard aesthetic — single near-black accent on stone backgrounds,
+           hairline borders, Inter UI + JetBrains Mono for technical data. All
+           existing class names and HTML structure preserved. */
+        :root {
+            --bg: #ffffff;
+            --bg-soft: #fafaf9;
+            --bg-muted: #f5f5f4;
+            --border: #e7e5e4;
+            --border-strong: #d6d3d1;
+            --text: #1c1917;
+            --text-muted: #57534e;
+            --text-subtle: #78716c;
+            --text-faint: #a8a29e;
+            --accent: #1c1917;
+            --accent-soft: #f5f5f4;
+            --danger: #b91c1c;
+            --warn: #a16207;
+            --ok: #15803d;
+            --indigo: #4f46e5;
+            --radius: 6px;
+            --radius-sm: 4px;
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
         }
 
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: #f5f5f5;
-            color: #333;
+            font-family: var(--font-sans);
+            font-feature-settings: "cv11", "ss01";
+            background: var(--bg-soft);
+            color: var(--text);
+            font-size: 14px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            letter-spacing: -0.005em;
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1100px;
             margin: 0 auto;
-            padding: 12px 16px;
+            padding: 0 20px;
         }
 
+        /* ─── Topbar / header ─────────────────────────────────────────── */
         header {
-            background: #2c3e50;
-            color: white;
+            background: var(--bg);
+            color: var(--text);
+            border-bottom: 1px solid var(--border);
             padding: 14px 0 12px;
-            margin-bottom: 14px;
-            border-bottom: 2px solid #3498db;
+            margin-bottom: 18px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
-
         header h1 {
-            font-size: 20px;
-            margin-bottom: 2px;
-            line-height: 1.2;
-        }
-
-        header p {
-            font-size: 12.5px;
-            opacity: 0.85;
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
             line-height: 1.3;
+            margin: 0;
+            color: var(--text);
+        }
+        header p {
+            font-size: 12px;
+            color: var(--text-subtle);
+            line-height: 1.4;
+            margin-top: 2px;
+            opacity: 1;
         }
 
+        /* ─── Composer / search section ───────────────────────────────── */
         .search-section {
-            background: white;
-            border-radius: 6px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            box-shadow: var(--shadow-sm);
             padding: 12px 14px;
-            margin-bottom: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            margin-bottom: 14px;
         }
-
         .search-box {
             display: flex;
             gap: 8px;
             margin-bottom: 10px;
         }
-
         #query-input {
             flex: 1;
             padding: 9px 11px;
-            border: 1.5px solid #e0e0e0;
-            border-radius: 4px;
-            font-size: 14.5px;
-            transition: border-color 0.2s;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: inherit;
+            letter-spacing: -0.005em;
+            transition: border-color 0.12s, box-shadow 0.12s;
         }
-
+        #query-input::placeholder { color: var(--text-faint); }
         #query-input:focus {
             outline: none;
-            border-color: #3498db;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(28,25,23,0.08);
         }
 
         button {
-            padding: 9px 22px;
-            background: #3498db;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 600;
+            height: 36px;
+            padding: 0 14px;
+            background: var(--accent);
+            color: #fff;
+            border: 1px solid var(--accent);
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            font-weight: 500;
             cursor: pointer;
-            transition: background 0.2s;
+            font-family: inherit;
+            letter-spacing: -0.005em;
+            transition: background 0.12s, border-color 0.12s, color 0.12s;
+            white-space: nowrap;
         }
-
-        button:hover {
-            background: #2980b9;
-        }
-
-        button:active {
-            transform: scale(0.98);
+        button:hover { background: #000; border-color: #000; }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
         }
 
         .config-toggle {
-            background: #95a5a6;
-            font-size: 13px;
-            padding: 6px 12px;
+            background: var(--bg);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            font-weight: 500;
+            font-size: 12.5px;
+            padding: 0 12px;
+            height: 36px;
         }
-
         .config-toggle:hover {
-            background: #7f8c8d;
+            background: var(--bg-muted);
+            border-color: var(--border-strong);
+            color: var(--text);
         }
 
-        /* ─── Agentic-mode toggle ─────────────────────────────────────── */
+        /* ─── Agentic toggle row ──────────────────────────────────────── */
         .agentic-row {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
             margin-top: 8px;
-            padding: 6px 10px;
-            background: #f4f6f7;
-            border-radius: 4px;
-            border-left: 3px solid #8e44ad;
+            padding: 8px 12px;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             font-size: 12.5px;
-            color: #555;
+            color: var(--text-subtle);
         }
         .agentic-row label {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
             cursor: pointer;
-            font-weight: 600;
-            color: #2c3e50;
+            font-weight: 500;
+            color: var(--text);
         }
         .agentic-row input[type="checkbox"] {
-            transform: scale(1.1);
+            transform: scale(1.05);
             cursor: pointer;
+            accent-color: var(--accent);
         }
         .agentic-row .agentic-hint {
-            color: #7f8c8d;
-            font-weight: normal;
-            font-size: 11.5px;
+            color: var(--text-subtle);
+            font-weight: 400;
+            font-size: 12px;
         }
         .agentic-row.active {
-            background: #f3e5f5;
-            border-left-color: #6c3483;
+            background: var(--bg-muted);
+            border-color: var(--border-strong);
         }
 
-        /* Sub-panel of agentic knobs, shown only when toggle is on. */
         .agentic-config {
-            background: #f3e5f5;
-            padding: 8px 12px;
-            border-radius: 4px;
-            margin-top: 4px;
-            border-left: 3px solid #6c3483;
+            background: var(--bg-soft);
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            margin-top: 6px;
         }
-        .agentic-config.hidden {
-            display: none;
-        }
-        .agentic-config .config-item label {
-            color: #2c3e50;
-        }
+        .agentic-config.hidden { display: none; }
+        .agentic-config .config-item label { color: var(--text-subtle); }
 
-        /* ─── Cost estimator (live updates on any config change) ──────── */
+        /* ─── Cost estimator ──────────────────────────────────────────── */
         .cost-estimator {
             margin-top: 10px;
-            background: #ffffff;
-            border: 1px solid #e1e6ec;
-            border-radius: 6px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             font-size: 13px;
             overflow: hidden;
         }
         .cost-summary {
             display: flex;
             align-items: center;
-            gap: 8px;
-            padding: 6px 10px;
+            gap: 10px;
+            padding: 8px 12px;
             cursor: pointer;
             user-select: none;
-            background: #fafbfc;
-            transition: background 0.15s;
+            background: var(--bg);
+            transition: background 0.12s;
         }
-        .cost-summary:hover { background: #f4f6f7; }
-        .cost-icon {
-            font-size: 13px;
-            opacity: 0.7;
-        }
+        .cost-summary:hover { background: var(--bg-soft); }
+        .cost-icon { display: none; }
         .cost-label {
             font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #64748b;
+            letter-spacing: 0.05em;
+            color: var(--text-faint);
             font-weight: 600;
         }
         .cost-total {
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            font-weight: 700;
-            color: #1e8449;
+            font-family: var(--font-mono);
+            font-weight: 500;
+            color: var(--text);
             font-size: 13px;
         }
-        .cost-total.cost-warn { color: #b7791f; }
-        .cost-total.cost-high { color: #b91c1c; }
+        .cost-total.cost-warn { color: var(--warn); }
+        .cost-total.cost-high { color: var(--danger); }
         .cost-context {
-            color: #64748b;
+            color: var(--text-subtle);
             font-size: 11.5px;
         }
         .cost-toggle {
             margin-left: auto;
-            color: #94a3b8;
-            font-size: 10.5px;
-            transition: transform 0.2s;
+            color: var(--text-faint);
+            font-size: 10px;
+            transition: transform 0.15s;
         }
         .cost-estimator.open .cost-toggle { transform: rotate(180deg); }
         .cost-breakdown {
             display: none;
-            padding: 4px 10px 10px;
-            border-top: 1px solid #f1f5f9;
+            padding: 6px 12px 12px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-soft);
         }
         .cost-estimator.open .cost-breakdown { display: block; }
         .cost-row {
             display: flex;
             justify-content: space-between;
             align-items: baseline;
-            padding: 4px 0;
-            border-bottom: 1px dashed #f1f5f9;
-            font-size: 12px;
+            padding: 5px 0;
+            border-bottom: 1px dashed var(--border);
+            font-size: 12.5px;
         }
         .cost-row:last-child { border-bottom: 0; }
-        .cost-row-name { color: #334155; }
+        .cost-row-name { color: var(--text-muted); }
         .cost-row-name small {
-            color: #94a3b8;
-            margin-left: 6px;
+            color: var(--text-faint);
+            margin-left: 8px;
             font-size: 11.5px;
         }
         .cost-row-value {
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            color: #1f2d3d;
-            font-weight: 600;
+            font-family: var(--font-mono);
+            color: var(--text);
+            font-weight: 500;
+            font-size: 12px;
         }
         .cost-row.cost-row-total {
-            margin-top: 4px;
-            padding-top: 8px;
-            border-top: 1px solid #e1e6ec;
+            margin-top: 5px;
+            padding-top: 9px;
+            border-top: 1px solid var(--border);
             border-bottom: 0;
         }
-        .cost-row.cost-row-total .cost-row-value { color: #1e8449; }
+        .cost-row.cost-row-total .cost-row-value { color: var(--text); font-weight: 600; }
+        .cost-row.cost-row-total .cost-row-name b { color: var(--text); }
         .cost-disclaimer {
-            margin-top: 8px;
-            color: #94a3b8;
-            font-size: 11px;
-            font-style: italic;
-            line-height: 1.45;
+            margin-top: 10px;
+            color: var(--text-faint);
+            font-size: 11.5px;
+            font-style: normal;
+            line-height: 1.5;
         }
 
-        /* ─── Agent activity strip (lives inside the header banner) ──── */
+        /* ─── Agent activity strip (now sits in the light header) ─────── */
         .agent-strip {
-            margin-top: 10px;
-            padding: 7px 12px 7px 14px;
-            background: rgba(255, 255, 255, 0.07);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-left: 3px solid #a855f7;
-            border-radius: 5px;
+            margin-top: 12px;
+            padding: 8px 12px;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             display: flex;
             flex-wrap: wrap;
             align-items: center;
-            gap: 8px 12px;
-            color: #e2e8f0;
+            gap: 8px 14px;
+            color: var(--text-muted);
             font-size: 12.5px;
-            line-height: 1.35;
+            line-height: 1.4;
             min-height: 36px;
-            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
         }
         .agent-strip-label {
-            font-size: 11px;
+            font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.8px;
-            color: #f1f5f9;
-            font-weight: 700;
-            margin-right: 6px;
-            padding-right: 10px;
-            border-right: 1px solid rgba(255, 255, 255, 0.18);
+            letter-spacing: 0.06em;
+            color: var(--text-faint);
+            font-weight: 600;
+            margin-right: 4px;
+            padding-right: 12px;
+            border-right: 1px solid var(--border);
         }
         .agent-strip-empty {
-            color: #cbd5e1;
-            font-style: italic;
-            font-size: 13px;
+            color: var(--text-subtle);
+            font-style: normal;
+            font-size: 12.5px;
         }
         .agent-strip-state {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            font-size: 12px;
-            color: #cbd5e1;
-            background: rgba(255, 255, 255, 0.06);
+            gap: 7px;
+            font-size: 12.5px;
+            color: var(--text-muted);
+            background: var(--bg);
             padding: 3px 10px;
             border-radius: 11px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--border);
         }
         .agent-strip-state .dot {
-            width: 7px;
-            height: 7px;
+            width: 7px; height: 7px;
             border-radius: 50%;
-            background: #94a3b8;
+            background: var(--text-faint);
             display: inline-block;
         }
-        .agent-strip-state.state-ok    .dot { background: #34d399; }
-        .agent-strip-state.state-warn  .dot { background: #fbbf24; }
-        .agent-strip-state.state-agent .dot { background: #c084fc; }
-        .agent-strip-state.state-error .dot { background: #f87171; }
-        .agent-strip-state b { color: #f1f5f9; font-weight: 600; }
+        .agent-strip-state.state-ok    .dot { background: var(--ok); }
+        .agent-strip-state.state-warn  .dot { background: var(--warn); }
+        .agent-strip-state.state-agent .dot { background: var(--indigo); }
+        .agent-strip-state.state-error .dot { background: var(--danger); }
+        .agent-strip-state b { color: var(--text); font-weight: 600; }
         .agent-strip-state .strip-latency {
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            color: #cbd5e1;
+            font-family: var(--font-mono);
+            color: var(--text-subtle);
         }
         .agent-strip-reason {
             flex: 1;
             min-width: 200px;
-            color: #cbd5e1;
+            color: var(--text-subtle);
             font-size: 12.5px;
         }
         .agent-strip-actions { margin-left: auto; }
@@ -898,24 +981,25 @@ FRONTEND_HTML = """<!DOCTYPE html>
             align-items: center;
         }
         .agent-strip-chip {
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            color: #e2e8f0;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
             font-size: 11px;
-            padding: 2px 8px;
+            padding: 2px 7px;
             border-radius: 10px;
+            font-family: var(--font-mono);
         }
-        .agent-strip-chip.chip-section { color: #cbd5e1; }
+        .agent-strip-chip.chip-section { color: var(--text-muted); }
         .agent-strip-details {
             flex-basis: 100%;
-            margin-top: 4px;
+            margin-top: 6px;
             padding-top: 8px;
-            border-top: 1px dashed rgba(255, 255, 255, 0.12);
+            border-top: 1px dashed var(--border);
             display: flex;
             flex-wrap: wrap;
             gap: 8px 16px;
             font-size: 12px;
-            color: #cbd5e1;
+            color: var(--text-subtle);
         }
         .agent-strip-details .detail-group {
             display: inline-flex;
@@ -925,98 +1009,114 @@ FRONTEND_HTML = """<!DOCTYPE html>
         .agent-strip-details .detail-label {
             font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.6px;
-            color: #94a3b8;
+            letter-spacing: 0.06em;
+            color: var(--text-faint);
             font-weight: 600;
         }
         .run-agentic-btn {
-            padding: 6px 14px;
-            background: #8b5cf6;
+            height: 28px;
+            padding: 0 12px;
+            background: var(--accent);
             color: #fff;
             font-size: 12.5px;
-            font-weight: 600;
-            border: 1px solid #7c3aed;
-            border-radius: 4px;
+            font-weight: 500;
+            border: 1px solid var(--accent);
+            border-radius: var(--radius-sm);
             cursor: pointer;
-            transition: background 0.15s;
+            font-family: inherit;
+            letter-spacing: -0.005em;
         }
-        .run-agentic-btn:hover { background: #7c3aed; }
+        .run-agentic-btn:hover { background: #000; border-color: #000; }
         .run-agentic-btn:disabled {
-            background: #475569;
-            border-color: #475569;
-            color: #cbd5e1;
+            background: var(--bg-muted);
+            border-color: var(--border);
+            color: var(--text-faint);
             cursor: not-allowed;
         }
 
+        /* ─── Config panel ────────────────────────────────────────────── */
         .config-panel {
             display: none;
-            background: #ecf0f1;
-            padding: 10px 12px;
-            border-radius: 4px;
+            background: var(--bg-soft);
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             margin-top: 8px;
-            border-left: 3px solid #95a5a6;
         }
-
-        .config-panel.open {
+        .config-panel.open { display: block; }
+        .config-panel strong {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-faint);
+            font-weight: 600;
             display: block;
+            margin-bottom: 10px;
         }
 
         .config-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 8px 10px;
-            margin-top: 6px;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px 14px;
+            margin-top: 4px;
         }
-
         .config-item {
             display: flex;
             flex-direction: column;
         }
-
         .config-item label {
             font-size: 10.5px;
-            font-weight: 600;
-            color: #555;
-            margin-bottom: 3px;
+            font-weight: 500;
+            color: var(--text-subtle);
+            margin-bottom: 4px;
             text-transform: uppercase;
-            letter-spacing: 0.3px;
+            letter-spacing: 0.05em;
         }
-
         .config-item input,
         .config-item select {
-            padding: 5px 7px;
-            border: 1px solid #bdc3c7;
-            border-radius: 3px;
-            font-size: 13px;
-            background: white;
-            color: #2c3e50;
-            font-family: inherit;
+            padding: 6px 9px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 12.5px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font-mono);
         }
-        .config-item select { cursor: pointer; }
+        .config-item select { font-family: var(--font-sans); cursor: pointer; }
+        .config-item input:focus,
+        .config-item select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(28,25,23,0.08);
+        }
+        .config-item input[type="checkbox"] {
+            accent-color: var(--accent);
+            width: auto;
+            margin-right: 6px;
+        }
         .config-item.config-item-wide { grid-column: span 2; }
 
+        /* ─── Loading row ─────────────────────────────────────────────── */
         .loading {
-            background: white;
-            border: 1px solid #e1e6ec;
-            border-radius: 6px;
-            padding: 14px 16px;
-            margin-bottom: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 14px;
+            box-shadow: var(--shadow-sm);
             display: flex;
             align-items: center;
             gap: 14px;
-            color: #1f2d3d;
+            color: var(--text);
             font-size: 13.5px;
         }
         .loading-spinner {
-            width: 22px;
-            height: 22px;
-            border: 2.5px solid #e0e7ff;
-            border-top-color: #3498db;
-            border-right-color: #3498db;
+            width: 18px; height: 18px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
             border-radius: 50%;
             flex-shrink: 0;
-            animation: loading-spin 0.8s linear infinite;
+            animation: loading-spin 0.7s linear infinite;
         }
         .loading-body {
             flex: 1;
@@ -1026,15 +1126,16 @@ FRONTEND_HTML = """<!DOCTYPE html>
             gap: 3px;
         }
         .loading-title {
-            font-weight: 600;
-            color: #1f2d3d;
+            font-weight: 500;
+            color: var(--text);
             line-height: 1.3;
+            font-size: 13.5px;
         }
         .loading-meta {
             font-size: 11.5px;
-            color: #64748b;
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            letter-spacing: 0.2px;
+            color: var(--text-subtle);
+            font-family: var(--font-mono);
+            letter-spacing: 0;
         }
         .loading-meta .loading-dots::after {
             content: "";
@@ -1044,26 +1145,25 @@ FRONTEND_HTML = """<!DOCTYPE html>
             animation: loading-dots 1.4s steps(4, end) infinite;
         }
         .loading-cancel {
-            padding: 6px 14px;
-            background: white;
-            color: #b91c1c;
-            border: 1px solid #fecaca;
-            border-radius: 4px;
+            height: 28px;
+            padding: 0 12px;
+            background: var(--bg);
+            color: var(--danger);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             font-size: 12.5px;
-            font-weight: 600;
+            font-weight: 500;
             cursor: pointer;
-            transition: background 0.15s, border-color 0.15s;
             flex-shrink: 0;
+            font-family: inherit;
         }
         .loading-cancel:hover {
-            background: #fee2e2;
-            border-color: #fca5a5;
+            background: #fef2f2;
+            border-color: #fecaca;
         }
         .loading-cancel:active { transform: scale(0.97); }
 
-        @keyframes loading-spin {
-            to { transform: rotate(360deg); }
-        }
+        @keyframes loading-spin { to { transform: rotate(360deg); } }
         @keyframes loading-dots {
             0%   { content: ""; }
             25%  { content: "."; }
@@ -1072,405 +1172,404 @@ FRONTEND_HTML = """<!DOCTYPE html>
             100% { content: ""; }
         }
 
-        button:disabled {
-            opacity: 0.55;
-            cursor: not-allowed;
-            transform: none !important;
-        }
-
+        /* ─── Error banner ────────────────────────────────────────────── */
         .error {
-            background: #e74c3c;
-            color: white;
-            padding: 10px 12px;
-            border-radius: 4px;
-            margin-bottom: 12px;
+            background: #fef2f2;
+            color: var(--danger);
+            padding: 10px 14px;
+            border: 1px solid #fecaca;
+            border-radius: var(--radius-sm);
+            margin-bottom: 14px;
             font-size: 13px;
         }
 
+        /* ─── Results / answer card ───────────────────────────────────── */
         .results-section {
-            background: white;
-            border-radius: 6px;
-            padding: 14px 16px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0;
+            box-shadow: var(--shadow-sm);
+            overflow: hidden;
+            margin-bottom: 0;
+        }
+        #latency {
+            color: var(--text-subtle) !important;
+            font-family: var(--font-mono);
+            font-size: 11.5px !important;
+            padding: 12px 22px 0 !important;
+            margin: 0 !important;
         }
 
         .answer-box {
-            background: #ecf0f1;
-            padding: 10px 12px;
-            border-radius: 4px;
-            margin-bottom: 12px;
-            border-left: 3px solid #27ae60;
+            background: var(--bg);
+            padding: 8px 22px 22px;
+            margin-bottom: 0;
+            border-left: none;
+            border-radius: 0;
         }
-
         .answer-box h3 {
-            color: #27ae60;
-            margin-bottom: 6px;
-            font-size: 12px;
+            color: var(--text-faint);
+            margin-bottom: 8px;
+            font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.4px;
+            letter-spacing: 0.08em;
+            font-weight: 600;
         }
-
         .answer-text {
-            line-height: 1.55;
-            color: #333;
+            line-height: 1.65;
+            color: var(--text);
+            font-size: 14.5px;
         }
 
         .citations {
-            background: #fef5e7;
-            padding: 10px 12px;
-            border-radius: 4px;
-            border-left: 3px solid #f39c12;
-            margin-bottom: 12px;
+            background: var(--bg-soft);
+            padding: 14px 22px 16px;
+            border-top: 1px solid var(--border);
+            border-left: none;
+            border-radius: 0;
+            margin-bottom: 0;
         }
-
         .citations h3 {
-            color: #f39c12;
-            margin-bottom: 6px;
-            font-size: 12px;
+            color: var(--text-faint);
+            margin-bottom: 10px;
+            font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.4px;
+            letter-spacing: 0.08em;
+            font-weight: 600;
         }
-
         .citation-item {
-            padding: 5px 0;
-            border-bottom: 1px solid #fdebd0;
+            padding: 6px 0;
+            border-top: 1px solid var(--border);
             font-size: 13px;
+            color: var(--text-muted);
         }
-
+        .citation-item:first-of-type {
+            border-top: 0;
+            padding-top: 0;
+        }
         .citation-item:last-child {
             border-bottom: none;
         }
-
         .citation-section {
-            color: #d68910;
-            font-weight: 600;
+            color: var(--text);
+            font-weight: 500;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            margin-right: 6px;
         }
 
-        .pipeline-section {
-            margin-top: 18px;
-        }
-
+        /* ─── Pipeline trace cards ────────────────────────────────────── */
+        .pipeline-section { margin-top: 16px; }
         .pipeline-section h2 {
-            font-size: 15px;
+            font-size: 13px;
+            font-weight: 600;
             margin-bottom: 8px;
-            color: #2c3e50;
+            color: var(--text);
+            letter-spacing: -0.005em;
         }
 
         .pipeline-stage {
-            background: #fff;
-            border: 1px solid #e1e6ec;
-            border-radius: 6px;
-            margin-bottom: 8px;
+            background: var(--bg);
+            border-top: 1px solid var(--border);
+            border-radius: 0;
+            border-left: 0;
+            border-right: 0;
+            border-bottom: 0;
+            margin-bottom: 0;
             overflow: hidden;
-            transition: box-shadow 0.15s, border-color 0.15s;
+            transition: background 0.12s;
         }
-        .pipeline-stage:hover {
-            border-color: #cdd5df;
-            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
-        }
-        .pipeline-stage.stage-group-agentic {
-            border-left: 3px solid #a855f7;
-        }
+        .pipeline-stage:first-child { border-top: 0; }
+        .pipeline-stage:hover { background: var(--bg); }
+        .pipeline-stage.stage-group-agentic,
         .pipeline-stage.stage-group-normal {
-            border-left: 3px solid #3b82f6;
+            border-left: 0;
         }
 
         .stage-header {
-            padding: 10px 14px;
-            background: #fafbfc;
+            padding: 9px 14px;
+            background: var(--bg);
             cursor: pointer;
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 12px;
             user-select: none;
-            transition: background 0.15s;
+            transition: background 0.12s;
         }
-        .stage-header:hover { background: #f4f6f7; }
-        .stage-header.open { background: #f1f5f9; }
+        .stage-header:hover { background: var(--bg-soft); }
+        .stage-header.open { background: var(--bg-soft); }
 
-        .stage-title-block {
-            flex: 1;
-            min-width: 0;
-        }
+        .stage-title-block { flex: 1; min-width: 0; }
         .stage-name {
-            font-weight: 600;
-            color: #1f2d3d;
-            font-size: 14px;
+            font-weight: 500;
+            color: var(--text);
+            font-size: 13px;
             display: block;
             line-height: 1.35;
         }
         .stage-index {
-            color: #94a3b8;
+            color: var(--text-faint);
             font-weight: 500;
-            margin-right: 4px;
+            margin-right: 6px;
+            font-family: var(--font-mono);
+            font-size: 11.5px;
         }
         .stage-subtitle {
             display: block;
             font-size: 12px;
-            color: #64748b;
+            color: var(--text-subtle);
             margin-top: 2px;
             font-weight: 400;
         }
 
         .stage-time {
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            font-size: 12px;
-            color: #475569;
-            background: #eef2f6;
-            padding: 2px 8px;
-            border-radius: 10px;
+            font-family: var(--font-mono);
+            font-size: 11.5px;
+            color: var(--text-subtle);
+            background: transparent;
+            padding: 0;
+            border-radius: 0;
             white-space: nowrap;
             flex-shrink: 0;
         }
-        .stage-time.stage-time-slow { background: #fef3c7; color: #92400e; }
+        .stage-time.stage-time-slow { color: var(--warn); background: transparent; }
 
         .stage-toggle {
-            color: #94a3b8;
-            font-size: 14px;
-            transition: transform 0.2s;
+            color: var(--text-faint);
+            font-size: 10px;
+            transition: transform 0.15s;
             flex-shrink: 0;
         }
         .stage-header.open .stage-toggle { transform: rotate(180deg); }
 
         .stage-content {
             display: none;
-            padding: 14px 16px 16px;
-            border-top: 1px solid #eef2f6;
-            background: #fdfdfe;
+            padding: 12px 18px 16px 42px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-soft);
         }
         .stage-content.open { display: block; }
 
         .stage-metrics {
             display: flex;
             flex-wrap: wrap;
-            gap: 6px;
+            gap: 5px;
             margin-bottom: 12px;
         }
         .stage-chip {
-            font-size: 12px;
-            background: #eef2f6;
-            color: #334155;
-            border: 1px solid #e1e6ec;
-            padding: 3px 9px;
-            border-radius: 12px;
-            font-weight: 500;
+            font-size: 11.5px;
+            background: var(--bg);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 400;
+            font-family: var(--font-mono);
         }
         .stage-chip.stage-chip-error {
-            background: #fee2e2;
-            color: #991b1b;
+            background: #fef2f2;
+            color: var(--danger);
             border-color: #fecaca;
         }
         .stage-chip.stage-chip-warn {
-            background: #fef3c7;
-            color: #92400e;
+            background: #fefce8;
+            color: var(--warn);
             border-color: #fde68a;
         }
         .stage-chip.stage-chip-ok {
-            background: #dcfce7;
-            color: #166534;
+            background: #f0fdf4;
+            color: var(--ok);
             border-color: #bbf7d0;
         }
         .stage-chip.stage-chip-info {
-            background: #dbeafe;
-            color: #1e40af;
-            border-color: #bfdbfe;
+            background: #eef2ff;
+            color: #3730a3;
+            border-color: #c7d2fe;
         }
         .stage-chip.stage-chip-skipped {
-            background: #f3f4f6;
-            color: #6b7280;
-            border-color: #e5e7eb;
-            font-style: italic;
+            background: var(--bg-muted);
+            color: var(--text-subtle);
+            border-color: var(--border);
+            font-style: normal;
         }
 
         .stage-kv {
             display: grid;
             grid-template-columns: 140px 1fr;
-            gap: 12px;
-            padding: 8px 0;
-            border-top: 1px solid #f1f5f9;
-            font-size: 13px;
+            gap: 14px;
+            padding: 6px 0;
+            border-top: 1px solid var(--border);
+            font-size: 12.5px;
             align-items: start;
         }
         .stage-kv:first-of-type { border-top: 0; padding-top: 0; }
         .stage-kv-label {
-            color: #64748b;
-            font-weight: 600;
-            font-size: 12px;
+            color: var(--text-subtle);
+            font-weight: 500;
+            font-size: 11.5px;
             text-transform: uppercase;
-            letter-spacing: 0.3px;
+            letter-spacing: 0.04em;
             padding-top: 2px;
         }
         .stage-kv-value {
-            color: #1f2d3d;
+            color: var(--text);
             min-width: 0;
             word-break: break-word;
         }
         .stage-kv-value code {
-            background: #f1f5f9;
-            padding: 1px 6px;
+            background: var(--bg-muted);
+            padding: 1px 5px;
             border-radius: 3px;
-            font-size: 12.5px;
-            border: 1px solid #e2e8f0;
+            font-size: 12px;
+            border: 1px solid var(--border);
+            font-family: var(--font-mono);
+            color: var(--text);
         }
 
-        .stage-list {
-            margin: 0;
-            padding-left: 18px;
-            color: #1f2d3d;
-        }
+        .stage-list { margin: 0; padding-left: 18px; color: var(--text); }
         .stage-list li { margin: 3px 0; }
 
         .stage-tag {
             display: inline-block;
-            background: #eef2f6;
-            color: #334155;
-            font-size: 12px;
+            background: var(--bg);
+            color: var(--text-muted);
+            font-size: 11.5px;
             padding: 2px 8px;
-            border-radius: 4px;
+            border-radius: 10px;
             margin: 2px 4px 2px 0;
-            border: 1px solid #e1e6ec;
+            border: 1px solid var(--border);
+            font-family: var(--font-mono);
         }
         .stage-tag-kind {
-            color: #94a3b8;
+            color: var(--text-faint);
             font-size: 11px;
             margin-left: 4px;
         }
 
-        .stage-mono {
-            font-family: "SF Mono", Menlo, Consolas, monospace;
-            font-size: 12.5px;
-        }
-        .stage-meta { color: #64748b; }
+        .stage-mono { font-family: var(--font-mono); font-size: 12px; }
+        .stage-meta { color: var(--text-subtle); }
 
         .stage-hits {
             width: 100%;
             border-collapse: collapse;
-            font-size: 12.5px;
-            background: white;
-            border: 1px solid #e1e6ec;
-            border-radius: 4px;
+            font-size: 12px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             overflow: hidden;
         }
         .stage-hits thead th {
-            background: #f4f6f7;
-            color: #475569;
+            background: var(--bg-muted);
+            color: var(--text-subtle);
             text-align: left;
-            font-weight: 600;
-            font-size: 11.5px;
+            font-weight: 500;
+            font-size: 10.5px;
             text-transform: uppercase;
-            letter-spacing: 0.4px;
+            letter-spacing: 0.05em;
             padding: 6px 10px;
-            border-bottom: 1px solid #e1e6ec;
+            border-bottom: 1px solid var(--border);
         }
         .stage-hits tbody td {
             padding: 6px 10px;
-            border-top: 1px solid #f1f5f9;
+            border-top: 1px solid var(--border);
             vertical-align: top;
+            font-family: var(--font-mono);
+            font-size: 11.5px;
+            color: var(--text);
         }
         .stage-hits tbody tr:first-child td { border-top: 0; }
 
         .stage-raw {
             margin-top: 14px;
-            border-top: 1px dashed #e1e6ec;
+            border-top: 1px dashed var(--border);
             padding-top: 10px;
         }
         .stage-raw summary {
             cursor: pointer;
-            font-size: 12px;
-            color: #64748b;
+            font-size: 11.5px;
+            color: var(--text-subtle);
             user-select: none;
             font-weight: 500;
         }
-        .stage-raw summary:hover { color: #1f2d3d; }
+        .stage-raw summary:hover { color: var(--text); }
         .stage-raw[open] summary { margin-bottom: 8px; }
         .stage-json {
-            background: #1e293b;
-            color: #e2e8f0;
+            background: #0c0c0c;
+            color: #e5e5e5;
             padding: 12px 14px;
-            border-radius: 5px;
+            border-radius: var(--radius-sm);
             overflow-x: auto;
-            font-family: "SF Mono", Menlo, Consolas, monospace;
+            font-family: var(--font-mono);
             font-size: 11.5px;
             line-height: 1.5;
             margin: 0;
         }
 
-        .hidden {
-            display: none;
-        }
+        .hidden { display: none !important; }
 
         footer {
             text-align: center;
             margin-top: 50px;
             padding: 20px;
-            color: #666;
-            font-size: 12px;
+            color: var(--text-faint);
+            font-size: 11.5px;
         }
 
         @media (max-width: 768px) {
-            .config-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .search-box {
-                flex-direction: column;
-            }
-
-            button {
-                width: 100%;
-            }
+            .config-grid { grid-template-columns: 1fr; }
+            .search-box { flex-direction: column; }
+            button { width: 100%; }
         }
 
-        /* ─── Markdown rendering inside .answer-text ──────────────────────
-           Subset of Claude.ai's style: comfortable spacing, bordered tables
-           with a subtle row-zebra, monospace code blocks, soft inline-code
-           chips. Scoped to .answer-text so the rest of the page is unaffected. */
+        /* ─── Markdown rendering inside .answer-text ──────────────────── */
         .answer-text h1, .answer-text h2, .answer-text h3, .answer-text h4 {
-            color: #2c3e50;
-            margin: 1.1em 0 0.4em;
+            color: var(--text);
+            margin: 1em 0 0.4em;
             line-height: 1.3;
+            font-weight: 600;
+            letter-spacing: -0.01em;
         }
-        .answer-text h1 { font-size: 1.55em; }
-        .answer-text h2 { font-size: 1.35em; }
-        .answer-text h3 { font-size: 1.18em; }
-        .answer-text h4 { font-size: 1.05em; }
+        .answer-text h1 { font-size: 1.4em; }
+        .answer-text h2 { font-size: 1.2em; }
+        .answer-text h3 { font-size: 1.05em; }
+        .answer-text h4 { font-size: 1em; }
         .answer-text > *:first-child { margin-top: 0; }
         .answer-text > *:last-child  { margin-bottom: 0; }
-        .answer-text p { margin: 0.65em 0; }
-        .answer-text ul, .answer-text ol {
-            margin: 0.65em 0; padding-left: 1.6em;
-        }
+        .answer-text p { margin: 0.7em 0; }
+        .answer-text ul, .answer-text ol { margin: 0.7em 0; padding-left: 1.4em; }
         .answer-text li { margin: 0.25em 0; }
         .answer-text li > p { margin: 0.25em 0; }
-        .answer-text strong { color: #2c3e50; }
-        .answer-text em { color: #555; }
+        .answer-text strong { color: var(--text); font-weight: 600; }
+        .answer-text em { color: var(--text-muted); }
         .answer-text blockquote {
-            border-left: 3px solid #bdc3c7;
-            color: #555;
+            border-left: 2px solid var(--border-strong);
+            color: var(--text-muted);
             margin: 0.8em 0;
             padding: 0.2em 0.9em;
-            background: #f4f6f7;
+            background: var(--bg-soft);
             border-radius: 0 3px 3px 0;
         }
         .answer-text code {
-            font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
-            font-size: 0.9em;
-            background: #eef2f6;
+            font-family: var(--font-mono);
+            font-size: 0.88em;
+            background: var(--bg-muted);
             padding: 1px 5px;
             border-radius: 3px;
-            color: #2c3e50;
-            border: 1px solid #e1e6ec;
+            color: var(--text);
+            border: 1px solid var(--border);
         }
         .answer-text pre {
-            background: #2c3e50;
-            color: #ecf0f1;
+            background: #0c0c0c;
+            color: #e5e5e5;
             padding: 12px 14px;
-            border-radius: 6px;
+            border-radius: var(--radius-sm);
             overflow-x: auto;
             margin: 0.8em 0;
             line-height: 1.45;
             font-size: 0.88em;
+            font-family: var(--font-mono);
         }
         .answer-text pre code {
             background: transparent;
@@ -1483,85 +1582,91 @@ FRONTEND_HTML = """<!DOCTYPE html>
             border-collapse: collapse;
             margin: 0.9em 0;
             width: 100%;
-            font-size: 0.94em;
-            background: white;
-            border: 1px solid #d0d7de;
-            border-radius: 4px;
+            font-size: 0.92em;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             overflow: hidden;
         }
         .answer-text th, .answer-text td {
-            border: 1px solid #e1e6ec;
+            border-bottom: 1px solid var(--border);
+            border-left: 0;
+            border-right: 0;
             padding: 8px 11px;
             text-align: left;
             vertical-align: top;
         }
         .answer-text th {
-            background: #f4f6f7;
-            color: #2c3e50;
+            background: var(--bg-muted);
+            color: var(--text-muted);
             font-weight: 600;
         }
-        .answer-text tr:nth-child(even) td { background: #fafbfc; }
+        .answer-text tr:last-child td { border-bottom: 0; }
+        .answer-text tr:nth-child(even) td { background: var(--bg-soft); }
         .answer-text a {
-            color: #2980b9;
+            color: var(--text);
             text-decoration: underline;
             text-underline-offset: 2px;
+            text-decoration-color: var(--border-strong);
         }
+        .answer-text a:hover { text-decoration-color: var(--text); }
         .answer-text hr {
             border: 0;
-            border-top: 1px solid #d0d7de;
+            border-top: 1px solid var(--border);
             margin: 1.2em 0;
         }
 
-        /* ─── Pipeline visualization (Mermaid DAG) ───────────────────── */
+        /* ─── Pipeline visualization (Mermaid DAG) ────────────────────── */
         .viz-section {
-            background: white;
-            border: 1px solid #e1e6ec;
+            background: var(--bg);
+            border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 12px 14px 10px;
-            margin-top: 18px;
-            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+            padding: 14px 16px 12px;
+            margin: 14px 0;
+            box-shadow: var(--shadow-sm);
         }
         .viz-section h2 {
-            font-size: 15px;
-            color: #1f2d3d;
+            font-size: 13px;
+            color: var(--text);
             margin: 0 0 2px;
             font-weight: 600;
+            letter-spacing: -0.005em;
         }
         .viz-section .viz-sub {
             font-size: 12px;
-            color: #64748b;
-            margin-bottom: 10px;
-            line-height: 1.4;
+            color: var(--text-subtle);
+            margin-bottom: 12px;
+            line-height: 1.45;
         }
         .viz-container {
             overflow-x: auto;
             background:
-                radial-gradient(circle at 1px 1px, #e2e8f0 1px, transparent 0);
+                radial-gradient(circle at 1px 1px, var(--border) 1px, transparent 0);
             background-size: 22px 22px;
-            background-color: #fafbfc;
-            border: 1px solid #eef2f6;
-            border-radius: 8px;
+            background-color: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             padding: 24px 18px;
-            min-height: 240px;
+            min-height: 220px;
             display: flex;
             align-items: center;
             justify-content: center;
         }
         .viz-container .mermaid { text-align: center; width: 100%; }
         .viz-container svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
-        /* Mermaid node typography */
         .viz-container .nodeLabel,
         .viz-container .label,
         .viz-container foreignObject div {
-            font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif !important;
-            font-size: 12.5px !important;
-            line-height: 1.45 !important;
+            font-family: var(--font-sans) !important;
+            font-size: 12px !important;
+            line-height: 1.4 !important;
+            letter-spacing: -0.005em;
         }
         .viz-container .nodeLabel b { font-weight: 600; }
         .viz-container .nodeLabel .vz-sub {
             display: block;
             font-size: 11px;
-            opacity: 0.78;
+            opacity: 0.75;
             margin-top: 2px;
             font-weight: 400;
         }
@@ -1569,74 +1674,227 @@ FRONTEND_HTML = """<!DOCTYPE html>
             display: block;
             font-size: 10.5px;
             margin-top: 3px;
-            opacity: 0.7;
-            font-family: "SF Mono", Menlo, Consolas, monospace;
+            opacity: 0.65;
+            font-family: var(--font-mono);
         }
-        /* Subtle drop shadows for nodes */
         .viz-container .node rect,
         .viz-container .node polygon,
         .viz-container .node path {
-            filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.08));
+            filter: drop-shadow(0 1px 1.5px rgba(0,0,0,0.04));
         }
-        /* Edges: thinner, softer color */
         .viz-container .edgePath path {
-            stroke-width: 1.4px !important;
-            stroke: #94a3b8 !important;
+            stroke-width: 1.2px !important;
+            stroke: var(--text-faint) !important;
         }
         .viz-container .arrowheadPath,
         .viz-container marker path {
-            fill: #94a3b8 !important;
-            stroke: #94a3b8 !important;
+            fill: var(--text-faint) !important;
+            stroke: var(--text-faint) !important;
         }
 
         .viz-empty {
-            color: #94a3b8;
+            color: var(--text-faint);
             text-align: center;
-            font-size: 13px;
-            padding: 30px;
-            font-style: italic;
+            font-size: 12.5px;
+            padding: 28px;
+            font-style: normal;
             width: 100%;
         }
 
         .viz-legend {
             display: flex;
             flex-wrap: wrap;
-            gap: 10px 18px;
+            gap: 8px 16px;
             margin-top: 14px;
-            padding: 11px 14px;
-            background: #fafbfc;
-            border: 1px solid #eef2f6;
-            border-radius: 6px;
-            font-size: 12px;
+            padding: 10px 12px;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 11.5px;
         }
         .viz-legend-item {
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            color: #475569;
+            color: var(--text-muted);
         }
         .viz-legend-swatch {
-            width: 12px;
-            height: 12px;
+            width: 10px; height: 10px;
             border-radius: 3px;
-            border: 1px solid rgba(15, 23, 42, 0.12);
+            border: 1px solid rgba(0,0,0,0.06);
             flex-shrink: 0;
+        }
+
+        .viz-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 4px;
+        }
+        .viz-nav {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .viz-nav-btn {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            width: 28px;
+            height: 28px;
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            padding: 0;
+        }
+        .viz-nav-btn:hover:not(:disabled) {
+            background: var(--bg-muted);
+            border-color: var(--border-strong);
+            color: var(--text);
+        }
+        .viz-nav-btn:disabled { opacity: 0.35; cursor: default; }
+        .viz-nav-label {
+            font-size: 11.5px;
+            color: var(--text-subtle);
+            min-width: 64px;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+            font-family: var(--font-mono);
+        }
+
+        /* ─── Collapsed trace accordion ───────────────────────────────── */
+        .trace-details { margin: 14px 0; }
+        .trace-summary {
+            cursor: pointer;
+            list-style: none;
+            padding: 10px 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            user-select: none;
+            transition: background 0.12s;
+            letter-spacing: -0.005em;
+        }
+        .trace-summary:hover { background: var(--bg-soft); }
+        .trace-summary::-webkit-details-marker { display: none; }
+        .trace-summary::marker { display: none; }
+        .trace-details[open] .trace-summary {
+            border-radius: 8px 8px 0 0;
+            border-bottom-color: var(--border);
+        }
+        .trace-summary-chevron {
+            margin-left: auto;
+            font-size: 10px;
+            color: var(--text-faint);
+            transition: transform 0.15s;
+        }
+        .trace-details[open] .trace-summary-chevron { transform: rotate(180deg); }
+        .trace-count {
+            font-size: 12px;
+            font-weight: 400;
+            color: var(--text-subtle);
+            font-family: var(--font-mono);
+        }
+        .trace-details #pipeline-stages {
+            border: 1px solid var(--border);
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+            background: var(--bg);
+            padding: 0;
+            overflow: hidden;
+        }
+
+        /* ─── Draggable stage detail popup ────────────────────────────── */
+        .stage-popup {
+            position: fixed;
+            z-index: 9999;
+            top: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 480px;
+            max-width: 92vw;
+            max-height: 80vh;
+            background: var(--bg);
+            border: 1px solid var(--border-strong);
+            border-radius: 8px;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.12);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .stage-popup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: var(--bg-soft);
+            border-bottom: 1px solid var(--border);
+            cursor: grab;
+            user-select: none;
+            flex-shrink: 0;
+        }
+        .stage-popup-header:active { cursor: grabbing; }
+        .stage-popup-title {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--text);
+            letter-spacing: -0.005em;
+        }
+        .stage-popup-close {
+            background: none;
+            border: none;
+            font-size: 14px;
+            cursor: pointer;
+            color: var(--text-subtle);
+            line-height: 1;
+            padding: 2px 6px;
+            border-radius: 3px;
+            height: auto;
+        }
+        .stage-popup-close:hover {
+            background: var(--bg-muted);
+            color: var(--text);
+        }
+        .stage-popup-body {
+            overflow-y: auto;
+            padding: 12px 14px;
+            flex: 1;
+            font-size: 13px;
+        }
+        .viz-container svg g.node { cursor: pointer; }
+        .viz-container svg g.node:hover rect,
+        .viz-container svg g.node:hover polygon,
+        .viz-container svg g.node:hover path,
+        .viz-container svg g.node:hover circle,
+        .viz-container svg g.node:hover ellipse {
+            filter: brightness(0.96) drop-shadow(0 2px 4px rgba(0,0,0,0.08));
         }
 
         /* ─── Model info panel ────────────────────────────────────────── */
         .model-panel {
-            margin-top: 14px;
-            border: 1px solid #dce1e7;
-            border-radius: 6px;
+            margin: 14px 0;
+            border: 1px solid var(--border);
+            border-radius: 8px;
             overflow: hidden;
             font-size: 12.5px;
+            background: var(--bg);
         }
         .model-panel-header {
             display: flex;
             align-items: center;
-            gap: 6px;
-            background: #f4f6f7;
-            padding: 6px 12px;
+            gap: 8px;
+            background: var(--bg);
+            padding: 10px 14px;
             cursor: pointer;
             user-select: none;
             border: none;
@@ -1644,24 +1902,30 @@ FRONTEND_HTML = """<!DOCTYPE html>
             text-align: left;
             font-size: 13px;
             font-weight: 600;
-            color: #444;
+            color: var(--text);
+            height: auto;
+            letter-spacing: -0.005em;
+            border-radius: 0;
         }
-        .model-panel-header:hover { background: #eaecee; }
+        .model-panel-header:hover { background: var(--bg-soft); }
         .model-panel-badge {
             margin-left: auto;
-            background: #eafaf1;
-            color: #1e8449;
-            font-size: 12px;
-            font-weight: 700;
+            background: var(--bg-muted);
+            color: var(--text-muted);
+            font-size: 11.5px;
+            font-weight: 500;
             padding: 2px 8px;
             border-radius: 10px;
+            font-family: var(--font-mono);
+            border: 1px solid var(--border);
         }
-        .model-panel-chevron { font-size: 10px; color: #999; }
+        .model-panel-chevron { font-size: 10px; color: var(--text-faint); }
         .model-panel-body {
             display: none;
-            padding: 14px;
-            background: white;
+            padding: 0;
+            background: var(--bg);
             overflow-x: auto;
+            border-top: 1px solid var(--border);
         }
         .model-panel-body.open { display: block; }
         .model-table {
@@ -1671,39 +1935,64 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
         .model-table th {
             text-align: left;
-            padding: 5px 8px;
-            border-bottom: 2px solid #e0e0e0;
-            color: #666;
-            font-weight: 700;
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-subtle);
+            font-weight: 500;
             white-space: nowrap;
+            font-size: 10.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background: var(--bg);
         }
         .model-table td {
-            padding: 5px 8px;
-            border-bottom: 1px solid #f2f2f2;
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border);
             vertical-align: middle;
+            color: var(--text);
         }
+        .model-table tr:last-child td { border-bottom: 0; }
         .model-table code {
-            background: #f5f5f5;
-            padding: 1px 4px;
+            background: var(--bg-muted);
+            padding: 1px 5px;
             border-radius: 3px;
             font-size: 11px;
+            border: 1px solid var(--border);
+            font-family: var(--font-mono);
         }
-        .model-row-active td { background: #eaf4ff; font-weight: 600; }
-        .model-note { color: #999; font-style: italic; }
+        .model-row-active td {
+            background: var(--bg-muted);
+            font-weight: 500;
+        }
+        .model-row-active td:first-child { position: relative; }
+        .model-row-active td:first-child::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 6px; bottom: 6px;
+            width: 2px;
+            background: var(--accent);
+        }
+        .model-note { color: var(--text-faint); font-style: normal; font-size: 11.5px; }
         .model-cost-row {
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
             align-items: center;
-            margin-top: 10px;
-            padding-top: 10px;
-            border-top: 1px solid #eee;
+            margin: 0;
+            padding: 10px 14px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-soft);
             font-size: 12px;
-            color: #555;
+            color: var(--text-muted);
         }
-        .model-cost-label { font-weight: 700; color: #333; }
-        .model-cost-sep { color: #bbb; }
-        .model-cost-total { font-weight: 700; color: #1e8449; font-size: 13px; }
+        .model-cost-label { font-weight: 600; color: var(--text); }
+        .model-cost-sep { color: var(--text-faint); }
+        .model-cost-total {
+            font-weight: 600;
+            color: var(--text);
+            font-size: 12.5px;
+            font-family: var(--font-mono);
+        }
     </style>
 </head>
 <body>
@@ -1715,7 +2004,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
                 </div>
                 <form method="post" action="/logout" style="margin: 0;">
-                    <button type="submit" class="config-toggle" style="background:#34495e;">Sign out</button>
+                    <button type="submit" class="config-toggle">Sign out</button>
                 </form>
             </div>
             <div id="agent-strip" class="agent-strip" aria-label="Agent activity">
@@ -1862,7 +2151,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             </div>
 
             <div id="answer-section" class="results-section hidden">
-                <div id="latency" style="text-align: right; font-size: 12px; color: #666; margin-bottom: 15px;"></div>
+                <div id="latency" style="text-align: right;"></div>
 
                 <div class="answer-box">
                     <h3>Answer</h3>
@@ -1874,17 +2163,22 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <div id="citations-list"></div>
                 </div>
 
-                <div class="pipeline-section">
-                    <h2>Pipeline Trace</h2>
-                    <div id="pipeline-stages"></div>
-                </div>
-
                 <div class="viz-section">
-                    <h2>Pipeline Flow</h2>
-                    <div class="viz-sub">
-                        Each color is a stage family. Branches show per-sub-query
-                        retrieval (semantic · keyword · BM25); all paths merge
-                        through rank fusion → dedup → rerank → generation.
+                    <div class="viz-header-row">
+                        <div>
+                            <h2>Pipeline Flow</h2>
+                            <div class="viz-sub">
+                                Each color is a stage family. Branches show per-sub-query
+                                retrieval (semantic · keyword · BM25); all paths merge
+                                through rank fusion → dedup → rerank → generation.
+                                Click any node to inspect its data.
+                            </div>
+                        </div>
+                        <div id="viz-nav" class="viz-nav" style="display:none">
+                            <button id="viz-nav-prev" class="viz-nav-btn" onclick="vizPrev()" title="Previous pass">&#8592;</button>
+                            <span id="viz-nav-label" class="viz-nav-label">Pass 1 / 1</span>
+                            <button id="viz-nav-next" class="viz-nav-btn" onclick="vizNext()" title="Next pass">&#8594;</button>
+                        </div>
                     </div>
                     <div id="pipeline-viz" class="viz-container">
                         <div class="viz-empty">
@@ -1902,6 +2196,15 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#10b981;border-color:#047857"></span>Final answer</span>
                     </div>
                 </div>
+
+                <details id="trace-details" class="trace-details">
+                    <summary class="trace-summary">
+                        Pipeline Trace
+                        <span id="trace-stage-count" class="trace-count"></span>
+                        <span class="trace-summary-chevron">▼</span>
+                    </summary>
+                    <div id="pipeline-stages"></div>
+                </details>
 
                 <div class="model-panel" id="model-panel">
                     <button class="model-panel-header" onclick="toggleModelPanel()">
@@ -1926,6 +2229,15 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Draggable stage-detail popup (hidden until a flowchart node is clicked) -->
+    <div id="stage-popup" class="stage-popup" style="display:none" role="dialog" aria-modal="true">
+        <div class="stage-popup-header" id="stage-popup-drag-handle">
+            <span id="stage-popup-title"></span>
+            <button class="stage-popup-close" onclick="closeStagePopup()" title="Close">&#x2715;</button>
+        </div>
+        <div class="stage-popup-body" id="stage-popup-body"></div>
     </div>
 
     <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
@@ -1953,17 +2265,17 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 securityLevel: "strict",
                 theme: "base",
                 themeVariables: {
-                    fontFamily: "'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif",
-                    fontSize: "13px",
-                    primaryColor: "#fafbfc",
-                    primaryTextColor: "#1f2d3d",
-                    primaryBorderColor: "#cbd5e1",
-                    lineColor: "#94a3b8",
-                    textColor: "#1f2d3d",
-                    nodeBorder: "#cbd5e1",
-                    mainBkg: "#fafbfc",
-                    clusterBkg: "#f8fafc",
-                    clusterBorder: "#e2e8f0",
+                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                    fontSize: "12.5px",
+                    primaryColor: "#ffffff",
+                    primaryTextColor: "#1c1917",
+                    primaryBorderColor: "#d6d3d1",
+                    lineColor: "#a8a29e",
+                    textColor: "#1c1917",
+                    nodeBorder: "#d6d3d1",
+                    mainBkg: "#ffffff",
+                    clusterBkg: "#fafaf9",
+                    clusterBorder: "#e7e5e4",
                 },
                 flowchart: {
                     curve: "basis",
@@ -2343,36 +2655,116 @@ FRONTEND_HTML = """<!DOCTYPE html>
             return parts.join("<br/>");
         }
 
-        function buildMermaidFromTrace(trace, query) {
-            // Recursive agentic stages get an `.iterN` suffix — collapse to the
-            // base name so a single visualization still shows the agentic loop
-            // (using the latest iteration's data).
-            const stages = {};
+        // ─── Split a full trace into per-iteration sub-traces ────────────
+        // When recursive agentic mode is on, stages get `.iter0`, `.iter1`, …
+        // suffixes. This splits them so each iteration gets its own chart.
+        // Returns null when there are no iteration suffixes (single chart).
+        function splitTraceByIteration(trace) {
+            // Iteration suffix appears either at the end of a stage name
+            // (e.g. "agentic.gap_analysis.iter1") or in the middle of a
+            // namespaced follow-up sub-stage (e.g.
+            // "agentic.followup_q0.iter1.hybrid_search.vector_search_q0"),
+            // so the regex must match `.iterN` followed by `.` OR end.
+            const ITER_RE = /\\.iter(\\d+)(?:\\.|$)/;
+            // Replacement strips the `.iterN` while preserving a trailing
+            // `.` when it's mid-name. "$1" captures either "." or "".
+            const stripIter = stage => stage.replace(/\\.iter(\\d+)(\\.|$)/, "$2");
+
+            let maxIter = -1;
             for (const s of trace) {
-                stages[s.stage] = s;
-                const base = s.stage.replace(/\\.iter\\d+$/, "");
-                if (base !== s.stage) stages[base] = s;
+                const m = s.stage.match(ITER_RE);
+                if (m) maxIter = Math.max(maxIter, parseInt(m[1], 10));
             }
+            if (maxIter < 0) return null;
+
+            const result = [];
+            for (let i = 0; i <= maxIter; i++) {
+                if (i === 0) {
+                    // Pass 1: full base pipeline + iter0 agentic stages.
+                    result.push(trace.filter(s => {
+                        const m = s.stage.match(ITER_RE);
+                        if (!m) return true; // base stage
+                        return parseInt(m[1], 10) === 0;
+                    }).map(s => ({...s, stage: stripIter(s.stage)})));
+                } else {
+                    // Pass 2+: only this iteration's agentic stages. The
+                    // base pipeline didn't re-run — the chart starts from
+                    // what gap analysis requested and shows the follow-up
+                    // sub-pipeline (decompose → hybrid search → rerank →
+                    // regenerate).
+                    result.push(trace.filter(s => {
+                        const m = s.stage.match(ITER_RE);
+                        return m && parseInt(m[1], 10) === i;
+                    }).map(s => ({...s, stage: stripIter(s.stage)})));
+                }
+            }
+            return result;
+        }
+
+        // ─── Build Mermaid flowchart definition from a pipeline trace ─────
+        // Returns {def, nodeMap} where nodeMap maps each Mermaid node ID
+        // (e.g. "RRF", "GEN") to the stage object that generated it so the
+        // click-to-inspect popup can retrieve data for the clicked node.
+        function buildMermaidFromTrace(trace, query) {
+            const stages = {};
+            for (const s of trace) stages[s.stage] = s;
 
             const L = ["flowchart TD"];
-            L.push(`  Q["${_label("Query", _vizText(query, 60), null)}"]:::input`);
+            const nodeMap = {};
+
+            const refineSeed = stages["refine.seed"];
+            const qp         = stages.query_processor;
+            const gapEarly   = stages["agentic.gap_analysis"];
+
+            // Agentic-only trace (recursive pass 2+): no base pipeline stages
+            // ran. The "query" for this pass is the follow-up queries gap
+            // analysis identified, so we use those as the top node label.
+            const isAgenticOnly = !qp && !refineSeed && gapEarly;
+            let _qLabel, _qSub;
+            if (isAgenticOnly) {
+                const fqs = (gapEarly.output && gapEarly.output.queries) || [];
+                _qLabel = "Follow-up queries";
+                _qSub   = fqs.length
+                    ? _vizText(fqs[0], 56) + (fqs.length > 1 ? ` +${fqs.length - 1} more` : "")
+                    : _vizText((gapEarly.output && gapEarly.output.reason) || "", 56);
+            } else {
+                _qLabel = "Query";
+                _qSub   = _vizText(query, 60);
+            }
+            // Populate the Q-node popup with the actual query text. For
+            // agentic-only passes also surface the follow-up queries and the
+            // gap reason that triggered this iteration so clicking the node
+            // explains what the recursive pass is searching for.
+            const _qStage = isAgenticOnly
+                ? {
+                    stage: "query.followup",
+                    input: {query: query, note: "Original user query"},
+                    output: {
+                        queries: (gapEarly.output && gapEarly.output.queries) || [],
+                        reason:  (gapEarly.output && gapEarly.output.reason)  || "",
+                        requested_resources: (gapEarly.output && gapEarly.output.requested_resources) || null,
+                    },
+                    took_ms: 0,
+                  }
+                : {stage: "query", input: {query}, output: {}, took_ms: 0};
+            L.push(`  Q["${_label(_qLabel, _qSub, null)}"]:::input`);
+            nodeMap["Q"] = _qStage;
 
             // Refine-mode trace: /api/refine reused a prior /api/query's
             // first-pass state, so Stages 1–4 didn't run. Emit a "Resume"
             // marker so the diagram still has a visible upstream node feeding
             // into the agentic branch below. Without this we bail with just
             // the Query node and the user sees an empty canvas.
-            const refineSeed = stages["refine.seed"];
-            const qp = stages.query_processor;
-            if (!qp && !refineSeed) {
-                L.push("  classDef input fill:#1e293b,color:#fff,stroke:#0f172a,stroke-width:2px,rx:8,ry:8");
-                return L.join("\\n");
+            if (!qp && !refineSeed && !gapEarly) {
+                L.push("  classDef input fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
+                return {def: L.join("\\n"), nodeMap};
             }
             if (refineSeed && !qp) {
                 const ddCount = (refineSeed.output && refineSeed.output.deduplicated_count) || 0;
                 const ctxCount = (refineSeed.output && refineSeed.output.context_chunk_count) || 0;
                 L.push(`  RESUME[/"${_label("Resume from cache", ddCount + " pooled chunks · " + ctxCount + " in prior context", refineSeed)}"/]:::stage_resume`);
                 L.push("  Q --> RESUME");
+                nodeMap["RESUME"] = refineSeed;
             }
             if (qp) {
                 const qpType = _vizText(qp.output.type, 20);
@@ -2381,6 +2773,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 const qpSub = `${qpType ? "type: " + qpType : ""}${qpEnts ? " · " + qpEnts + " entit" + (qpEnts===1?"y":"ies") : ""}${qpSubs ? " · " + qpSubs + " sub-quer" + (qpSubs===1?"y":"ies") : ""}`.replace(/^ · /, "");
                 L.push(`  QP["${_label("Understand query", qpSub, qp)}"]:::stage_qp`);
                 L.push("  Q --> QP");
+                nodeMap["QP"] = qp;
             }
 
             // Structured lookup — side branch that merges back into dedup
@@ -2398,6 +2791,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     L.push(`  SL["${_label("Structured lookup", lookupSub, sl)}"]:::stage_struct`);
                 }
                 L.push("  QP --> SL");
+                nodeMap["SL"] = sl;
             }
 
             // Per-sub-query branches: vector + tsvector + BM25
@@ -2414,28 +2808,34 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 const t = stages[`hybrid_search.tsvector_search_q${i}`];
                 const b = stages[`hybrid_search.bm25_search_q${i}`];
                 const sqText = (v && v.input && v.input.query) || `q${i}`;
+                const sqStage = {stage: `sub_query_${i}`, input: {query: sqText}, output: {}, took_ms: 0};
                 L.push(`  SQ${i}{{"${_label("Sub-query " + (i+1), _vizText(sqText, 60), null)}"}}:::stage_subq`);
                 L.push(`  QP --> SQ${i}`);
+                nodeMap[`SQ${i}`] = sqStage;
 
                 if (v) {
                     L.push(`  V${i}["${_label("Semantic search", (v.output.count || 0) + " hits · Voyage", v)}"]:::stage_vector`);
                     L.push(`  SQ${i} --> V${i}`);
                     if (rrf) L.push(`  V${i} --> RRF`);
+                    nodeMap[`V${i}`] = v;
                 }
                 if (t) {
                     L.push(`  T${i}["${_label("Keyword search", (t.output.count || 0) + " hits · tsvector", t)}"]:::stage_tsv`);
                     L.push(`  SQ${i} --> T${i}`);
                     if (rrf) L.push(`  T${i} --> RRF`);
+                    nodeMap[`T${i}`] = t;
                 }
                 if (b) {
                     L.push(`  B${i}["${_label("BM25 search", (b.output.count || 0) + " hits · Okapi", b)}"]:::stage_bm25`);
                     L.push(`  SQ${i} --> B${i}`);
                     if (rrf) L.push(`  B${i} --> RRF`);
+                    nodeMap[`B${i}`] = b;
                 }
             }
 
             if (rrf) {
                 L.push(`  RRF["${_label("Fuse results", (rrf.output.count || 0) + " merged · RRF", rrf)}"]:::stage_rrf`);
+                nodeMap["RRF"] = rrf;
             }
 
             const dd = stages.result_dedup;
@@ -2443,12 +2843,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 L.push(`  DEDUP["${_label("Deduplicate", (dd.output.deduped_count || 0) + " unique chunks", dd)}"]:::stage_dedup`);
                 if (rrf) L.push("  RRF --> DEDUP");
                 if (slActive) L.push("  SL --> DEDUP");
+                nodeMap["DEDUP"] = dd;
             }
 
             const rr = stages.final_rerank;
             if (rr) {
                 L.push(`  RR["${_label("Rerank", "top " + (rr.output.count || 0) + " · cross-encoder", rr)}"]:::stage_rerank`);
                 if (dd) L.push("  DEDUP --> RR");
+                nodeMap["RR"] = rr;
             }
 
             const gen = stages.generation;
@@ -2457,6 +2859,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 const ans = gen.output.answer_length || 0;
                 L.push(`  GEN["${_label("Generate answer", ans.toLocaleString() + " chars · " + cits + " citation" + (cits===1?"":"s") + " · Claude", gen)}"]:::stage_gen`);
                 if (rr) L.push("  RR --> GEN");
+                nodeMap["GEN"] = gen;
             }
 
             // ─── Agentic refinement branch (only present when agentic=true) ───
@@ -2466,17 +2869,20 @@ FRONTEND_HTML = """<!DOCTYPE html>
             const ag_gen = stages["agentic.regenerate"];
             // In refine mode there's no GEN node, so the final-answer arrow
             // falls back to RESUME until the agentic regen succeeds and
-            // promotes itself to GEN2.
-            let agAnswerNode = gen ? "GEN" : (refineSeed ? "RESUME" : "GEN");
+            // promotes itself to GEN2. For agentic-only charts (recursive
+            // pass 2+) the answer node is just GEN2 (nothing upstream).
+            let agAnswerNode = gen ? "GEN" : (refineSeed ? "RESUME" : "GEN2");
             if (gap) {
                 const needs = gap.output && gap.output.needs_followup;
                 const reason = _vizText((gap.output && gap.output.reason) || "", 60);
                 const gapSub = needs ? ("needs follow-up: " + reason) : "answer covers the question";
                 L.push(`  GAP{"${_label("Gap analysis", gapSub, gap)}"}:::stage_gap`);
-                // Normal path: first-pass Sonnet → gap. Refine path: cached
-                // first-pass (via RESUME) → gap (no GEN node to wire from).
+                // Normal: first-pass GEN → gap. Refine: RESUME → gap.
+                // Agentic-only (pass 2+): Q (follow-up queries) → gap.
                 if (gen) L.push("  GEN --> GAP");
                 else if (refineSeed) L.push("  RESUME --> GAP");
+                else if (isAgenticOnly) L.push("  Q --> GAP");
+                nodeMap["GAP"] = gap;
 
                 if (needs) {
                     // (a) Targeted resource fetch — direct table/field lookup
@@ -2494,6 +2900,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         L.push(`  TFETCH[/"${_label("Targeted fetch", "asked: " + reqSummary + " · got: " + got, tfetch)}"/]:::stage_tfetch`);
                         L.push("  GAP --> TFETCH");
                         if (ag_rr) L.push("  TFETCH --> RR2");
+                        nodeMap["TFETCH"] = tfetch;
                     }
 
                     // (b) Per-followup natural-language retrieval branches.
@@ -2504,7 +2911,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     // so they don't collide with the main query's stages.
                     const fqIds = new Set();
                     for (const s of trace) {
-                        const m = s.stage.match(/^agentic\\.followup_search_q(\\d+)(\\.iter\\d+)?$/);
+                        const m = s.stage.match(/^agentic\\.followup_search_q(\\d+)$/);
                         if (m) fqIds.add(parseInt(m[1], 10));
                     }
                     for (const i of [...fqIds].sort((a, b) => a - b)) {
@@ -2518,10 +2925,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         const nsPrefix = `agentic.followup_q${i}.`;
                         const fqSubIds = new Set();
                         for (const s of trace) {
-                            // Strip the .iterN suffix if present, then match.
-                            const baseStage = s.stage.replace(/\\.iter\\d+$/, "");
-                            if (!baseStage.startsWith(nsPrefix)) continue;
-                            const m2 = baseStage.slice(nsPrefix.length).match(/^hybrid_search\\.\\w+_q(\\d+)$/);
+                            if (!s.stage.startsWith(nsPrefix)) continue;
+                            const m2 = s.stage.slice(nsPrefix.length).match(/^hybrid_search\\.\\w+_q(\\d+)$/);
                             if (m2) fqSubIds.add(parseInt(m2[1], 10));
                         }
                         const fqSorted = [...fqSubIds].sort((a, b) => a - b);
@@ -2534,6 +2939,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                             ? `${decomp.output.sub_queries.length} sub-quer${decomp.output.sub_queries.length===1?"y":"ies"}`
                             : "verbatim";
                         L.push(`    FQ${i}{{"${_label("Decompose", decompSub, decomp)}"}}:::stage_followup`);
+                        if (decomp) nodeMap[`FQ${i}`] = decomp;
 
                         for (const j of fqSorted) {
                             const v = stages[`${nsPrefix}hybrid_search.vector_search_q${j}`];
@@ -2546,20 +2952,24 @@ FRONTEND_HTML = """<!DOCTYPE html>
                                 L.push(`    FQ${i}V${j}["${_label("Semantic", (v.output.count || 0) + " hits", v)}"]:::stage_vector`);
                                 L.push(`    FQ${i}SQ${j} --> FQ${i}V${j}`);
                                 if (fqRrf) L.push(`    FQ${i}V${j} --> FQ${i}RRF`);
+                                nodeMap[`FQ${i}V${j}`] = v;
                             }
                             if (t) {
                                 L.push(`    FQ${i}T${j}["${_label("Keyword", (t.output.count || 0) + " hits", t)}"]:::stage_tsv`);
                                 L.push(`    FQ${i}SQ${j} --> FQ${i}T${j}`);
                                 if (fqRrf) L.push(`    FQ${i}T${j} --> FQ${i}RRF`);
+                                nodeMap[`FQ${i}T${j}`] = t;
                             }
                             if (b) {
                                 L.push(`    FQ${i}B${j}["${_label("BM25", (b.output.count || 0) + " hits", b)}"]:::stage_bm25`);
                                 L.push(`    FQ${i}SQ${j} --> FQ${i}B${j}`);
                                 if (fqRrf) L.push(`    FQ${i}B${j} --> FQ${i}RRF`);
+                                nodeMap[`FQ${i}B${j}`] = b;
                             }
                         }
                         if (fqRrf) {
                             L.push(`    FQ${i}RRF["${_label("Fuse", (fqRrf.output.count || 0) + " merged", fqRrf)}"]:::stage_rrf`);
+                            nodeMap[`FQ${i}RRF`] = fqRrf;
                         }
                         L.push(`  end`);
 
@@ -2572,6 +2982,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         const newC = (ag_rr.input && ag_rr.input.added_by_followups) || 0;
                         const topC = (ag_rr.output && ag_rr.output.count) || 0;
                         L.push(`  RR2["${_label("Rerank expanded pool", "top " + topC + " · " + newC + " new chunk" + (newC===1?"":"s"), ag_rr)}"]:::stage_rerank`);
+                        nodeMap["RR2"] = ag_rr;
                     }
                     if (ag_gen) {
                         const c2 = (ag_gen.output && ag_gen.output.citation_count !== undefined) ? ag_gen.output.citation_count : 0;
@@ -2583,6 +2994,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         L.push(`  GEN2["${label}"]:::stage_agen`);
                         if (ag_rr) L.push("  RR2 --> GEN2");
                         if (!errType) agAnswerNode = "GEN2";
+                        nodeMap["GEN2"] = ag_gen;
                     }
                 }
             }
@@ -2596,56 +3008,187 @@ FRONTEND_HTML = """<!DOCTYPE html>
             // sweeps through warm hues, and the agentic loop uses purples to
             // signal "second pass". Rounded corners + 1.4px strokes give the
             // diagram a softer, more modern look than flat saturated boxes.
-            L.push("  classDef input    fill:#1e293b,color:#fff,stroke:#0f172a,stroke-width:2px,rx:9,ry:9");
-            L.push("  classDef output   fill:#10b981,color:#fff,stroke:#047857,stroke-width:2px,rx:10,ry:10");
-            L.push("  classDef stage_qp     fill:#ede9fe,color:#4c1d95,stroke:#a78bfa,stroke-width:1.4px,rx:7,ry:7");
-            L.push("  classDef stage_struct fill:#d1fae5,color:#065f46,stroke:#34d399,stroke-width:1.4px,rx:7,ry:7");
-            L.push("  classDef stage_skipped fill:#f3f4f6,color:#6b7280,stroke:#cbd5e1,stroke-width:1.2px,stroke-dasharray:4 3,rx:7,ry:7");
-            L.push("  classDef stage_subq   fill:#e0f2fe,color:#0c4a6e,stroke:#7dd3fc,stroke-width:1.4px");
-            L.push("  classDef stage_vector fill:#dbeafe,color:#1e3a8a,stroke:#93c5fd,stroke-width:1.2px,rx:6,ry:6");
-            L.push("  classDef stage_tsv    fill:#cffafe,color:#155e75,stroke:#67e8f9,stroke-width:1.2px,rx:6,ry:6");
-            L.push("  classDef stage_bm25   fill:#ccfbf1,color:#115e59,stroke:#5eead4,stroke-width:1.2px,rx:6,ry:6");
-            L.push("  classDef stage_rrf    fill:#fef3c7,color:#854d0e,stroke:#fbbf24,stroke-width:1.4px,rx:7,ry:7");
-            L.push("  classDef stage_dedup  fill:#fed7aa,color:#7c2d12,stroke:#fb923c,stroke-width:1.4px,rx:7,ry:7");
-            L.push("  classDef stage_rerank fill:#fecaca,color:#7f1d1d,stroke:#fca5a5,stroke-width:1.4px,rx:7,ry:7");
-            L.push("  classDef stage_gen    fill:#1e40af,color:#fff,stroke:#1e3a8a,stroke-width:2px,rx:8,ry:8");
-            // Refine fast-path marker — slate, distinct from any other stage.
-            L.push("  classDef stage_resume   fill:#e2e8f0,color:#0f172a,stroke:#64748b,stroke-width:1.6px,stroke-dasharray:5 3,rx:7,ry:7");
-            // Agentic branch — purples set it apart from the main path.
-            L.push("  classDef stage_gap      fill:#f3e8ff,color:#6b21a8,stroke:#c084fc,stroke-width:1.4px");
-            L.push("  classDef stage_followup fill:#e9d5ff,color:#581c87,stroke:#a855f7,stroke-width:1.4px");
-            L.push("  classDef stage_agen     fill:#581c87,color:#fff,stroke:#3b0764,stroke-width:2px,rx:8,ry:8");
-            // Targeted fetch — teal family to distinguish "direct lookup"
-            // from "natural-language search".
-            L.push("  classDef stage_tfetch   fill:#ccfbf1,color:#115e59,stroke:#14b8a6,stroke-width:1.4px,rx:7,ry:7");
+            // Minimalist palette: monochrome anchors (input/generate),
+            // light tints to keep stage families distinguishable but quiet.
+            L.push("  classDef input    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
+            L.push("  classDef output   fill:#ffffff,color:#15803d,stroke:#15803d,stroke-width:1.5px,rx:8,ry:8");
+            L.push("  classDef stage_qp     fill:#fafaf9,color:#1c1917,stroke:#d6d3d1,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_struct fill:#f0fdf4,color:#166534,stroke:#bbf7d0,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5");
+            L.push("  classDef stage_subq   fill:#fafaf9,color:#57534e,stroke:#d6d3d1,stroke-width:1px");
+            L.push("  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_tsv    fill:#ecfeff,color:#155e75,stroke:#a5f3fc,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_rrf    fill:#fefce8,color:#854d0e,stroke:#fde68a,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_dedup  fill:#fff7ed,color:#9a3412,stroke:#fed7aa,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_rerank fill:#fef2f2,color:#991b1b,stroke:#fecaca,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_gen    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
+            // Refine fast-path marker — dashed stone, distinct from other stages.
+            L.push("  classDef stage_resume   fill:#f5f5f4,color:#57534e,stroke:#a8a29e,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5");
+            // Agentic branch — indigo tint sets it apart from the main path.
+            L.push("  classDef stage_gap      fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px");
+            L.push("  classDef stage_followup fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px");
+            L.push("  classDef stage_agen     fill:#312e81,color:#fff,stroke:#312e81,stroke-width:1.5px,rx:6,ry:6");
+            // Targeted fetch — teal family for "direct lookup".
+            L.push("  classDef stage_tfetch   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5");
 
-            return L.join("\\n");
+            return {def: L.join("\\n"), nodeMap};
         }
 
+        // ─── Viz nav state ────────────────────────────────────────────────
+        let _vizPages  = [];  // [{def, nodeMap}, …]
+        let _vizPageIdx = 0;
         let _vizCounter = 0;
+        let _vizQuery   = "";
+
+        // Attach click listeners to SVG nodes so clicking opens the popup.
+        function attachNodeClickListeners(nodeMap) {
+            const svg = document.querySelector("#pipeline-viz svg");
+            if (!svg) return;
+            svg.querySelectorAll("g.node").forEach(g => {
+                // Mermaid 11 sets data-id on each node <g>.
+                let nodeId = g.dataset.id || "";
+                // Fallback: parse from the element id like "flowchart-RRF-42"
+                if (!nodeId && g.id) {
+                    nodeId = g.id.replace(/^flowchart-/, "").replace(/-\\d+$/, "");
+                }
+                if (!nodeId || !nodeMap[nodeId]) return;
+                const stage = nodeMap[nodeId];
+                g.style.cursor = "pointer";
+                g.addEventListener("click", e => {
+                    e.stopPropagation();
+                    showStagePopup(stage, e.clientX, e.clientY);
+                });
+            });
+        }
+
+        // Render the page at _vizPageIdx and update nav UI.
+        async function vizGoTo(idx) {
+            if (!_vizPages.length) return;
+            _vizPageIdx = Math.max(0, Math.min(idx, _vizPages.length - 1));
+            const page = _vizPages[_vizPageIdx];
+
+            const host   = document.getElementById("pipeline-viz");
+            const legend = document.getElementById("pipeline-legend");
+            const nav    = document.getElementById("viz-nav");
+            const label  = document.getElementById("viz-nav-label");
+            const prevBtn = document.getElementById("viz-nav-prev");
+            const nextBtn = document.getElementById("viz-nav-next");
+
+            if (legend) legend.style.display = "none";
+
+            if (typeof mermaid === "undefined") {
+                host.innerHTML = '<div class="viz-empty">Mermaid failed to load (CDN blocked?). The expanded trace below still has every stage.</div>';
+                return;
+            }
+
+            const id = `viz-${++_vizCounter}`;
+            try {
+                const {svg} = await mermaid.render(id, page.def);
+                host.innerHTML = svg;
+                if (legend) legend.style.display = "";
+                attachNodeClickListeners(page.nodeMap);
+            } catch (err) {
+                console.error("mermaid render failed:", err, page.def);
+                host.innerHTML = `<div class="viz-empty">Could not render flow: ${escapeHtml(err.message || String(err))}</div>`;
+            }
+
+            // Update navigation controls.
+            const isMulti = _vizPages.length > 1;
+            if (nav) nav.style.display = isMulti ? "" : "none";
+            if (label) label.textContent = `Pass ${_vizPageIdx + 1} / ${_vizPages.length}`;
+            if (prevBtn) prevBtn.disabled = _vizPageIdx === 0;
+            if (nextBtn) nextBtn.disabled = _vizPageIdx === _vizPages.length - 1;
+        }
+
+        function vizPrev() { vizGoTo(_vizPageIdx - 1); }
+        function vizNext() { vizGoTo(_vizPageIdx + 1); }
+
         async function renderPipelineViz(trace, query) {
+            _vizQuery = query || "";
+            _vizPages = [];
+            _vizPageIdx = 0;
+
             const host = document.getElementById("pipeline-viz");
             const legend = document.getElementById("pipeline-legend");
+            const nav = document.getElementById("viz-nav");
             if (legend) legend.style.display = "none";
+            if (nav) nav.style.display = "none";
+
             if (!trace || !trace.length) {
                 host.innerHTML = '<div class="viz-empty">No pipeline trace returned. Set <code>DEBUG_PIPELINE=1</code> on the server to enable.</div>';
                 return;
             }
-            if (typeof mermaid === "undefined") {
-                host.innerHTML = '<div class="viz-empty">Mermaid failed to load (CDN blocked?). The expanded trace above still has every stage.</div>';
-                return;
+
+            const iters = splitTraceByIteration(trace);
+            if (iters && iters.length > 1) {
+                for (const sub of iters) {
+                    _vizPages.push(buildMermaidFromTrace(sub, _vizQuery));
+                }
+            } else {
+                _vizPages.push(buildMermaidFromTrace(trace, _vizQuery));
             }
-            const id = `viz-${++_vizCounter}`;
-            const def = buildMermaidFromTrace(trace, query);
-            try {
-                const { svg } = await mermaid.render(id, def);
-                host.innerHTML = svg;
-                if (legend) legend.style.display = "";
-            } catch (err) {
-                console.error("mermaid render failed:", err, def);
-                host.innerHTML = `<div class="viz-empty">Could not render flow: ${escapeHtml(err.message || String(err))}</div>`;
-            }
+
+            await vizGoTo(0);
         }
+
+        // ─── Draggable stage-detail popup ─────────────────────────────────
+        function showStagePopup(stage, clickX, clickY) {
+            const popup = document.getElementById("stage-popup");
+            if (!popup) return;
+            const display = formatStageDisplay(stage.stage);
+            document.getElementById("stage-popup-title").textContent = display.title;
+            document.getElementById("stage-popup-body").innerHTML = renderStageBody(stage);
+
+            // Position near the click, clamped inside the viewport.
+            popup.style.transform = "none";
+            popup.style.display = "flex";
+            const w = popup.offsetWidth || 480;
+            const h = popup.offsetHeight || 300;
+            popup.style.left = Math.max(8, Math.min(clickX, window.innerWidth  - w - 8)) + "px";
+            popup.style.top  = Math.max(8, Math.min(clickY + 14, window.innerHeight - h - 8)) + "px";
+        }
+
+        function closeStagePopup() {
+            const popup = document.getElementById("stage-popup");
+            if (popup) popup.style.display = "none";
+        }
+
+        // Wire up drag on popup header once the DOM is ready.
+        document.addEventListener("DOMContentLoaded", () => {
+            const handle = document.getElementById("stage-popup-drag-handle");
+            const popup  = document.getElementById("stage-popup");
+            if (!handle || !popup) return;
+            let ox = 0, oy = 0;
+            function onMove(e) {
+                const cx = e.touches ? e.touches[0].clientX : e.clientX;
+                const cy = e.touches ? e.touches[0].clientY : e.clientY;
+                popup.style.left = Math.max(0, cx - ox) + "px";
+                popup.style.top  = Math.max(0, cy - oy) + "px";
+            }
+            function onUp() {
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup",   onUp);
+                document.removeEventListener("touchmove", onMove);
+                document.removeEventListener("touchend",  onUp);
+            }
+            handle.addEventListener("mousedown", e => {
+                const r = popup.getBoundingClientRect();
+                ox = e.clientX - r.left;
+                oy = e.clientY - r.top;
+                document.addEventListener("mousemove", onMove);
+                document.addEventListener("mouseup",   onUp);
+                e.preventDefault();
+            });
+            handle.addEventListener("touchstart", e => {
+                const r = popup.getBoundingClientRect();
+                ox = e.touches[0].clientX - r.left;
+                oy = e.touches[0].clientY - r.top;
+                document.addEventListener("touchmove", onMove, {passive: false});
+                document.addEventListener("touchend",  onUp);
+                e.preventDefault();
+            }, {passive: false});
+        });
 
         function renderMarkdown(md) {
             if (typeof md !== "string") return "";
@@ -2862,20 +3405,24 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 citationsBox.classList.add("hidden");
             }
 
-            // Pipeline trace — render as human-readable cards (title + subtitle
-            // + chips + key/value rows) with the raw JSON tucked behind a
-            // "Show raw JSON" details toggle for power users.
+            // Pipeline visualization (Mermaid DAG) — rendered first so the
+            // flowchart appears above the collapsed trace accordion.
+            renderPipelineViz(data.pipeline_trace, data.query);
+
+            // Pipeline trace — rendered into the collapsed <details> accordion
+            // below the flowchart. Each card shows title + subtitle + chips +
+            // key/value rows; raw JSON is behind a "Show raw JSON" toggle.
             const stagesDiv = document.getElementById("pipeline-stages");
+            const stageCount = document.getElementById("trace-stage-count");
             if (data.pipeline_trace) {
                 stagesDiv.innerHTML = data.pipeline_trace
                     .map((stage, idx) => renderStageCard(stage, idx))
                     .join("");
+                if (stageCount) stageCount.textContent = `(${data.pipeline_trace.length} stage${data.pipeline_trace.length === 1 ? "" : "s"})`;
             } else {
                 stagesDiv.innerHTML = '';
+                if (stageCount) stageCount.textContent = '';
             }
-
-            // Pipeline visualization (Mermaid DAG)
-            renderPipelineViz(data.pipeline_trace, data.query);
 
             // Model panel — update active row + cost
             const isAgentic = !!data.agentic;
@@ -2894,6 +3441,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
         // `hybrid_search.vector_search_q2.iter1` maps to the "Semantic search"
         // entry with " (sub-query 3)" and " · pass 2" annotations.
         const STAGE_INFO = {
+            "query":                        {t: "Query",                         s: "The question the user asked",                              g: "normal"},
+            "query.followup":               {t: "Follow-up queries",             s: "What gap analysis decided to search for in this pass",     g: "agentic"},
+            "sub_query":                    {t: "Sub-query",                     s: "One slice of the decomposed query",                        g: "normal"},
+            "refine.seed":                  {t: "Resume from cache",             s: "Reused a prior /api/query first-pass state",               g: "normal"},
             "query_processor":              {t: "Understand the question",       s: "Decompose into sub-queries and extract entities",        g: "normal"},
             "structured_lookup":            {t: "Structured lookup",             s: "Direct hit against named fields, tables, or figures",     g: "normal"},
             "hybrid_search.vector_search":  {t: "Semantic search",               s: "Embeddings via Voyage (vector similarity)",               g: "normal"},
