@@ -206,15 +206,25 @@ def _refine_cache_get(request_id: str) -> dict | None:
 # FastAPI App Setup
 # ============================================================================
 
+# Trace is only returned to authenticated callers (the API endpoints that
+# include it all require a valid session). Default OFF to keep production
+# responses small; flip on to populate the in-UI pipeline flow chart.
+DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "0").lower() in ("1", "true", "yes")
+
+# Separate switch from DEBUG_PIPELINE: /docs, /redoc, /openapi.json are auto-
+# added by FastAPI with NO auth. They don't let anyone call gated endpoints,
+# but they enumerate the API surface to unauthenticated visitors — different
+# blast radius than the trace, so it gets its own variable. Off by default.
+_EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "yes")
+
 app = FastAPI(
     title="specGPT Pipeline",
     description="NVMe Specification Q&A with Full Pipeline Visibility",
     version="2.0",
+    docs_url="/docs" if _EXPOSE_API_DOCS else None,
+    redoc_url="/redoc" if _EXPOSE_API_DOCS else None,
+    openapi_url="/openapi.json" if _EXPOSE_API_DOCS else None,
 )
-
-# Configuration: trace exposes chunk previews, model names, and timings, so
-# default to OFF. Set DEBUG_PIPELINE=1 only in development.
-DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "0").lower() in ("1", "true", "yes")
 
 
 # ============================================================================
@@ -1033,6 +1043,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
             color: var(--text-faint);
             cursor: not-allowed;
         }
+
+        /* inline status text used in agent strip (no pill/bubble) */
+        .strip-status {
+            font-size: 12.5px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+        .strip-status-ok { color: var(--ok); }
 
         /* ─── Config panel ────────────────────────────────────────────── */
         .config-panel {
@@ -2241,6 +2259,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         </div>
         <div class="stage-popup-body" id="stage-popup-body"></div>
     </div>
+
 
     <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
          LLM output is partially user-influenced via prompt injection, so we
@@ -3704,8 +3723,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
             const gh = data.gap_hint;
             if (!gh) {
                 strip.innerHTML = label + `
-                    <span class="agent-strip-state"><span class="dot"></span><b>Gap check skipped</b></span>
-                    <span class="agent-strip-reason">Auto gap check is disabled in config.</span>
+                    <span class="strip-status">Gap check disabled</span>
+                    <span class="agent-strip-reason">Enable Auto Gap Check in config to get suggestions.</span>
                     ${latency}
                 `;
                 return;
@@ -3720,8 +3739,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 return;
             }
 
-            // Has gaps — render the offer in the strip, with optional details
-            // line below (chips for figures/fields/sections, follow-up queries).
+            // Has gaps — render the full offer with chips and button.
             const req = gh.requested_resources || {};
             const figs = (req.figures  || []).slice(0, 6);
             const flds = (req.fields   || []).slice(0, 6);
@@ -3752,8 +3770,6 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 btn.addEventListener("click", () => {
                     btn.disabled = true;
                     btn.textContent = "Running…";
-                    // Reflect agentic state in the toggle (purely cosmetic — the
-                    // refine endpoint runs Stage 5 regardless).
                     if (!agenticToggle.checked) {
                         agenticToggle.checked = true;
                         agenticToggle.dispatchEvent(new Event("change"));
