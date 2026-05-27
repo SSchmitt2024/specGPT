@@ -73,7 +73,7 @@ class PipelineConfig:
 
     # Reranking parameters
     final_rerank_topk: int = 7
-    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    cross_encoder_model: str = "rerank-2-lite"
 
     # Query decomposition parameters
     max_subqueries: int = 3

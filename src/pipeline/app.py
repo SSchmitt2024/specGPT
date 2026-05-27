@@ -601,10 +601,10 @@ async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
         },
         "reranker": {
             "model": cfg.cross_encoder_model,
-            "provider": "Local (HuggingFace)",
-            "price_per_1m_input": 0.0,
+            "provider": "Voyage AI",
+            "price_per_1m_input": 0.05,
             "price_per_1m_output": None,
-            "note": "Runs locally, no API cost",
+            "note": "rerank-2-lite; ~$0.05/1M tokens",
         },
         "llm": {
             "model": cfg.llm_model,
@@ -2125,14 +2125,16 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         <label>Agentic LLM</label>
                         <select id="config-agentic_model">
                             <optgroup label="Gemini (Google)">
-                                <option value="gemini-2.0-flash">Gemini 2.0 Flash — cheapest</option>
+                                <option value="gemini-2.0-flash">Gemini 2.0 Flash (cheapest)</option>
                                 <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                                <option value="gemini-2.5-pro">Gemini 2.5 Pro — most capable</option>
+                                <option value="gemini-2.5-pro">Gemini 2.5 Pro (most capable)</option>
                             </optgroup>
                             <optgroup label="Claude (Anthropic)">
                                 <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
                                 <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
                                 <option value="claude-opus-4-7" selected>Claude Opus 4.7 (default)</option>
+                            </optgroup>
+                            <optgroup label="UNH Models">
                                 <option value="deepthought">DeepThought (free)</option>
                             </optgroup>
                         </select>
@@ -2173,15 +2175,17 @@ FRONTEND_HTML = """<!DOCTYPE html>
                         <label>Regular LLM</label>
                         <select id="config-llm_model">
                             <optgroup label="Gemini (Google)">
-                                <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite — cheapest</option>
+                                <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (cheapest)</option>
                                 <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
                                 <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
                             </optgroup>
                             <optgroup label="Claude (Anthropic)">
-                                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 — fastest</option>
+                                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (fastest)</option>
                                 <option value="claude-sonnet-4-5" selected>Claude Sonnet 4.5 (default)</option>
                                 <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                                <option value="claude-opus-4-7">Claude Opus 4.7 — most capable</option>
+                                <option value="claude-opus-4-7">Claude Opus 4.7 (most capable)</option>
+                            </optgroup>
+                            <optgroup label="UNH Models">
                                 <option value="deepthought">DeepThought (free)</option>
                             </optgroup>
                         </select>
@@ -2340,7 +2344,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <div id="ag-confirm-overlay" class="ag-confirm-overlay hidden" role="dialog" aria-modal="true">
         <div class="ag-confirm">
             <div class="ag-confirm-title">Run agentic refinement?</div>
-            <div class="ag-confirm-sub">Will run with these settings — edit config first if needed.</div>
+            <div class="ag-confirm-sub">Will run with these settings. Edit config first if needed.</div>
             <div class="ag-confirm-rows" id="ag-confirm-rows"></div>
             <div class="ag-confirm-actions">
                 <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-confirm-cancel">Cancel</button>
@@ -2975,7 +2979,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             const rr = stages.final_rerank;
             if (rr) {
-                L.push(`  RR["${_label("Rerank", "top " + (rr.output.count || 0) + " · cross-encoder", rr)}"]:::stage_rerank`);
+                L.push(`  RR["${_label("Rerank", "top " + (rr.output.count || 0) + " · voyage", rr)}"]:::stage_rerank`);
                 if (dd) L.push("  DEDUP --> RR");
                 nodeMap["RR"] = rr;
             }
@@ -3288,7 +3292,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
             const chk = id => { const el = document.getElementById(id); return el ? el.checked : false; };
             const modelEl = document.getElementById("config-agentic_model");
-            const modelLabel = modelEl ? (modelEl.options[modelEl.selectedIndex]?.text || modelEl.value) : "—";
+            const modelLabel = modelEl ? (modelEl.options[modelEl.selectedIndex]?.text || modelEl.value) : "-";
             const rows = [
                 ["Model",        modelLabel],
                 ["Max follow-ups", val("config-agentic_max_followups") || "3"],
@@ -3634,7 +3638,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             "hybrid_search.rrf_merge":      {t: "Fuse search branches",          s: "Reciprocal Rank Fusion across semantic + keyword + BM25", g: "normal"},
             "hybrid_search.total":          {t: "Hybrid search (total)",         s: "End-to-end time across all retrieval branches",           g: "normal"},
             "result_dedup":                 {t: "Deduplicate combined pool",     s: "Merge structured + hybrid chunks, drop duplicates",        g: "normal"},
-            "final_rerank":                 {t: "Rerank (cross-encoder)",        s: "Score each chunk against the query",                       g: "normal"},
+            "final_rerank":                 {t: "Rerank",                        s: "Score each chunk against the query (Voyage rerank-2-lite)", g: "normal"},
             "generation":                   {t: "Generate answer",               s: "Synthesize the answer with citations (Claude)",            g: "normal"},
             "agentic.gap_analysis":         {t: "Agentic gap analysis",          s: "Does the answer fully cover the question?",                g: "agentic"},
             "agentic.targeted_fetch":       {t: "Targeted fetch",                s: "Pull figures, fields, or sections the model named",        g: "agentic"},
