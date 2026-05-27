@@ -18,6 +18,9 @@ Required env vars:
   SESSION_SECRET   — ≥16-byte string used as HMAC key for session cookies
   SUPABASE_URL / SUPABASE_KEY / VOYAGE_API_KEY / ANTHROPIC_API_KEY — pipeline backends
 
+Optional env vars (model backends):
+  GEMINI_API_KEY   — required when using any gemini-* model
+
 Optional env vars:
   DEBUG_PIPELINE   — "1" to include full trace in responses (default: off)
   PORT             — server port (default: 8000)
@@ -2121,10 +2124,17 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <div class="config-item config-item-wide">
                         <label>Agentic LLM</label>
                         <select id="config-agentic_model">
-                            <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
-                            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                            <option value="claude-opus-4-7" selected>Claude Opus 4.7 (default)</option>
-                            <option value="deepthought">DeepThought (free)</option>
+                            <optgroup label="Gemini (Google)">
+                                <option value="gemini-2.0-flash">Gemini 2.0 Flash — cheapest</option>
+                                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                                <option value="gemini-2.5-pro">Gemini 2.5 Pro — most capable</option>
+                            </optgroup>
+                            <optgroup label="Claude (Anthropic)">
+                                <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
+                                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                                <option value="claude-opus-4-7" selected>Claude Opus 4.7 (default)</option>
+                                <option value="deepthought">DeepThought (free)</option>
+                            </optgroup>
                         </select>
                     </div>
                     <div class="config-item">
@@ -2162,11 +2172,18 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <div class="config-item config-item-wide">
                         <label>Regular LLM</label>
                         <select id="config-llm_model">
-                            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (fastest, cheapest)</option>
-                            <option value="claude-sonnet-4-5" selected>Claude Sonnet 4.5 (default)</option>
-                            <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (newer Sonnet)</option>
-                            <option value="claude-opus-4-7">Claude Opus 4.7 (most capable)</option>
-                            <option value="deepthought">DeepThought (free)</option>
+                            <optgroup label="Gemini (Google)">
+                                <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite — cheapest</option>
+                                <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                            </optgroup>
+                            <optgroup label="Claude (Anthropic)">
+                                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 — fastest</option>
+                                <option value="claude-sonnet-4-5" selected>Claude Sonnet 4.5 (default)</option>
+                                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                                <option value="claude-opus-4-7">Claude Opus 4.7 — most capable</option>
+                                <option value="deepthought">DeepThought (free)</option>
+                            </optgroup>
                         </select>
                     </div>
                     <div class="config-item">
@@ -2417,6 +2434,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
         // a different model — no extra round-trip needed. Numbers track
         // Anthropic's public pricing pages at the time of writing.
         const MODEL_PRICING = {
+            // Gemini (Google) — cheapest → most expensive
+            "gemini-2.0-flash-lite": {in: 0.075, out: 0.30},
+            "gemini-2.0-flash":      {in: 0.10,  out: 0.40},
+            "gemini-2.5-flash":      {in: 0.15,  out: 0.60},
+            "gemini-2.5-pro":        {in: 1.25,  out: 10.0},
+            // Claude (Anthropic)
             "claude-haiku-4-5-20251001":  {in: 1.0,  out: 5.0},
             "claude-sonnet-4-5":           {in: 3.0,  out: 15.0},
             "claude-sonnet-4-6":           {in: 3.0,  out: 15.0},
@@ -2427,6 +2450,13 @@ FRONTEND_HTML = """<!DOCTYPE html>
         // Overlay the model selectors onto `_modelsData` so the model panel +
         // cost calc reflect whatever the user picked. No-op until both the
         // /api/models response and the selectors are in the DOM.
+        function _modelProvider(id) {
+            if (!id) return "Anthropic";
+            if (id.startsWith("gemini-")) return "Google";
+            if (id === "deepthought") return "DeepThought";
+            return "Anthropic";
+        }
+
         function _applySelectedModels() {
             if (!_modelsData) return;
             const llmEl = document.getElementById("config-llm_model");
@@ -2434,7 +2464,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
             if (llmEl && _modelsData.llm) {
                 const id = llmEl.value;
                 const p  = MODEL_PRICING[id];
-                _modelsData.llm.model = id;
+                _modelsData.llm.model    = id;
+                _modelsData.llm.provider = _modelProvider(id);
                 if (p) {
                     _modelsData.llm.price_per_1m_input  = p.in;
                     _modelsData.llm.price_per_1m_output = p.out;
@@ -2443,7 +2474,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
             if (agEl && _modelsData.agentic_llm) {
                 const id = agEl.value;
                 const p  = MODEL_PRICING[id];
-                _modelsData.agentic_llm.model = id;
+                _modelsData.agentic_llm.model    = id;
+                _modelsData.agentic_llm.provider = _modelProvider(id);
                 if (p) {
                     _modelsData.agentic_llm.price_per_1m_input  = p.in;
                     _modelsData.agentic_llm.price_per_1m_output = p.out;

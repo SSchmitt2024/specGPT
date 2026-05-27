@@ -33,6 +33,13 @@ except ImportError:
     print("Missing dependency: pip install anthropic")
     sys.exit(1)
 
+try:
+    from google import genai as _google_genai
+    from google.genai import types as _google_genai_types
+    _GOOGLE_GENAI_AVAILABLE = True
+except ImportError:
+    _GOOGLE_GENAI_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +328,74 @@ def _call_with_retry(
     raise last_err
 
 
+def _call_gemini(
+    query: str,
+    system_prompt: str,
+    *,
+    model: str,
+    max_tokens: int,
+    max_retries: int,
+) -> tuple[str, dict]:
+    """Call the Gemini API and return (answer_text, tokens_used).
+
+    Requires the ``GEMINI_API_KEY`` environment variable. Retries on
+    transient failures with exponential back-off (same pattern as the
+    Anthropic helper above).
+    """
+    if not _GOOGLE_GENAI_AVAILABLE:
+        raise RuntimeError("google-genai package not installed; run: pip install google-genai")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY environment variable is not set. "
+            "Add it to your .env file or Railway/deployment config."
+        )
+
+    client = _google_genai.Client(api_key=api_key)
+    last_err: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=query,
+                config=_google_genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+            logger.warning(
+                "Gemini call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, max_retries, e, sleep,
+            )
+            time.sleep(sleep)
+    else:
+        assert last_err is not None
+        raise last_err
+
+    answer = response.text or ""
+
+    # Check stop reason so we can append a truncation note (mirrors Anthropic path).
+    stop_reason: str | None = None
+    if getattr(response, "candidates", None):
+        finish = getattr(response.candidates[0], "finish_reason", None)
+        if finish is not None and str(finish).upper() in ("MAX_TOKENS", "2"):
+            stop_reason = "max_tokens"
+            answer = f"{answer}\n\n[Answer truncated: hit max_tokens={max_tokens}.]"
+
+    usage = getattr(response, "usage_metadata", None)
+    tokens_used = {
+        "prompt": getattr(usage, "prompt_token_count", 0) if usage else 0,
+        "completion": getattr(usage, "candidates_token_count", 0) if usage else 0,
+        "stop_reason": stop_reason,
+    }
+    return answer, tokens_used
+
+
 def generate(
     query: str,
     context_chunks: list[dict],
@@ -385,29 +460,40 @@ def generate(
     # to keep injection surface inside the context fence.
     full_system_prompt = system_prompt.format(context=context_text)
 
-    # Step 3: Call Sonnet with retry on transient failures
-    client = Anthropic()
-    response = _call_with_retry(
-        client,
-        model=model,
-        system=full_system_prompt,
-        messages=[{"role": "user", "content": query}],
-        max_tokens=max_tokens,
-        timeout=timeout,
-        max_retries=max_retries,
-    )
+    # Step 3: Call the appropriate backend based on the model prefix.
+    if model.startswith("gemini-"):
+        # ── Google Gemini path ─────────────────────────────────────────
+        answer, tokens_used = _call_gemini(
+            query,
+            full_system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+        )
+    else:
+        # ── Anthropic Claude path (default) ────────────────────────────
+        client = Anthropic()
+        response = _call_with_retry(
+            client,
+            model=model,
+            system=full_system_prompt,
+            messages=[{"role": "user", "content": query}],
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
-    answer = _extract_text(response)
-    stop_reason = getattr(response, "stop_reason", None)
-    if stop_reason == "max_tokens":
-        answer = f"{answer}\n\n[Answer truncated: hit max_tokens={max_tokens}.]"
+        answer = _extract_text(response)
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens":
+            answer = f"{answer}\n\n[Answer truncated: hit max_tokens={max_tokens}.]"
 
-    usage = getattr(response, "usage", None)
-    tokens_used = {
-        "prompt": getattr(usage, "input_tokens", 0) if usage else 0,
-        "completion": getattr(usage, "output_tokens", 0) if usage else 0,
-        "stop_reason": stop_reason,
-    }
+        usage = getattr(response, "usage", None)
+        tokens_used = {
+            "prompt": getattr(usage, "input_tokens", 0) if usage else 0,
+            "completion": getattr(usage, "output_tokens", 0) if usage else 0,
+            "stop_reason": stop_reason,
+        }
 
     # Step 4: Extract citations
     citations = _extract_citations(answer, used_chunks)
