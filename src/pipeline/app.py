@@ -75,6 +75,7 @@ _load_dotenv()
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.pipeline.auth import (
@@ -226,6 +227,9 @@ app = FastAPI(
     openapi_url="/openapi.json" if _EXPOSE_API_DOCS else None,
 )
 
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
 
 # ============================================================================
 # Auth helpers + endpoints
@@ -286,6 +290,7 @@ def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>specGPT - sign in</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -635,6 +640,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>specGPT - NVMe Spec Q&A</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -790,8 +796,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
             gap: 10px;
             margin-top: 8px;
             padding: 8px 12px;
-            background: var(--bg-soft);
-            border: 1px solid var(--border);
+            background: #fff8f8;
+            border: 1px solid #fecaca;
             border-radius: var(--radius-sm);
             font-size: 12.5px;
             color: var(--text-subtle);
@@ -815,16 +821,17 @@ FRONTEND_HTML = """<!DOCTYPE html>
             font-size: 12px;
         }
         .agentic-row.active {
-            background: var(--bg-muted);
-            border-color: var(--border-strong);
+            background: #fff1f1;
+            border-color: #fca5a5;
         }
 
         .agentic-config {
-            background: var(--bg-soft);
+            background: #fff8f8;
             padding: 12px 14px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            margin-top: 6px;
+            border: 1px solid #fecaca;
+            border-top: none;
+            border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+            margin-top: 0;
         }
         .agentic-config.hidden { display: none; }
         .agentic-config .config-item label { color: var(--text-subtle); }
@@ -1043,6 +1050,58 @@ FRONTEND_HTML = """<!DOCTYPE html>
             color: var(--text-faint);
             cursor: not-allowed;
         }
+
+        /* ─── Agentic confirm popup ───────────────────────────────────── */
+        .ag-confirm-overlay {
+            position: fixed; inset: 0; z-index: 9000;
+            background: rgba(15,23,42,0.25);
+            display: flex; align-items: center; justify-content: center;
+        }
+        .ag-confirm-overlay.hidden { display: none; }
+        .ag-confirm {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            box-shadow: 0 12px 40px rgba(15,23,42,0.18);
+            width: 340px; max-width: 92vw;
+            padding: 20px 20px 16px;
+            font-size: 13px; color: #1e293b;
+        }
+        .ag-confirm-title {
+            font-weight: 700; font-size: 14.5px; margin-bottom: 4px;
+        }
+        .ag-confirm-sub {
+            font-size: 12px; color: #64748b; margin-bottom: 14px;
+        }
+        .ag-confirm-rows {
+            background: #f8fafc; border: 1px solid #e2e8f0;
+            border-radius: 7px; padding: 10px 12px;
+            margin-bottom: 14px; display: grid;
+            grid-template-columns: 1fr 1fr; gap: 6px 12px;
+        }
+        .ag-confirm-row { display: contents; }
+        .ag-confirm-key { font-size: 11.5px; color: #64748b; }
+        .ag-confirm-val { font-size: 11.5px; color: #1e293b; font-weight: 600; font-family: var(--font-mono); }
+        .ag-confirm-actions {
+            display: flex; gap: 8px; justify-content: flex-end;
+        }
+        .ag-confirm-btn {
+            height: 30px; padding: 0 13px; border-radius: 6px;
+            font-size: 12.5px; font-weight: 500; cursor: pointer;
+            font-family: inherit; border: 1px solid transparent;
+        }
+        .ag-confirm-btn-cancel {
+            background: #f1f5f9; border-color: #e2e8f0; color: #475569;
+        }
+        .ag-confirm-btn-cancel:hover { background: #e2e8f0; }
+        .ag-confirm-btn-edit {
+            background: #fff; border-color: #e2e8f0; color: #475569;
+        }
+        .ag-confirm-btn-edit:hover { background: #f1f5f9; }
+        .ag-confirm-btn-run {
+            background: var(--accent); border-color: var(--accent); color: #fff;
+        }
+        .ag-confirm-btn-run:hover { background: #000; border-color: #000; }
 
         /* inline status text used in agent strip (no pill/bubble) */
         .strip-status {
@@ -2260,6 +2319,20 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div class="stage-popup-body" id="stage-popup-body"></div>
     </div>
 
+    <!-- Agentic-run confirmation overlay -->
+    <div id="ag-confirm-overlay" class="ag-confirm-overlay hidden" role="dialog" aria-modal="true">
+        <div class="ag-confirm">
+            <div class="ag-confirm-title">Run agentic refinement?</div>
+            <div class="ag-confirm-sub">Will run with these settings — edit config first if needed.</div>
+            <div class="ag-confirm-rows" id="ag-confirm-rows"></div>
+            <div class="ag-confirm-actions">
+                <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-confirm-cancel">Cancel</button>
+                <button class="ag-confirm-btn ag-confirm-btn-edit" id="ag-confirm-edit">Edit config</button>
+                <button class="ag-confirm-btn ag-confirm-btn-run" id="ag-confirm-run">Run &#8594;</button>
+            </div>
+        </div>
+    </div>
+
 
     <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
          LLM output is partially user-influenced via prompt injection, so we
@@ -3176,6 +3249,60 @@ FRONTEND_HTML = """<!DOCTYPE html>
             if (popup) popup.style.display = "none";
         }
 
+        let _agConfirmCallback = null;
+
+        function showAgenticConfirm(onRun) {
+            _agConfirmCallback = onRun;
+            const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
+            const chk = id => { const el = document.getElementById(id); return el ? el.checked : false; };
+            const modelEl = document.getElementById("config-agentic_model");
+            const modelLabel = modelEl ? (modelEl.options[modelEl.selectedIndex]?.text || modelEl.value) : "—";
+            const rows = [
+                ["Model",        modelLabel],
+                ["Max follow-ups", val("config-agentic_max_followups") || "3"],
+                ["Rerank top-k", val("config-agentic_rerank_topk") || "14"],
+                ["Max ctx tok",  val("config-agentic_max_context_tokens") || "16000"],
+                ["Targeted fetch", chk("config-agentic_targeted_fetch") ? "on" : "off"],
+                ["Recursive",    chk("config-agentic_recursive") ? "on (max " + (val("config-agentic_max_iterations") || "5") + " iter)" : "off"],
+            ];
+            document.getElementById("ag-confirm-rows").innerHTML = rows.map(([k, v]) =>
+                `<span class="ag-confirm-key">${escapeHtml(k)}</span><span class="ag-confirm-val">${escapeHtml(String(v))}</span>`
+            ).join("");
+            document.getElementById("ag-confirm-overlay").classList.remove("hidden");
+        }
+
+        function closeAgenticConfirm() {
+            document.getElementById("ag-confirm-overlay").classList.add("hidden");
+            _agConfirmCallback = null;
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            document.getElementById("ag-confirm-cancel").addEventListener("click", closeAgenticConfirm);
+            document.getElementById("ag-confirm-run").addEventListener("click", () => {
+                closeAgenticConfirm();
+                if (_agConfirmCallback) _agConfirmCallback();
+            });
+            document.getElementById("ag-confirm-edit").addEventListener("click", () => {
+                closeAgenticConfirm();
+                const panel = document.getElementById("config-panel");
+                const toggle = document.getElementById("config-toggle");
+                if (panel && !panel.classList.contains("open")) {
+                    panel.classList.add("open");
+                }
+                // Ensure agentic config is visible
+                const agToggle = document.getElementById("agentic-toggle");
+                if (agToggle && !agToggle.checked) {
+                    agToggle.checked = true;
+                    agToggle.dispatchEvent(new Event("change"));
+                }
+                document.getElementById("agentic-config")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            });
+            // Click outside to dismiss
+            document.getElementById("ag-confirm-overlay").addEventListener("click", e => {
+                if (e.target === e.currentTarget) closeAgenticConfirm();
+            });
+        });
+
         // Wire up drag on popup header once the DOM is ready.
         document.addEventListener("DOMContentLoaded", () => {
             const handle = document.getElementById("stage-popup-drag-handle");
@@ -3768,13 +3895,15 @@ FRONTEND_HTML = """<!DOCTYPE html>
             const btn = document.getElementById("run-agentic-btn");
             if (btn) {
                 btn.addEventListener("click", () => {
-                    btn.disabled = true;
-                    btn.textContent = "Running…";
-                    if (!agenticToggle.checked) {
-                        agenticToggle.checked = true;
-                        agenticToggle.dispatchEvent(new Event("change"));
-                    }
-                    runRefine(data.request_id);
+                    showAgenticConfirm(() => {
+                        btn.disabled = true;
+                        btn.textContent = "Running…";
+                        if (!agenticToggle.checked) {
+                            agenticToggle.checked = true;
+                            agenticToggle.dispatchEvent(new Event("change"));
+                        }
+                        runRefine(data.request_id);
+                    });
                 });
             }
         }
