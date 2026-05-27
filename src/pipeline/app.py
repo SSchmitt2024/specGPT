@@ -90,7 +90,27 @@ from src.pipeline.auth import (
     verify_password,
     verify_session_token,
 )
+from src.pipeline.generator import DeepThoughtUnreachableError
 from src.pipeline.orchestrator import GenerationError, orchestrate, PipelineConfig
+
+
+def _generation_error_detail(e: GenerationError, request_id: str, *, include_trace: bool) -> dict:
+    """Build the JSON `detail` for a 502 generation failure.
+
+    When the cause is a known network-config error (DeepThought off-VPN),
+    include a `message` field with a human-readable hint so the UI can show
+    something more useful than "Bad Gateway".
+    """
+    detail: dict = {
+        "error": "generation_failed",
+        "request_id": request_id,
+        "cause_type": type(e.cause).__name__,
+    }
+    if isinstance(e.cause, DeepThoughtUnreachableError):
+        detail["message"] = str(e.cause)
+    if include_trace:
+        detail["pipeline_trace"] = e.trace
+    return detail
 
 
 logger = logging.getLogger(__name__)
@@ -462,13 +482,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         # is more accurate than 500 here, and the trace can still be returned
         # in debug mode so callers can see what *was* retrieved.
         logger.warning("Generation failure [%s]: %s", request_id, e.cause)
-        detail: dict = {
-            "error": "generation_failed",
-            "request_id": request_id,
-            "cause_type": type(e.cause).__name__,
-        }
-        if debug_trace:
-            detail["pipeline_trace"] = e.trace
+        detail = _generation_error_detail(e, request_id, include_trace=debug_trace)
         raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
         logger.exception("Pipeline error [%s]: %s", request_id, e)
@@ -540,13 +554,7 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         )
     except GenerationError as e:
         logger.warning("Refine generation failure [%s]: %s", req.request_id, e.cause)
-        detail: dict = {
-            "error": "generation_failed",
-            "request_id": req.request_id,
-            "cause_type": type(e.cause).__name__,
-        }
-        if debug_trace:
-            detail["pipeline_trace"] = e.trace
+        detail = _generation_error_detail(e, req.request_id, include_trace=debug_trace)
         raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
         logger.exception("Refine error [%s]: %s", req.request_id, e)
@@ -3529,7 +3537,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 }
                 if (!response.ok) {
                     const err = await response.json();
-                    throw new Error(typeof err.detail === "string" ? err.detail : "Request failed");
+                    const detail = err && err.detail;
+                    const message =
+                        typeof detail === "string"
+                            ? detail
+                            : (detail && typeof detail.message === "string"
+                                ? detail.message
+                                : "Request failed");
+                    throw new Error(message);
                 }
 
                 const data = await response.json();
@@ -3996,7 +4011,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 }
                 if (!response.ok) {
                     const err = await response.json();
-                    throw new Error(typeof err.detail === "string" ? err.detail : "Refine failed");
+                    const detail = err && err.detail;
+                    const message =
+                        typeof detail === "string"
+                            ? detail
+                            : (detail && typeof detail.message === "string"
+                                ? detail.message
+                                : "Refine failed");
+                    throw new Error(message);
                 }
                 const data = await response.json();
                 displayResults(data);
