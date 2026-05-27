@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -48,6 +49,14 @@ DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
 DEFAULT_REQUEST_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 3
+
+# DeepThought is UNH's on-prem OpenAI-compatible LLM gateway. The dropdown
+# value "deepthought" is the public model id used by the UI; the underlying
+# model served by the gateway is named below. Reachable only from the USNH
+# network (campus or GlobalProtect VPN); calls from elsewhere time out at the
+# TCP layer rather than returning an HTTP error.
+DEEPTHOUGHT_BASE_URL = "https://dtcontroller.sr.unh.edu:4242/openai/v1"
+DEEPTHOUGHT_MODEL = "Meta-Llama-3.1-8B-Instruct"
 
 # The context block is wrapped in explicit delimiters so chunk text (which
 # originates from a PDF and may contain instruction-like sentences) is clearly
@@ -396,6 +405,79 @@ def _call_gemini(
     return answer, tokens_used
 
 
+def _call_deepthought(
+    query: str,
+    system_prompt: str,
+    *,
+    max_tokens: int,
+    max_retries: int,
+) -> tuple[str, dict]:
+    """Call UNH's DeepThought OpenAI-compatible gateway and return (answer, tokens_used).
+
+    Requires DEEPTHOUGHT_API_KEY and USNH network access (on-campus or
+    GlobalProtect VPN). Off-network calls fail at TCP connect, not HTTP.
+    """
+    api_key = os.environ.get("DEEPTHOUGHT_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DEEPTHOUGHT_API_KEY environment variable is not set. "
+            "Generate one at https://deepthought.usnh.edu/?id=usnh-int and add it to your .env."
+        )
+
+    from openai import OpenAI, APIError, RateLimitError  # lazy import
+
+    client = OpenAI(api_key=api_key, base_url=DEEPTHOUGHT_BASE_URL)
+    last_err: Exception | None = None
+    response = None
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=DEEPTHOUGHT_MODEL,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+            )
+            break
+        except (RateLimitError, APIError) as e:
+            last_err = e
+            sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+            logger.warning(
+                "DeepThought call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, max_retries, e, sleep,
+            )
+            time.sleep(sleep)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+            logger.warning(
+                "DeepThought call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, max_retries, e, sleep,
+            )
+            time.sleep(sleep)
+    else:
+        assert last_err is not None
+        raise last_err
+
+    choice = response.choices[0]
+    answer = choice.message.content or ""
+
+    stop_reason = getattr(choice, "finish_reason", None)
+    if stop_reason == "length":
+        answer = f"{answer}\n\n[Answer truncated: hit max_tokens={max_tokens}.]"
+        stop_reason = "max_tokens"
+
+    usage = getattr(response, "usage", None)
+    tokens_used = {
+        "prompt": getattr(usage, "prompt_tokens", 0) if usage else 0,
+        "completion": getattr(usage, "completion_tokens", 0) if usage else 0,
+        "stop_reason": stop_reason,
+    }
+    return answer, tokens_used
+
+
 def generate(
     query: str,
     context_chunks: list[dict],
@@ -461,7 +543,15 @@ def generate(
     full_system_prompt = system_prompt.format(context=context_text)
 
     # Step 3: Call the appropriate backend based on the model prefix.
-    if model.startswith("gemini-"):
+    if model == "deepthought":
+        # ── UNH DeepThought (OpenAI-compatible, on-prem) ───────────────
+        answer, tokens_used = _call_deepthought(
+            query,
+            full_system_prompt,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+        )
+    elif model.startswith("gemini-"):
         # ── Google Gemini path ─────────────────────────────────────────
         answer, tokens_used = _call_gemini(
             query,
