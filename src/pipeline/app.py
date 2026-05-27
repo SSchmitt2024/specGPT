@@ -2047,6 +2047,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                             <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
                             <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
                             <option value="claude-opus-4-7" selected>Claude Opus 4.7 (default)</option>
+                            <option value="deepthought">DeepThought (free)</option>
                         </select>
                     </div>
                     <div class="config-item">
@@ -2088,6 +2089,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                             <option value="claude-sonnet-4-5" selected>Claude Sonnet 4.5 (default)</option>
                             <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (newer Sonnet)</option>
                             <option value="claude-opus-4-7">Claude Opus 4.7 (most capable)</option>
+                            <option value="deepthought">DeepThought (free)</option>
                         </select>
                     </div>
                     <div class="config-item">
@@ -2327,6 +2329,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             "claude-sonnet-4-5":           {in: 3.0,  out: 15.0},
             "claude-sonnet-4-6":           {in: 3.0,  out: 15.0},
             "claude-opus-4-7":             {in: 15.0, out: 75.0},
+            "deepthought":                 {in: 0.0,  out: 0.0},
         };
 
         // Overlay the model selectors onto `_modelsData` so the model panel +
