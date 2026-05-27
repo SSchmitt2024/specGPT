@@ -58,6 +58,15 @@ DEFAULT_MAX_RETRIES = 3
 DEEPTHOUGHT_BASE_URL = "https://dtcontroller.sr.unh.edu:4242/openai/v1"
 DEEPTHOUGHT_MODEL = "Meta-Llama-3.1-8B-Instruct"
 
+
+class DeepThoughtUnreachableError(RuntimeError):
+    """Raised when DeepThought can't be contacted from this host.
+
+    Distinct from a transient API error so the orchestrator/UI can show a
+    network-specific message ("connect to UNH VPN") instead of a generic
+    "bad gateway." Always fail fast — retrying won't fix a VPN-off host.
+    """
+
 # The context block is wrapped in explicit delimiters so chunk text (which
 # originates from a PDF and may contain instruction-like sentences) is clearly
 # marked as untrusted data. The system prompt itself contains no user input;
@@ -424,7 +433,13 @@ def _call_deepthought(
             "Generate one at https://deepthought.usnh.edu/?id=usnh-int and add it to your .env."
         )
 
-    from openai import OpenAI, APIError, RateLimitError  # lazy import
+    from openai import (  # lazy import
+        APIConnectionError,
+        APIError,
+        APITimeoutError,
+        OpenAI,
+        RateLimitError,
+    )
 
     client = OpenAI(api_key=api_key, base_url=DEEPTHOUGHT_BASE_URL)
     last_err: Exception | None = None
@@ -441,6 +456,13 @@ def _call_deepthought(
                 ],
             )
             break
+        except (APIConnectionError, APITimeoutError) as e:
+            # Off-network (no campus / no VPN) or the gateway is down. Retrying
+            # won't fix either, so fail fast with a UI-facing hint.
+            raise DeepThoughtUnreachableError(
+                "Can't reach DeepThought at dtcontroller.sr.unh.edu — connect to "
+                "the USNH GlobalProtect VPN (or use campus Wi-Fi) and try again."
+            ) from e
         except (RateLimitError, APIError) as e:
             last_err = e
             sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
