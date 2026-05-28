@@ -800,20 +800,57 @@ FRONTEND_HTML = """<!DOCTYPE html>
             color: var(--text);
         }
 
-        /* ─── Agentic toggle row ──────────────────────────────────────── */
-        .agentic-row {
+        /* ─── Agentic toggle row (legacy — kept hidden so existing JS
+             that reads/writes #agentic-toggle still works) ─────────────── */
+        .agentic-row { display: none !important; }
+
+        /* ─── Square red robot button in the search bar ───────────────── */
+        .agentic-square-btn {
+            width: 36px;
+            height: 36px;
+            padding: 0;
+            background: #fff8f8;
+            color: #ef4444;
+            border: 1px solid #fecaca;
+            border-radius: var(--radius-sm);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.12s, border-color 0.12s, color 0.12s;
+            flex: 0 0 36px;
+        }
+        .agentic-square-btn:hover {
+            background: #fff1f1;
+            border-color: #fca5a5;
+            color: #dc2626;
+        }
+        .agentic-square-btn.active {
+            background: #ef4444;
+            border-color: #ef4444;
+            color: #fff;
+        }
+        .agentic-square-btn.active:hover {
+            background: #dc2626;
+            border-color: #dc2626;
+            color: #fff;
+        }
+        .agentic-square-btn svg { display: block; width: 20px; height: 20px; }
+
+        /* Enable-toggle row inside the agentic config popup */
+        .ag-config-enable-row {
             display: flex;
             align-items: center;
             gap: 10px;
-            margin-top: 8px;
             padding: 8px 12px;
             background: #fff8f8;
             border: 1px solid #fecaca;
             border-radius: var(--radius-sm);
             font-size: 12.5px;
             color: var(--text-subtle);
+            margin-bottom: 12px;
         }
-        .agentic-row label {
+        .ag-config-enable-row label {
             display: inline-flex;
             align-items: center;
             gap: 8px;
@@ -821,19 +858,15 @@ FRONTEND_HTML = """<!DOCTYPE html>
             font-weight: 500;
             color: var(--text);
         }
-        .agentic-row input[type="checkbox"] {
+        .ag-config-enable-row input[type="checkbox"] {
             transform: scale(1.05);
             cursor: pointer;
             accent-color: var(--accent);
         }
-        .agentic-row .agentic-hint {
+        .ag-config-enable-row .ag-config-enable-hint {
             color: var(--text-subtle);
             font-weight: 400;
-            font-size: 12px;
-        }
-        .agentic-row.active {
-            background: #fff1f1;
-            border-color: #fca5a5;
+            font-size: 11.5px;
         }
 
         .agentic-config {
@@ -1114,6 +1147,45 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
         .ag-confirm-btn-run:hover { background: #000; border-color: #000; }
 
+        /* ─── Agentic config popup (Edit config →) ───────────────────── */
+        .ag-config-overlay {
+            position: fixed; inset: 0; z-index: 9001;
+            background: rgba(15,23,42,0.25);
+            display: flex; align-items: center; justify-content: center;
+        }
+        .ag-config-overlay.hidden { display: none; }
+        .ag-config {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            box-shadow: 0 12px 40px rgba(15,23,42,0.18);
+            width: 560px; max-width: 94vw; max-height: 88vh;
+            display: flex; flex-direction: column;
+            font-size: 13px; color: #1e293b;
+        }
+        .ag-config-header {
+            padding: 16px 18px 10px;
+            border-bottom: 1px solid #f1f5f9;
+        }
+        .ag-config-title { font-weight: 700; font-size: 14.5px; }
+        .ag-config-sub { font-size: 12px; color: #64748b; margin-top: 2px; }
+        .ag-config-body {
+            padding: 14px 18px; overflow: auto; flex: 1 1 auto;
+        }
+        /* When agentic-config is hosted inside the popup, drop the colored
+           card chrome so the popup itself owns the surface. */
+        .ag-config-body .agentic-config {
+            background: transparent;
+            border: none;
+            padding: 0;
+            border-radius: 0;
+        }
+        .ag-config-footer {
+            padding: 12px 18px 16px;
+            border-top: 1px solid #f1f5f9;
+            display: flex; gap: 8px; justify-content: flex-end;
+        }
+
         /* inline status text used in agent strip (no pill/bubble) */
         .strip-status {
             font-size: 12.5px;
@@ -1183,6 +1255,37 @@ FRONTEND_HTML = """<!DOCTYPE html>
             margin-right: 6px;
         }
         .config-item.config-item-wide { grid-column: span 2; }
+
+        /* ─── Global model picker (top-right header) ─────────────────── */
+        .global-model-picker {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-muted);
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 4px 8px;
+        }
+        .global-model-picker-label {
+            font-weight: 500;
+            text-transform: uppercase;
+            font-size: 10.5px;
+            letter-spacing: 0.04em;
+            color: var(--text-subtle);
+        }
+        #global-model-select {
+            border: 0;
+            background: transparent;
+            color: var(--text);
+            font-size: 12.5px;
+            font-family: var(--font-sans);
+            cursor: pointer;
+            padding: 2px 0;
+            max-width: 260px;
+        }
+        #global-model-select:focus { outline: none; }
 
         /* ─── Loading row ─────────────────────────────────────────────── */
         .loading {
@@ -1308,6 +1411,19 @@ FRONTEND_HTML = """<!DOCTYPE html>
             line-height: 1.65;
             color: var(--text);
             font-size: 14.5px;
+        }
+        /* Blinking caret while text is rolling out, chatbot-style. */
+        .answer-text.streaming::after {
+            content: "▊";
+            display: inline-block;
+            margin-left: 1px;
+            color: var(--accent);
+            font-weight: 400;
+            animation: answer-caret-blink 0.9s steps(1) infinite;
+            vertical-align: baseline;
+        }
+        @keyframes answer-caret-blink {
+            50% { opacity: 0; }
         }
 
         .citations {
@@ -2091,9 +2207,15 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <h1>specGPT</h1>
                     <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
                 </div>
-                <form method="post" action="/logout" style="margin: 0;">
-                    <button type="submit" class="config-toggle">Sign out</button>
-                </form>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label class="global-model-picker" title="Sets both LLMs at once">
+                        <span class="global-model-picker-label">Model</span>
+                        <select id="global-model-select"></select>
+                    </label>
+                    <form method="post" action="/logout" style="margin: 0;">
+                        <button type="submit" class="config-toggle">Sign out</button>
+                    </form>
+                </div>
             </div>
             <div id="agent-strip" class="agent-strip" aria-label="Agent activity">
                 <span class="agent-strip-label">Agent</span>
@@ -2102,7 +2224,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         </div>
     </header>
 
-    <div class="container">
+    <div class="container"> 
         <div class="search-section">
             <div class="search-box">
                 <input
@@ -2112,6 +2234,20 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     autocomplete="off"
                 >
                 <button id="search-btn">Search</button>
+                <button id="agentic-square-btn" class="agentic-square-btn" type="button"
+                        title="Agentic mode — click to configure" aria-label="Agentic mode">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <line x1="12" y1="3" x2="12" y2="6"/>
+                        <circle cx="12" cy="2.5" r="1" fill="currentColor" stroke="none"/>
+                        <rect x="4" y="7" width="16" height="12" rx="2.5"/>
+                        <circle cx="9" cy="13" r="1.4" fill="currentColor" stroke="none"/>
+                        <circle cx="15" cy="13" r="1.4" fill="currentColor" stroke="none"/>
+                        <line x1="10" y1="16.5" x2="14" y2="16.5"/>
+                        <line x1="3" y1="13" x2="4" y2="13"/>
+                        <line x1="20" y1="13" x2="21" y2="13"/>
+                    </svg>
+                </button>
                 <button id="config-toggle" class="config-toggle">Config</button>
             </div>
 
@@ -2131,21 +2267,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 <div class="config-grid">
                     <div class="config-item config-item-wide">
                         <label>Agentic LLM</label>
-                        <select id="config-agentic_model">
-                            <optgroup label="Gemini (Google)">
-                                <option value="gemini-2.0-flash">Gemini 2.0 Flash (cheapest)</option>
-                                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                                <option value="gemini-2.5-pro">Gemini 2.5 Pro (most capable)</option>
-                            </optgroup>
-                            <optgroup label="Claude (Anthropic)">
-                                <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
-                                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                                <option value="claude-opus-4-7" selected>Claude Opus 4.7 (default)</option>
-                            </optgroup>
-                            <optgroup label="UNH Models">
-                                <option value="deepthought">DeepThought (free)</option>
-                            </optgroup>
-                        </select>
+                        <select id="config-agentic_model" data-model-select="agentic"></select>
                     </div>
                     <div class="config-item">
                         <label>Max Follow-ups</label>
@@ -2181,22 +2303,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 <div class="config-grid">
                     <div class="config-item config-item-wide">
                         <label>Regular LLM</label>
-                        <select id="config-llm_model">
-                            <optgroup label="Gemini (Google)">
-                                <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (cheapest)</option>
-                                <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                            </optgroup>
-                            <optgroup label="Claude (Anthropic)">
-                                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (fastest)</option>
-                                <option value="claude-sonnet-4-5" selected>Claude Sonnet 4.5 (default)</option>
-                                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                                <option value="claude-opus-4-7">Claude Opus 4.7 (most capable)</option>
-                            </optgroup>
-                            <optgroup label="UNH Models">
-                                <option value="deepthought">DeepThought (free)</option>
-                            </optgroup>
-                        </select>
+                        <select id="config-llm_model" data-model-select="llm"></select>
                     </div>
                     <div class="config-item">
                         <label>Vector Top-K</label>
@@ -2357,7 +2464,33 @@ FRONTEND_HTML = """<!DOCTYPE html>
             <div class="ag-confirm-actions">
                 <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-confirm-cancel">Cancel</button>
                 <button class="ag-confirm-btn ag-confirm-btn-edit" id="ag-confirm-edit">Edit config</button>
-                <button class="ag-confirm-btn ag-confirm-btn-run" id="ag-confirm-run">Run &#8594;</button>
+                <button class="ag-confirm-btn ag-confirm-btn-run" id="ag-confirm-run">Confirm &#8594;</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Agentic config editor popup (opened by "Edit config") -->
+    <div id="ag-config-overlay" class="ag-config-overlay hidden" role="dialog" aria-modal="true">
+        <div class="ag-config">
+            <div class="ag-config-header">
+                <div class="ag-config-title">Agentic refinement config</div>
+                <div class="ag-config-sub">Tweak these settings, then run.</div>
+            </div>
+            <div class="ag-config-body" id="ag-config-body">
+                <div class="ag-config-enable-row">
+                    <label>
+                        <input type="checkbox" id="ag-config-enable">
+                        <span>Enable agentic mode</span>
+                    </label>
+                    <span class="ag-config-enable-hint">
+                        Decomposes the answer, runs follow-up retrieval, then regenerates with the agentic model (~30–60s, ~10× cost).
+                    </span>
+                </div>
+                <!-- agentic-config is reparented in here while the popup is open -->
+            </div>
+            <div class="ag-config-footer">
+                <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-config-cancel">Cancel</button>
+                <button class="ag-confirm-btn ag-confirm-btn-run" id="ag-config-run">Run &#8594;</button>
             </div>
         </div>
     </div>
@@ -2441,23 +2574,120 @@ FRONTEND_HTML = """<!DOCTYPE html>
             return "$" + dollars.toFixed(4);
         }
 
-        // Per-1M pricing for each selectable Claude model. Kept client-side so
-        // the model panel can update the cost calc as soon as the user picks
-        // a different model — no extra round-trip needed. Numbers track
-        // Anthropic's public pricing pages at the time of writing.
-        const MODEL_PRICING = {
+        // Single source of truth for selectable models. Both dropdowns and the
+        // top-right global model picker render the exact same option list,
+        // grouped by provider. Tags ("cheapest"/"fastest") are computed
+        // per-provider from the price/latency fields so changing this catalog
+        // automatically refreshes the badges everywhere.
+        //
+        //   in/out      — per-1M-token prices (USD)
+        //   label       — short display name
+        //   defaultFor  — which select(s) default to this model
+        //   tags        — additional tags surfaced in the label
+        const MODEL_CATALOG = [
             // Gemini (Google) — cheapest → most expensive
-            "gemini-2.0-flash-lite": {in: 0.075, out: 0.30},
-            "gemini-2.0-flash":      {in: 0.10,  out: 0.40},
-            "gemini-2.5-flash":      {in: 0.15,  out: 0.60},
-            "gemini-2.5-pro":        {in: 1.25,  out: 10.0},
+            {id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite", provider: "Gemini (Google)", in: 0.075, out: 0.30,  speed: 1, tags: []},
+            {id: "gemini-2.0-flash",      label: "Gemini 2.0 Flash",      provider: "Gemini (Google)", in: 0.10,  out: 0.40,  speed: 2, tags: []},
+            {id: "gemini-2.5-flash",      label: "Gemini 2.5 Flash",      provider: "Gemini (Google)", in: 0.15,  out: 0.60,  speed: 3, tags: []},
+            {id: "gemini-2.5-pro",        label: "Gemini 2.5 Pro",        provider: "Gemini (Google)", in: 1.25,  out: 10.0,  speed: 7, tags: ["most capable"]},
             // Claude (Anthropic)
-            "claude-haiku-4-5-20251001":  {in: 1.0,  out: 5.0},
-            "claude-sonnet-4-5":           {in: 3.0,  out: 15.0},
-            "claude-sonnet-4-6":           {in: 3.0,  out: 15.0},
-            "claude-opus-4-7":             {in: 15.0, out: 75.0},
-            "deepthought":                 {in: 0.0,  out: 0.0},
-        };
+            {id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  provider: "Claude (Anthropic)", in: 1.0,  out: 5.0,   speed: 1, tags: []},
+            {id: "claude-sonnet-4-5",         label: "Claude Sonnet 4.5", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: [], defaultFor: ["llm"]},
+            {id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: []},
+            {id: "claude-opus-4-7",           label: "Claude Opus 4.7",   provider: "Claude (Anthropic)", in: 15.0, out: 75.0,  speed: 8, tags: ["most capable"], defaultFor: ["agentic"]},
+            // OpenAI
+            {id: "gpt-4o-mini",  label: "GPT-4o mini",  provider: "OpenAI", in: 0.15, out: 0.60,  speed: 1, tags: []},
+            {id: "gpt-4o",       label: "GPT-4o",       provider: "OpenAI", in: 2.50, out: 10.0,  speed: 3, tags: []},
+            {id: "gpt-4.1-mini", label: "GPT-4.1 mini", provider: "OpenAI", in: 0.40, out: 1.60,  speed: 2, tags: []},
+            {id: "gpt-4.1",      label: "GPT-4.1",      provider: "OpenAI", in: 2.00, out: 8.00,  speed: 4, tags: []},
+            {id: "gpt-5-mini",   label: "GPT-5 mini",   provider: "OpenAI", in: 0.25, out: 2.00,  speed: 2, tags: []},
+            {id: "gpt-5",        label: "GPT-5",        provider: "OpenAI", in: 1.25, out: 10.0,  speed: 6, tags: ["most capable"]},
+            // UNH
+            {id: "deepthought", label: "DeepThought", provider: "UNH Models", in: 0.0, out: 0.0, speed: 5, tags: ["free"]},
+        ];
+
+        // Tag the per-provider cheapest (by input price) and fastest (by speed
+        // rank) so the dropdown labels surface the obvious picks at a glance.
+        (function _annotateCatalog() {
+            const byProvider = {};
+            for (const m of MODEL_CATALOG) {
+                (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
+            }
+            for (const list of Object.values(byProvider)) {
+                if (list.length < 2) continue;
+                const cheapest = list.reduce((a, b) => (a.in <= b.in ? a : b));
+                const fastest  = list.reduce((a, b) => (a.speed <= b.speed ? a : b));
+                if (cheapest.in > 0) cheapest.tags = [...cheapest.tags, "cheapest"];
+                if (fastest !== cheapest) fastest.tags = [...fastest.tags, "fastest"];
+            }
+        })();
+
+        const MODEL_PRICING = Object.fromEntries(
+            MODEL_CATALOG.map(m => [m.id, {in: m.in, out: m.out}])
+        );
+
+        // Build the same set of <optgroup>/<option> entries for any select.
+        // Pulls default selection from `defaultFor` so both dropdowns can share
+        // this catalog while keeping their own per-role defaults.
+        function _modelOptionLabel(m) {
+            return m.tags.length ? `${m.label} (${m.tags.join(", ")})` : m.label;
+        }
+        function populateModelSelect(selectEl, role) {
+            if (!selectEl) return;
+            const byProvider = {};
+            for (const m of MODEL_CATALOG) {
+                (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
+            }
+            // Stable provider order matching the catalog declaration.
+            const providerOrder = [];
+            for (const m of MODEL_CATALOG) {
+                if (!providerOrder.includes(m.provider)) providerOrder.push(m.provider);
+            }
+            let html = "";
+            let defaultId = null;
+            for (const provider of providerOrder) {
+                html += `<optgroup label="${provider}">`;
+                for (const m of byProvider[provider]) {
+                    const isDefault = role && m.defaultFor && m.defaultFor.includes(role);
+                    if (isDefault) defaultId = m.id;
+                    html += `<option value="${m.id}">${_modelOptionLabel(m)}</option>`;
+                }
+                html += `</optgroup>`;
+            }
+            selectEl.innerHTML = html;
+            if (defaultId) selectEl.value = defaultId;
+        }
+
+        // Render all three model selects from the same catalog.
+        populateModelSelect(document.getElementById("config-llm_model"),     "llm");
+        populateModelSelect(document.getElementById("config-agentic_model"), "agentic");
+        populateModelSelect(document.getElementById("global-model-select"),  "llm");
+
+        // Top-right global picker: sets both LLMs at once. Fires a change
+        // event on each underlying select so all dependent UI (cost panel,
+        // model table) recomputes via existing listeners.
+        (function _wireGlobalModelPicker() {
+            const globalEl = document.getElementById("global-model-select");
+            if (!globalEl) return;
+            globalEl.addEventListener("change", () => {
+                const id = globalEl.value;
+                for (const targetId of ["config-llm_model", "config-agentic_model"]) {
+                    const el = document.getElementById(targetId);
+                    if (!el) continue;
+                    el.value = id;
+                    el.dispatchEvent(new Event("change", {bubbles: true}));
+                }
+            });
+            // Keep the global picker in sync if the user changes either of the
+            // panel selects directly. Whichever was changed last wins.
+            for (const targetId of ["config-llm_model", "config-agentic_model"]) {
+                const el = document.getElementById(targetId);
+                if (!el) continue;
+                el.addEventListener("change", () => {
+                    if (globalEl.value !== el.value) globalEl.value = el.value;
+                });
+            }
+        })();
 
         // Overlay the model selectors onto `_modelsData` so the model panel +
         // cost calc reflect whatever the user picked. No-op until both the
@@ -2465,6 +2695,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         function _modelProvider(id) {
             if (!id) return "Anthropic";
             if (id.startsWith("gemini-")) return "Google";
+            if (id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) return "OpenAI";
             if (id === "deepthought") return "DeepThought";
             return "Anthropic";
         }
@@ -2513,27 +2744,84 @@ FRONTEND_HTML = """<!DOCTYPE html>
             }).join("");
         }
 
+        // Cost = Σ over every LLM call in the response. Each call carries its
+        // own model so query-processor / gap-analysis (cheap Gemini) and the
+        // final generation (Claude/Opus/etc.) get priced separately. Falls
+        // back to the legacy single-model calc when the server hasn't sent a
+        // per-call breakdown.
+        function _costForCall(call) {
+            const price = MODEL_PRICING[call.model] || {in: 0, out: 0};
+            const inCost  = ((call.prompt     || 0) / 1e6) * price.in;
+            const outCost = ((call.completion || 0) / 1e6) * price.out;
+            return {inCost, outCost, total: inCost + outCost};
+        }
+        function _stageLabel(stage) {
+            const s = String(stage || "");
+            if (s === "query_processor")                  return "Query processor";
+            if (s === "generation")                        return "Generation";
+            if (s === "gap_hint")                          return "Gap hint";
+            if (s.startsWith("agentic.gap_analysis"))      return "Gap analysis";
+            if (s.startsWith("agentic.regenerate"))         return "Regenerate (agentic)";
+            if (s.startsWith("agentic.followup_decomp"))    return "Follow-up decompose";
+            return s.replace(/\\.iter\\d+$/, "");
+        }
         function renderModelCost(tokensUsed, isAgentic) {
             if (!tokensUsed || !_modelsData) return;
-            const llm = isAgentic ? _modelsData.agentic_llm : _modelsData.llm;
-            if (!llm) return;
-            const inCost  = (tokensUsed.prompt     / 1e6) * llm.price_per_1m_input;
-            const outCost = (tokensUsed.completion  / 1e6) * llm.price_per_1m_output;
-            const total   = inCost + outCost;
+            const calls = Array.isArray(tokensUsed.calls) ? tokensUsed.calls : null;
+
+            let totalIn = 0, totalOut = 0, totalCost = 0;
+            const perStage = [];
+
+            if (calls && calls.length) {
+                for (const c of calls) {
+                    const {total} = _costForCall(c);
+                    totalIn   += (c.prompt     || 0);
+                    totalOut  += (c.completion || 0);
+                    totalCost += total;
+                    perStage.push({
+                        stage: _stageLabel(c.stage),
+                        model: c.model || "(unknown)",
+                        prompt: c.prompt || 0,
+                        completion: c.completion || 0,
+                        cost: total,
+                    });
+                }
+            } else {
+                // Legacy fallback: single-model calc using the active panel model.
+                const llm = isAgentic ? _modelsData.agentic_llm : _modelsData.llm;
+                if (!llm) return;
+                totalIn   = tokensUsed.prompt     || 0;
+                totalOut  = tokensUsed.completion || 0;
+                totalCost = (totalIn / 1e6) * llm.price_per_1m_input
+                          + (totalOut / 1e6) * llm.price_per_1m_output;
+            }
 
             const badge = document.getElementById("model-cost-badge");
-            badge.textContent = _fmtCost(total) + " / query";
+            badge.textContent = _fmtCost(totalCost) + " / query";
             badge.style.display = "";
 
             const row = document.getElementById("model-cost-row");
             row.style.display = "flex";
+            row.style.flexWrap = "wrap";
+            const stageHtml = perStage.length
+                ? `<div style="flex-basis:100%; margin-top:6px; padding-top:6px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:3px;">
+                    ${perStage.map(s => `
+                        <div style="display:flex; gap:8px; font-size:11.5px; color:var(--text-muted); align-items:baseline;">
+                            <span style="min-width:160px;">${escapeHtml(s.stage)}</span>
+                            <code style="font-size:11px;">${escapeHtml(s.model)}</code>
+                            <span style="margin-left:auto;">${s.prompt.toLocaleString()} in · ${s.completion.toLocaleString()} out</span>
+                            <span class="model-cost-total" style="min-width:72px; text-align:right;">${_fmtCost(s.cost)}</span>
+                        </div>`).join("")}
+                  </div>`
+                : "";
             row.innerHTML = `
                 <span class="model-cost-label">Last query:</span>
-                <span>${tokensUsed.prompt.toLocaleString()} in → ${_fmtCost(inCost)}</span>
+                <span>${totalIn.toLocaleString()} in</span>
                 <span class="model-cost-sep">+</span>
-                <span>${tokensUsed.completion.toLocaleString()} out → ${_fmtCost(outCost)}</span>
+                <span>${totalOut.toLocaleString()} out</span>
                 <span class="model-cost-sep">=</span>
-                <span class="model-cost-total">${_fmtCost(total)}</span>
+                <span class="model-cost-total">${_fmtCost(totalCost)}</span>
+                ${stageHtml}
             `;
         }
 
@@ -3151,10 +3439,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
             // light tints to keep stage families distinguishable but quiet.
             L.push("  classDef input    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
             L.push("  classDef output   fill:#ffffff,color:#15803d,stroke:#15803d,stroke-width:1.5px,rx:8,ry:8");
-            L.push("  classDef stage_qp     fill:#fafaf9,color:#1c1917,stroke:#d6d3d1,stroke-width:1px,rx:5,ry:5");
+            L.push("  classDef stage_qp     fill:#fdf4ff,color:#581c87,stroke:#e9d5ff,stroke-width:1px,rx:5,ry:5");
             L.push("  classDef stage_struct fill:#f0fdf4,color:#166534,stroke:#bbf7d0,stroke-width:1px,rx:5,ry:5");
             L.push("  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5");
-            L.push("  classDef stage_subq   fill:#fafaf9,color:#57534e,stroke:#d6d3d1,stroke-width:1px");
+            L.push("  classDef stage_subq   fill:#f0f9ff,color:#0c4a6e,stroke:#bae6fd,stroke-width:1px,rx:5,ry:5");
             L.push("  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5");
             L.push("  classDef stage_tsv    fill:#ecfeff,color:#155e75,stroke:#a5f3fc,stroke-width:1px,rx:5,ry:5");
             L.push("  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5");
@@ -3320,6 +3608,125 @@ FRONTEND_HTML = """<!DOCTYPE html>
             _agConfirmCallback = null;
         }
 
+        // Remembers where agentic-config came from so we can put it back
+        // after the config popup closes.
+        let _agConfigOrigParent = null;
+        let _agConfigOrigNext = null;
+        let _agConfigWasHidden = false;
+        // Snapshot of input values at popup-open, used to revert on Cancel.
+        let _agConfigSnapshot = null;
+
+        // IDs of every agentic-* input the popup edits. Stays in sync with
+        // the cost-estimator's COST_INPUT_IDS subset for agentic settings.
+        const _AG_CONFIG_INPUT_IDS = [
+            "config-agentic_model",
+            "config-agentic_max_followups",
+            "config-agentic_rerank_topk",
+            "config-agentic_max_context_tokens",
+            "config-agentic_max_output_tokens",
+            "config-agentic_targeted_fetch",
+            "config-agentic_recursive",
+            "config-agentic_max_iterations",
+        ];
+
+        function _snapshotAgenticConfig() {
+            const snap = { agenticToggle: false, inputs: {} };
+            const tog = document.getElementById("agentic-toggle");
+            snap.agenticToggle = !!(tog && tog.checked);
+            _AG_CONFIG_INPUT_IDS.forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                snap.inputs[id] = el.type === "checkbox" ? el.checked : el.value;
+            });
+            return snap;
+        }
+
+        function _restoreAgenticConfig(snap) {
+            if (!snap) return;
+            _AG_CONFIG_INPUT_IDS.forEach(id => {
+                const el = document.getElementById(id);
+                if (!el || !(id in snap.inputs)) return;
+                const v = snap.inputs[id];
+                if (el.type === "checkbox") {
+                    if (el.checked !== v) el.checked = v;
+                } else {
+                    if (el.value !== v) el.value = v;
+                }
+            });
+            const tog = document.getElementById("agentic-toggle");
+            if (tog && tog.checked !== snap.agenticToggle) {
+                tog.checked = snap.agenticToggle;
+                tog.dispatchEvent(new Event("change"));
+            }
+            // Recompute cost estimator after a bulk revert.
+            if (typeof renderCostEstimate === "function") renderCostEstimate();
+        }
+
+        function openAgenticConfigPopup() {
+            const agConfig = document.getElementById("agentic-config");
+            const body = document.getElementById("ag-config-body");
+            if (!agConfig || !body) return;
+            // Snapshot first so any in-popup edits can be reverted on Cancel.
+            _agConfigSnapshot = _snapshotAgenticConfig();
+            // Stash the original DOM position + visibility so we can restore.
+            _agConfigOrigParent = agConfig.parentNode;
+            _agConfigOrigNext = agConfig.nextSibling;
+            _agConfigWasHidden = agConfig.classList.contains("hidden");
+            // Force visible while it lives inside the popup.
+            agConfig.classList.remove("hidden");
+            body.appendChild(agConfig);
+            // Sync the popup's enable checkbox with the hidden agentic-toggle.
+            // (Staged only — does not commit until "Done" / "Run".)
+            const enable = document.getElementById("ag-config-enable");
+            const tog = document.getElementById("agentic-toggle");
+            if (enable && tog) enable.checked = tog.checked;
+            // Primary button label: "Run →" when there's a refinement
+            // callback waiting, "Done" otherwise.
+            const runBtn = document.getElementById("ag-config-run");
+            if (runBtn) runBtn.innerHTML = _agConfirmCallback ? "Run &#8594;" : "Done";
+            document.getElementById("ag-config-overlay").classList.remove("hidden");
+        }
+
+        function _syncAgenticSquareBtn() {
+            const btn = document.getElementById("agentic-square-btn");
+            const tog = document.getElementById("agentic-toggle");
+            if (btn && tog) btn.classList.toggle("active", tog.checked);
+        }
+
+        // Hide the popup and return agentic-config to its home in the page.
+        function _detachAgenticConfigPopup() {
+            const agConfig = document.getElementById("agentic-config");
+            if (agConfig && _agConfigOrigParent) {
+                _agConfigOrigParent.insertBefore(agConfig, _agConfigOrigNext);
+                const agToggle = document.getElementById("agentic-toggle");
+                const shouldHide = agToggle ? !agToggle.checked : _agConfigWasHidden;
+                agConfig.classList.toggle("hidden", shouldHide);
+            }
+            _agConfigOrigParent = null;
+            _agConfigOrigNext = null;
+            document.getElementById("ag-config-overlay").classList.add("hidden");
+        }
+
+        function cancelAgenticConfigPopup() {
+            // Revert any in-popup edits, then close.
+            _restoreAgenticConfig(_agConfigSnapshot);
+            _agConfigSnapshot = null;
+            _detachAgenticConfigPopup();
+        }
+
+        function commitAgenticConfigPopup() {
+            // Commit the staged "Enable agentic mode" checkbox to the
+            // hidden #agentic-toggle, fan its change event out to the UI.
+            const enable = document.getElementById("ag-config-enable");
+            const tog = document.getElementById("agentic-toggle");
+            if (enable && tog && enable.checked !== tog.checked) {
+                tog.checked = enable.checked;
+                tog.dispatchEvent(new Event("change"));
+            }
+            _agConfigSnapshot = null;
+            _detachAgenticConfigPopup();
+        }
+
         document.addEventListener("DOMContentLoaded", () => {
             document.getElementById("ag-confirm-cancel").addEventListener("click", closeAgenticConfirm);
             document.getElementById("ag-confirm-run").addEventListener("click", () => {
@@ -3328,23 +3735,38 @@ FRONTEND_HTML = """<!DOCTYPE html>
             });
             document.getElementById("ag-confirm-edit").addEventListener("click", () => {
                 closeAgenticConfirm();
-                const panel = document.getElementById("config-panel");
-                const toggle = document.getElementById("config-toggle");
-                if (panel && !panel.classList.contains("open")) {
-                    panel.classList.add("open");
-                }
-                // Ensure agentic config is visible
-                const agToggle = document.getElementById("agentic-toggle");
-                if (agToggle && !agToggle.checked) {
-                    agToggle.checked = true;
-                    agToggle.dispatchEvent(new Event("change"));
-                }
-                document.getElementById("agentic-config")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                openAgenticConfigPopup();
             });
             // Click outside to dismiss
             document.getElementById("ag-confirm-overlay").addEventListener("click", e => {
                 if (e.target === e.currentTarget) closeAgenticConfirm();
             });
+
+            // Config popup wiring — Cancel reverts in-popup edits; Done/Run
+            // commits them. Edits are NOT applied until commit.
+            document.getElementById("ag-config-cancel").addEventListener("click", () => {
+                cancelAgenticConfigPopup();
+                _agConfirmCallback = null;
+            });
+            document.getElementById("ag-config-run").addEventListener("click", () => {
+                const cb = _agConfirmCallback;
+                commitAgenticConfigPopup();
+                _agConfirmCallback = null;
+                if (cb) cb();
+            });
+            document.getElementById("ag-config-overlay").addEventListener("click", e => {
+                if (e.target === e.currentTarget) {
+                    cancelAgenticConfigPopup();
+                    _agConfirmCallback = null;
+                }
+            });
+
+            // Square red robot button → opens the same agentic config popup.
+            const sqBtn = document.getElementById("agentic-square-btn");
+            if (sqBtn) sqBtn.addEventListener("click", openAgenticConfigPopup);
+
+            // Initial visual sync.
+            _syncAgenticSquareBtn();
         });
 
         // Wire up drag on popup header once the DOM is ready.
@@ -3418,6 +3840,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
         agenticToggle.addEventListener("change", () => {
             agenticRow.classList.toggle("active", agenticToggle.checked);
             agenticConfig.classList.toggle("hidden", !agenticToggle.checked);
+            _syncAgenticSquareBtn();
+            // Keep the popup's enable checkbox in sync if it's open.
+            const enable = document.getElementById("ag-config-enable");
+            if (enable) enable.checked = agenticToggle.checked;
         });
 
         // Config panel toggle
@@ -3572,16 +3998,63 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 .replace(/'/g, "&#39;");
         }
 
+        // Holds the cancel function for the in-flight typewriter roll-out
+        // so a follow-up query / refine can abort the previous animation.
+        let _cancelAnswerStream = null;
+
+        // Progressively reveal `fullText` into `el`. Re-renders markdown each
+        // tick so partial syntax doesn't show through. Fast by default — the
+        // intent is "chatbot rollout", not a leisurely typewriter.
+        function streamAnswerInto(el, fullText, opts = {}) {
+            const charsPerTick = opts.charsPerTick ?? 6;
+            const tickMs       = opts.tickMs       ?? 20;
+            const useMd = (typeof marked !== "undefined" && typeof DOMPurify !== "undefined");
+            let i = 0;
+            let cancelled = false;
+            let timer = null;
+            el.classList.add("streaming");
+            function step() {
+                if (cancelled) return;
+                i = Math.min(fullText.length, i + charsPerTick);
+                const slice = fullText.slice(0, i);
+                if (useMd) {
+                    el.innerHTML = renderMarkdown(slice);
+                } else {
+                    el.textContent = slice;
+                }
+                if (i < fullText.length) {
+                    timer = setTimeout(step, tickMs);
+                } else {
+                    el.classList.remove("streaming");
+                }
+            }
+            step();
+            return () => {
+                cancelled = true;
+                if (timer) clearTimeout(timer);
+                // Flush to the full text so the user keeps the complete answer.
+                if (useMd) {
+                    el.innerHTML = renderMarkdown(fullText);
+                } else {
+                    el.textContent = fullText;
+                }
+                el.classList.remove("streaming");
+            };
+        }
+
         function displayResults(data) {
             // Render the answer through marked → DOMPurify so markdown tables,
             // headers, code blocks, and lists display the way Claude.ai does.
             // textContent fallback if either lib failed to load (network issue,
             // CDN block, offline) so the user still sees the raw answer.
             const answerEl = document.getElementById("answer-text");
+            // Cancel any prior in-flight roll-out before starting a new one.
+            if (_cancelAnswerStream) { _cancelAnswerStream(); _cancelAnswerStream = null; }
+            const answerText = data.answer || "";
             if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
-                answerEl.innerHTML = renderMarkdown(data.answer || "");
+                _cancelAnswerStream = streamAnswerInto(answerEl, answerText);
             } else {
-                answerEl.textContent = data.answer || "";
+                answerEl.textContent = answerText;
             }
             document.getElementById("latency").textContent = `${data.latency_ms.toFixed(0)}ms`;
 

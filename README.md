@@ -6,26 +6,20 @@ A web app for intelligent querying of the public NVMe specification. Type a ques
 
 An independent Q&A system over the NVMe spec (800+ pages, heavily cross-referential). Custom spec parser, self-built knowledge graph, hybrid retrieval, LLM generation with inline section citations.
 
-Built on publicly available NVMe specifications from nvmexpress.org. No proprietary data.
+Built on publicly available NVMe specifications from nvmexpress.org.
 
 ## How it works
 
-1. **Parse** — tables, prose, cross-references, and metadata extracted from the spec PDF
-2. **Graph** — entities and relationships stored in a NetworkX knowledge graph
-3. **Index** — definition-enriched chunks embedded into Supabase (pgvector + BM25)
-4. **Retrieve** — hybrid search: BM25 + vector + graph expansion + cross-encoder rerank
-5. **Generate** — Claude Sonnet answers with strict grounding and section citations
+1. **Parse** — tables, prose, cross-references, definitions, TOC, enriched summaries, and metadata extracted from the spec PDF
+2. **Index** — definition-enriched chunks embedded into Supabase (pgvector + BM25 + tsvector), parsed tables, and parsed fields
+3. **Retrieve** — first querey decomposition occurs then, hybrid search: BM25 + vector + graph expansion + cross-encoder rerank as well as RRF
+4. **Generate** — A selected LLM will answer prompts with strict grounding and section citations
+5. **Agentic** - A configurable agent loop that can: perfom gap analyis, request follow up data, and can recurse into another cycle.
 
 ## Stack
 
-Python · NetworkX · Supabase (pgvector) · Claude (Sonnet + Haiku) · FastAPI · Docker
-
-## Status
-
-Pre-prototype. Building toward a 1-month milestone: live website with cited answers and a documented eval score.
+Python · Supabase · Multiple LLM API · FastAPI · Docker 
 
 See [BUILD_PLAN_FINAL.md](BUILD_PLAN_FINAL.md) for phase-by-phase detail.
 
-## Principle
 
-AI-driven, not vibecoded. A project to learn from, not just direct.

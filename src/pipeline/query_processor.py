@@ -76,6 +76,11 @@ class QueryDecomposition:
     entities: list[Entity] = field(default_factory=list)
     sub_queries: list[str] = field(default_factory=list)
     rationale: str = ""
+    # LLM calls made to produce this decomposition. Each entry is
+    # {"stage": str, "model": str, "prompt": int, "completion": int}.
+    # The orchestrator aggregates these into the final per-query token total
+    # so the cost panel reflects every LLM call, not just the answer call.
+    llm_calls: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -320,11 +325,13 @@ def classify_and_decompose(
     model: str | None = None,
     max_subqueries: int = 3,
     max_attempts: int = 2,
-) -> tuple[str, list[str], str]:
+) -> tuple[str, list[str], str, dict | None]:
     """Single LLM call with one retry on transient/parse failures.
 
-    Returns (type, sub_queries, rationale). Raises the last exception if
-    all attempts fail — caller decides whether to fall back to heuristics.
+    Returns (type, sub_queries, rationale, llm_call). ``llm_call`` is a
+    {"model","prompt","completion"} dict for token accounting, or None on
+    failure. Raises the last exception if all attempts fail — caller decides
+    whether to fall back to heuristics.
     """
     user_prompt = _build_user_prompt(query, entities)
     kwargs = {
@@ -338,8 +345,16 @@ def classify_and_decompose(
     last: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            parsed, _result = generate_json(user_prompt, **kwargs)
-            return _normalize_llm_output(parsed, query, max_subqueries=max_subqueries)
+            parsed, result = generate_json(user_prompt, **kwargs)
+            qtype, sub_queries, rationale = _normalize_llm_output(
+                parsed, query, max_subqueries=max_subqueries
+            )
+            call = {
+                "model": getattr(result, "model", None) or "",
+                "prompt": int(getattr(result, "prompt_tokens", 0) or 0),
+                "completion": int(getattr(result, "output_tokens", 0) or 0),
+            }
+            return qtype, sub_queries, rationale, call
         except Exception as e:  # noqa: BLE001
             last = e
             if attempt < max_attempts - 1:
@@ -439,7 +454,7 @@ def process_query(
         return _heuristic_result(query, entities, "no-llm mode")
 
     try:
-        qtype, sub_queries, rationale = classify_and_decompose(
+        qtype, sub_queries, rationale, call = classify_and_decompose(
             query,
             entities,
             model=model,
@@ -450,12 +465,17 @@ def process_query(
             raise
         return _heuristic_result(query, entities, f"LLM call failed ({type(e).__name__})")
 
+    llm_calls = []
+    if call:
+        llm_calls.append({"stage": "query_processor", **call})
+
     return QueryDecomposition(
         query=query,
         type=qtype,
         entities=entities,
         sub_queries=sub_queries,
         rationale=rationale,
+        llm_calls=llm_calls,
     )
 
 

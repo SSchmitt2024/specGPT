@@ -500,6 +500,80 @@ def _call_deepthought(
     return answer, tokens_used
 
 
+def _call_openai(
+    query: str,
+    system_prompt: str,
+    *,
+    model: str,
+    max_tokens: int,
+    max_retries: int,
+) -> tuple[str, dict]:
+    """Call OpenAI's chat completions API and return (answer, tokens_used)."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Get a key at https://platform.openai.com/api-keys and add it to your .env."
+        )
+
+    from openai import (  # lazy import
+        APIError,
+        OpenAI,
+        RateLimitError,
+    )
+
+    client = OpenAI(api_key=api_key)
+    last_err: Exception | None = None
+    response = None
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+            )
+            break
+        except (RateLimitError, APIError) as e:
+            last_err = e
+            sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+            logger.warning(
+                "OpenAI call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, max_retries, e, sleep,
+            )
+            time.sleep(sleep)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            sleep = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+            logger.warning(
+                "OpenAI call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, max_retries, e, sleep,
+            )
+            time.sleep(sleep)
+    else:
+        assert last_err is not None
+        raise last_err
+
+    choice = response.choices[0]
+    answer = choice.message.content or ""
+
+    stop_reason = getattr(choice, "finish_reason", None)
+    if stop_reason == "length":
+        answer = f"{answer}\n\n[Answer truncated: hit max_tokens={max_tokens}.]"
+        stop_reason = "max_tokens"
+
+    usage = getattr(response, "usage", None)
+    tokens_used = {
+        "prompt": getattr(usage, "prompt_tokens", 0) if usage else 0,
+        "completion": getattr(usage, "completion_tokens", 0) if usage else 0,
+        "stop_reason": stop_reason,
+    }
+    return answer, tokens_used
+
+
 def generate(
     query: str,
     context_chunks: list[dict],
@@ -576,6 +650,15 @@ def generate(
     elif model.startswith("gemini-"):
         # ── Google Gemini path ─────────────────────────────────────────
         answer, tokens_used = _call_gemini(
+            query,
+            full_system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+        )
+    elif model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
+        # ── OpenAI path (gpt-*, o1-*, o3-*, o4-*) ──────────────────────
+        answer, tokens_used = _call_openai(
             query,
             full_system_prompt,
             model=model,

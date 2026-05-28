@@ -358,12 +358,14 @@ def _agentic_gap_analysis(
     used_chunks: list[dict],
     citations: list[dict],
     max_followups: int,
-) -> tuple[list[str], str, dict[str, list[str]]]:
+) -> tuple[list[str], str, dict[str, list[str]], dict | None]:
     """Ask the classifier LLM if follow-up retrieval is needed.
 
-    Returns ``(followup_queries, reason, requested_resources)``. On any
-    failure, returns ``([], "<failure note>", {empty})`` so the agentic loop
-    falls back to the single-pass answer.
+    Returns ``(followup_queries, reason, requested_resources, llm_call)``.
+    ``llm_call`` is a {"model","prompt","completion"} dict for token
+    accounting, or None on failure. On any failure, returns
+    ``([], "<failure note>", {empty}, None)`` so the agentic loop falls back
+    to the single-pass answer.
     """
     used_titles = "\n".join(
         f"  - [{c.get('section_id','?')}] {c.get('section_title','')}"
@@ -384,7 +386,7 @@ def _agentic_gap_analysis(
     )
 
     try:
-        parsed, _ = query_processor.generate_json(  # via the LLM client
+        parsed, result = query_processor.generate_json(  # via the LLM client
             user_prompt,
             system=_AGENTIC_GAP_SYSTEM,
             temperature=0.0,
@@ -392,10 +394,16 @@ def _agentic_gap_analysis(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("agentic gap-analysis failed: %s", e)
-        return [], f"gap-analysis failed ({type(e).__name__})", {"figures": [], "fields": [], "sections": []}
+        return [], f"gap-analysis failed ({type(e).__name__})", {"figures": [], "fields": [], "sections": []}, None
+
+    call = {
+        "model": getattr(result, "model", None) or "",
+        "prompt": int(getattr(result, "prompt_tokens", 0) or 0),
+        "completion": int(getattr(result, "output_tokens", 0) or 0),
+    }
 
     if not isinstance(parsed, dict):
-        return [], "non-dict gap response", {"figures": [], "fields": [], "sections": []}
+        return [], "non-dict gap response", {"figures": [], "fields": [], "sections": []}, call
 
     requested = _parse_requested_resources(parsed)
     has_resources = any(requested.values())
@@ -404,11 +412,11 @@ def _agentic_gap_analysis(
     # "yes, follow up by fetching those resources" — the model often forgets
     # the boolean when the resources block is populated.
     if not parsed.get("needs_followup") and not has_resources:
-        return [], str(parsed.get("reason", "no follow-ups needed")), requested
+        return [], str(parsed.get("reason", "no follow-ups needed")), requested, call
 
     raw = parsed.get("queries") or []
     if not isinstance(raw, list):
-        return [], "invalid queries field", requested
+        return [], "invalid queries field", requested, call
     clean: list[str] = []
     seen: set[str] = set()
     qnorm = " ".join(query.split()).lower()
@@ -423,7 +431,7 @@ def _agentic_gap_analysis(
             continue
         seen.add(key)
         clean.append(s)
-    return clean[:max_followups], str(parsed.get("reason", "")), requested
+    return clean[:max_followups], str(parsed.get("reason", "")), requested, call
 
 
 def _resolve_requested_resources(
@@ -528,6 +536,34 @@ def _resolve_requested_resources(
     return chunks
 
 
+def _aggregate_tokens(
+    llm_calls: list[dict], final_call: dict | None
+) -> dict | None:
+    """Build the response-shaped tokens_used dict from a list of per-call
+    breakdowns. Sums prompt+completion across every LLM call (query processor,
+    gap analysis, follow-up decomp, generation, agentic regen) so the cost
+    panel reflects total spend, not just the answer call.
+
+    ``final_call`` is the canonical "final answer" call — its model and
+    stop_reason become the top-level fields for backward compatibility.
+    """
+    if not llm_calls and not final_call:
+        return None
+    total_prompt = sum(int(c.get("prompt", 0) or 0) for c in llm_calls)
+    total_completion = sum(int(c.get("completion", 0) or 0) for c in llm_calls)
+    out: dict = {
+        "prompt": total_prompt,
+        "completion": total_completion,
+        "calls": llm_calls,
+    }
+    if final_call:
+        if final_call.get("model"):
+            out["model"] = final_call["model"]
+        if final_call.get("stop_reason"):
+            out["stop_reason"] = final_call["stop_reason"]
+    return out
+
+
 def _run_stage5_and_finalize(
     *,
     query: str,
@@ -540,11 +576,39 @@ def _run_stage5_and_finalize(
     citations: list[dict],
     context_chunks: list[dict],
     tokens_used: dict | None,
+    llm_calls: list[dict] | None = None,
 ) -> dict:
     """Run Stage 5 (agentic refinement loop) + Stage 6 (non-agentic gap hint)
     and assemble the response. Extracted so /api/refine can reuse it on top
     of a seeded first-pass state without redoing Stages 1–4.
     """
+    # llm_calls accumulates one entry per LLM call so the response can report
+    # an accurate total token / cost figure (not just the final answer call).
+    if llm_calls is None:
+        # Seed from the inbound tokens_used.calls if present (refine fast-path
+        # carries the prior pass's accounting forward).
+        if isinstance(tokens_used, dict) and isinstance(tokens_used.get("calls"), list):
+            llm_calls = list(tokens_used["calls"])
+        else:
+            llm_calls = []
+    final_gen_call: dict | None = None
+    if isinstance(tokens_used, dict):
+        # Record the first-pass generation call in the call list if it isn't
+        # already there (orchestrate() adds it before invoking this helper).
+        if tokens_used.get("prompt") or tokens_used.get("completion"):
+            already_recorded = any(c.get("stage") == "generation" for c in llm_calls)
+            if not already_recorded:
+                llm_calls.append({
+                    "stage": "generation",
+                    "model": tokens_used.get("model") or config.llm_model,
+                    "prompt": int(tokens_used.get("prompt", 0) or 0),
+                    "completion": int(tokens_used.get("completion", 0) or 0),
+                    "stop_reason": tokens_used.get("stop_reason"),
+                })
+        final_gen_call = {
+            "model": tokens_used.get("model") or config.llm_model,
+            "stop_reason": tokens_used.get("stop_reason"),
+        }
     if agentic:
         # Recursive mode loops up to `agentic_max_iterations`; single-pass
         # mode is iter 0 only (original behavior). When non-recursive, stage
@@ -561,7 +625,7 @@ def _run_stage5_and_finalize(
             suffix = f".iter{iteration}" if config.agentic_recursive else ""
 
             start = time.time()
-            followups, gap_reason, requested = _agentic_gap_analysis(
+            followups, gap_reason, requested, gap_call = _agentic_gap_analysis(
                 query=query,
                 answer=answer,
                 used_chunks=context_chunks,
@@ -569,6 +633,8 @@ def _run_stage5_and_finalize(
                 max_followups=config.agentic_max_followups,
             )
             took_gap = time.time() - start
+            if gap_call:
+                llm_calls.append({"stage": f"agentic.gap_analysis{suffix}", **gap_call})
             last_gap_reason = gap_reason
             targeted_requested = (
                 requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
@@ -638,6 +704,8 @@ def _run_stage5_and_finalize(
                         fq, use_llm=True, max_subqueries=config.max_subqueries,
                     )
                     fq_subs = fq_decomp.sub_queries or [fq]
+                    for c in fq_decomp.llm_calls:
+                        llm_calls.append({**c, "stage": f"agentic.followup_decomp_q{fi}{suffix}"})
                     fq_decomp_summary = {
                         "type": fq_decomp.type,
                         "entities": _entity_list_to_dict(fq_decomp.entities),
@@ -732,6 +800,18 @@ def _run_stage5_and_finalize(
                     max_tokens=config.agentic_max_output_tokens,
                 )
                 took_g2 = time.time() - start
+                if isinstance(tokens2, dict):
+                    llm_calls.append({
+                        "stage": f"agentic.regenerate{suffix}",
+                        "model": config.agentic_model,
+                        "prompt": int(tokens2.get("prompt", 0) or 0),
+                        "completion": int(tokens2.get("completion", 0) or 0),
+                        "stop_reason": tokens2.get("stop_reason"),
+                    })
+                    final_gen_call = {
+                        "model": config.agentic_model,
+                        "stop_reason": tokens2.get("stop_reason"),
+                    }
                 trace.append(
                     PipelineStage(
                         stage=f"agentic.regenerate{suffix}",
@@ -787,13 +867,15 @@ def _run_stage5_and_finalize(
     if not agentic and config.auto_gap_check:
         start = time.time()
         try:
-            gh_followups, gh_reason, gh_requested = _agentic_gap_analysis(
+            gh_followups, gh_reason, gh_requested, gh_call = _agentic_gap_analysis(
                 query=query,
                 answer=answer,
                 used_chunks=context_chunks,
                 citations=citations,
                 max_followups=config.agentic_max_followups,
             )
+            if gh_call:
+                llm_calls.append({"stage": "gap_hint", **gh_call})
         except Exception as e:  # noqa: BLE001
             logger.exception("auto_gap_check failed: %s", e)
             gh_followups, gh_reason, gh_requested = [], "", {"figures": [], "fields": [], "sections": []}
@@ -823,7 +905,7 @@ def _run_stage5_and_finalize(
         "config": config.to_dict(),
         "agentic": agentic,
         "gap_hint": gap_hint,
-        "tokens_used": tokens_used,
+        "tokens_used": _aggregate_tokens(llm_calls, final_gen_call) or tokens_used,
         "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
     }
 
@@ -870,6 +952,11 @@ def orchestrate(
 
     trace: list[PipelineStage] = []
     tokens_used: dict | None = None
+    # Per-LLM-call breakdown. Every stage that talks to an LLM (query
+    # processor, gap analysis, follow-up decomp, generation, agentic regen)
+    # appends one entry so the final tokens_used reflects total spend, not
+    # just the last call.
+    llm_calls: list[dict] = []
 
     # -------------------------------------------------------------------------
     # Refine fast-path: skip Stages 1–4 and jump straight to Stage 5 with the
@@ -902,6 +989,7 @@ def orchestrate(
             deduplicated=deduplicated, answer=answer,
             citations=citations, context_chunks=context_chunks,
             tokens_used=tokens_used,
+            llm_calls=llm_calls,
         )
 
     # -------------------------------------------------------------------------
@@ -914,6 +1002,7 @@ def orchestrate(
         max_subqueries=config.max_subqueries,
     )
     took_qp = time.time() - start
+    llm_calls.extend(decomp.llm_calls)
 
     trace.append(
         PipelineStage(
@@ -1096,6 +1185,18 @@ def orchestrate(
             max_tokens=config.llm_max_output_tokens,
         )
         took_gen = time.time() - start
+        if isinstance(tokens_used, dict):
+            llm_calls.append({
+                "stage": "generation",
+                "model": config.llm_model,
+                "prompt": int(tokens_used.get("prompt", 0) or 0),
+                "completion": int(tokens_used.get("completion", 0) or 0),
+                "stop_reason": tokens_used.get("stop_reason"),
+            })
+            # Stamp the model onto tokens_used so the stage5 helper can
+            # pick it up as the canonical "final answer" model. The generator
+            # itself doesn't include the model id in its return dict.
+            tokens_used.setdefault("model", config.llm_model)
 
         trace.append(
             PipelineStage(
@@ -1160,6 +1261,7 @@ def orchestrate(
         trace=trace, deduplicated=deduplicated,
         answer=answer, citations=citations, context_chunks=context_chunks,
         tokens_used=tokens_used,
+        llm_calls=llm_calls,
     )
 
 
