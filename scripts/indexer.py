@@ -28,15 +28,25 @@ except ImportError:
 BATCH_SIZE = 100
 
 
+def _spec() -> str:
+    """Active spec id from the environment (set by the runner scripts)."""
+    return (os.getenv("NVME_SPEC") or "base").strip().lower() or "base"
+
+
 def load_embedded_chunks(data_dir: Path) -> list[dict]:
     path = data_dir / "chunks_embedded.json"
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def chunk_to_row(chunk: dict) -> dict:
+def chunk_to_row(chunk: dict, spec: str = "base") -> dict:
+    # Base keeps its original (unprefixed) ids for back-compat; other specs are
+    # id-prefixed so their chunk ids can't collide with Base's in spec_chunks.
+    chunk_id = chunk["chunk_id"]
+    row_id = chunk_id if spec == "base" else f"{spec}:{chunk_id}"
     return {
-        "id": chunk["chunk_id"],
+        "id": row_id,
+        "spec": spec,
         "embedding": chunk["embedding"],
         "text": chunk["text"],
         "text_raw": chunk["text_raw"],
@@ -57,18 +67,18 @@ def chunk_to_row(chunk: dict) -> dict:
     }
 
 
-def upsert_chunks(chunks: list[dict], supabase_url: str, supabase_key: str) -> int:
+def upsert_chunks(chunks: list[dict], supabase_url: str, supabase_key: str, spec: str = "base") -> int:
     client = create_client(supabase_url, supabase_key)
     total = len(chunks)
     batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
     uploaded = 0
 
-    print(f"Upserting {total} chunks in {batches} batches")
+    print(f"Upserting {total} chunks in {batches} batches (spec={spec})")
 
     for i in range(0, total, BATCH_SIZE):
         batch_num = i // BATCH_SIZE + 1
         batch = chunks[i : i + BATCH_SIZE]
-        rows = [chunk_to_row(c) for c in batch]
+        rows = [chunk_to_row(c, spec) for c in batch]
 
         client.table("spec_chunks").upsert(rows).execute()
 
@@ -103,7 +113,7 @@ def run(data_dir: str = "data") -> None:
         print("ERROR: First chunk has no embedding — run embedder.py first")
         sys.exit(1)
 
-    uploaded = upsert_chunks(chunks, supabase_url, supabase_key)
+    uploaded = upsert_chunks(chunks, supabase_url, supabase_key, _spec())
     print(f"Done. {uploaded} rows in spec_chunks.")
 
 

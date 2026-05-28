@@ -9,10 +9,20 @@ At the **top of the UI** the user picks **Base** or **PCIe**; every query is the
 scoped to that spec's data so search only ever returns rows from the selected
 spec. The data-pipeline **scripts ask first** which spec to build/ingest.
 
-This document is the implementation plan. **Phase 0 (pipeline parameterization +
-the "ask first" scripts) is already implemented on this branch** —
-see [§4](#4-phase-0-done-pipeline--scripts-parameterized). The remaining phases
-(schema, backend scoping, API, UI) are specified but not yet built.
+This document is the implementation plan. **All phases below are now implemented
+on branch `claude/nvme-pcie-spec-plan-kIuUR`** using **Option A** (one tagged
+corpus): identical parsing, identical data schema, every row tagged with a
+`spec` discriminator, and every retriever filtered on it. What remains is
+**operational**, not code: apply the schema migration and ingest the PCIe PDF.
+
+> **To go live:**
+> 1. Apply `scripts/supabase_schema.sql` (adds the `spec` column + widens lookup
+>    PKs; existing rows backfill to `spec='base'`).
+> 2. Obtain `nvme_spec/NVMe_PCIe_transport.pdf`, confirm its page offset, then
+>    run `NVME_SPEC=pcie ./scripts/rerun_pipeline.sh` and
+>    `NVME_SPEC=pcie ./scripts/run_phase2.sh`.
+> 3. The UI **Spec** picker (top-left of the header) then flips all retrieval
+>    between Base and PCIe.
 
 ---
 
@@ -135,7 +145,7 @@ independent `data/pcie/` corpus from the PCIe PDF, with cards tagged
 
 ---
 
-## 5. Phase 1 — Supabase schema (spec discriminator)
+## 5. Phase 1 (DONE) — Supabase schema (spec discriminator)
 
 Add to `scripts/supabase_schema.sql` (all `IF NOT EXISTS` / idempotent):
 
@@ -168,7 +178,7 @@ Add to `scripts/supabase_schema.sql` (all `IF NOT EXISTS` / idempotent):
 
 ---
 
-## 6. Phase 2 — ingest writes the spec tag
+## 6. Phase 2 (DONE) — ingest writes the spec tag
 
 - **`scripts/indexer.py`** — set `"spec": spec_env.spec()` (or read
   `NVME_SPEC`) on every chunk row, and **prefix chunk ids** with the spec
@@ -182,7 +192,7 @@ Re-run for each spec: `NVME_SPEC=base ./scripts/run_phase2.sh` then
 
 ---
 
-## 7. Phase 3 — backend retrieval scoping
+## 7. Phase 3 (DONE) — backend retrieval scoping
 
 The contract: **every retrieval call carries the active `spec`**, and structured
 lookup loads only that spec's tables.
@@ -217,7 +227,7 @@ lookup loads only that spec's tables.
 
 ---
 
-## 8. Phase 4 — API surface
+## 8. Phase 4 (DONE) — API surface
 
 - **`/api/query`** and **`/api/refine`** (`src/pipeline/app.py`) — already accept
   a free-form `config` dict, so `{"spec": "pcie"}` flows through with **no
@@ -234,7 +244,7 @@ lookup loads only that spec's tables.
 
 ---
 
-## 9. Phase 5 — UI selector (top of the page)
+## 9. Phase 5 (DONE) — UI selector (top of the page)
 
 The frontend is server-rendered as `FRONTEND_HTML` in `src/pipeline/app.py`
 (there is no separate `frontend/` build despite the README diagram). Wiring

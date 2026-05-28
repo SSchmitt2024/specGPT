@@ -241,6 +241,16 @@ DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "0").lower() in ("1", "true", "yes"
 # blast radius than the trace, so it gets its own variable. Off by default.
 _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "yes")
 
+# Specifications the UI can search. The `id` is the value stored on every
+# spec_chunks / lookup row (see scripts/load_lookup_data.py + indexer.py) and
+# the value the retrievers filter on. Add a row here when a new transport
+# corpus (e.g. RDMA/TCP) is ingested.
+AVAILABLE_SPECS = [
+    {"id": "base", "label": "Base Specification", "version": "2.1"},
+    {"id": "pcie", "label": "PCIe Transport", "version": "1.1"},
+]
+_VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
+
 app = FastAPI(
     title="specGPT Pipeline",
     description="NVMe Specification Q&A with Full Pipeline Visibility",
@@ -465,6 +475,9 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
     except TypeError as e:
         raise HTTPException(status_code=400, detail=f"invalid config: {e}")
 
+    if config.spec not in _VALID_SPEC_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown spec: {config.spec!r}")
+
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = uuid.uuid4().hex[:12]
 
@@ -541,6 +554,9 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
     except TypeError as e:
         raise HTTPException(status_code=400, detail=f"invalid config: {e}")
 
+    if config.spec not in _VALID_SPEC_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown spec: {config.spec!r}")
+
     debug_trace = req.debug and DEBUG_PIPELINE
     start = time.time()
     try:
@@ -593,6 +609,12 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
 async def config_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Return default PipelineConfig."""
     return PipelineConfig().to_dict()
+
+
+@app.get("/api/specs")
+async def specs_endpoint(_: bool = Depends(require_auth)) -> dict:
+    """Specs the UI can search, plus the default selection."""
+    return {"specs": AVAILABLE_SPECS, "default": PipelineConfig().spec}
 
 
 @app.get("/api/models")
@@ -2208,6 +2230,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
                 </div>
                 <div style="display: flex; align-items: center; gap: 10px;">
+                    <label class="global-model-picker" title="Which NVMe specification to search">
+                        <span class="global-model-picker-label">Spec</span>
+                        <select id="global-spec-select"></select>
+                    </label>
                     <label class="global-model-picker" title="Sets both LLMs at once">
                         <span class="global-model-picker-label">Model</span>
                         <select id="global-model-select"></select>
@@ -2687,6 +2713,37 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     if (globalEl.value !== el.value) globalEl.value = el.value;
                 });
             }
+        })();
+
+        // ── Spec picker (Base vs PCIe Transport) ───────────────────────────
+        // Scopes every query to one specification. Persisted in localStorage so
+        // the choice survives reloads; sent as config.spec on each request.
+        // Attached to window so runQuery / refine can read it regardless of
+        // script-scope nesting.
+        window.getSelectedSpec = function () {
+            const el = document.getElementById("global-spec-select");
+            if (el && el.value) return el.value;
+            return localStorage.getItem("specgpt_spec") || "base";
+        };
+        (function _wireSpecPicker() {
+            const el = document.getElementById("global-spec-select");
+            if (!el) return;
+            fetch("/api/specs")
+                .then((r) => (r.ok ? r.json() : null))
+                .then((data) => {
+                    if (!data || !Array.isArray(data.specs)) return;
+                    const saved = localStorage.getItem("specgpt_spec");
+                    el.innerHTML = data.specs
+                        .map((s) => `<option value="${s.id}">${s.label}${s.version ? " " + s.version : ""}</option>`)
+                        .join("");
+                    el.value = (saved && data.specs.some((s) => s.id === saved))
+                        ? saved
+                        : (data.default || "base");
+                })
+                .catch(() => {});
+            el.addEventListener("change", () => {
+                localStorage.setItem("specgpt_spec", el.value);
+            });
         })();
 
         // Overlay the model selectors onto `_modelsData` so the model panel +
@@ -3917,6 +3974,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             // Collect config
             const config = {
+                spec: window.getSelectedSpec(),
                 llm_model: document.getElementById("config-llm_model").value,
                 agentic_model: document.getElementById("config-agentic_model").value,
                 vector_topk: parseInt(document.getElementById("config-vector_topk").value),
@@ -4441,6 +4499,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             // Reuse the same config payload the user has set, so agentic_*
             // tweaks (max_followups, rerank_topk, recursive, etc.) apply.
             const config = {
+                spec: window.getSelectedSpec(),
                 vector_topk: parseInt(document.getElementById("config-vector_topk").value),
                 tsvector_topk: parseInt(document.getElementById("config-tsvector_topk").value),
                 bm25_topk: parseInt(document.getElementById("config-bm25_topk").value),

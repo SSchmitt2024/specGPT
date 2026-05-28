@@ -62,6 +62,11 @@ class GenerationError(RuntimeError):
 @dataclass
 class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
+    # Which specification corpus to search: "base" | "pcie". Scopes every
+    # retrieval (vector / tsvector / BM25 / structured lookup) to rows tagged
+    # with this spec, so Base and PCIe results never co-mingle.
+    spec: str = "base"
+
     # Search parameters
     vector_topk: int = 10
     tsvector_topk: int = 10
@@ -189,18 +194,21 @@ def hybrid_search(
     ranked_lists: list[list[dict]] = []
     total_input = 0
 
+    # Scope every retriever to the selected spec so Base/PCIe never co-mingle.
+    spec_filter = {"spec": config.spec}
+
     # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
     for i, sq in enumerate(sub_queries):
         start = time.time()
-        vec_results = search.vector_search(sq, top_k=config.vector_topk)
+        vec_results = search.vector_search(sq, top_k=config.vector_topk, filter=spec_filter)
         took_vec = time.time() - start
 
         start = time.time()
-        tsv_results = search.tsvector_search(sq, top_k=config.tsvector_topk)
+        tsv_results = search.tsvector_search(sq, top_k=config.tsvector_topk, filter=spec_filter)
         took_tsv = time.time() - start
 
         start = time.time()
-        bm25_results = search.bm25_search(sq, top_k=config.bm25_topk)
+        bm25_results = search.bm25_search(sq, top_k=config.bm25_topk, filter=spec_filter)
         took_bm25 = time.time() - start
 
         sub_trace.append(
@@ -438,8 +446,9 @@ def _resolve_requested_resources(
     requested: dict[str, list[str]],
     *,
     enable_section_fallback: bool = True,
+    spec: str = "base",
 ) -> list[dict]:
-    """Direct-fetch chunks for specific figures/fields/sections.
+    """Direct-fetch chunks for specific figures/fields/sections, scoped to `spec`.
 
     Returns chunk dicts matching the standard shape (compatible with the
     dedup/rerank pool). Tags ``method="agentic_fetch_*"`` so the trace can
@@ -450,7 +459,7 @@ def _resolve_requested_resources(
         return chunks
 
     try:
-        tables_by_fig = retriever.load_tables_by_figure()
+        tables_by_fig = retriever.load_tables_by_figure(spec)
     except Exception as e:  # noqa: BLE001
         logger.warning("agentic targeted-fetch: tables load failed: %s", e)
         tables_by_fig = {}
@@ -493,7 +502,7 @@ def _resolve_requested_resources(
 
     # ── Fields: resolve to parent figure(s) ─────────────────────────────
     try:
-        field_index = retriever.load_field_index()
+        field_index = retriever.load_field_index(spec)
     except Exception as e:  # noqa: BLE001
         logger.warning("agentic targeted-fetch: field_index load failed: %s", e)
         field_index = {}
@@ -519,12 +528,13 @@ def _resolve_requested_resources(
         for sid in requested.get("sections") or []:
             try:
                 hits = search.tsvector_search(sid, top_k=3,
-                                              filter={"section_prefix": sid})
+                                              filter={"section_prefix": sid, "spec": spec})
             except Exception:
                 hits = []
             if not hits:
                 try:
-                    hits = search.tsvector_search(f"Section {sid}", top_k=3)
+                    hits = search.tsvector_search(f"Section {sid}", top_k=3,
+                                                  filter={"spec": spec})
                 except Exception:
                     hits = []
             for h in hits:
@@ -664,7 +674,7 @@ def _run_stage5_and_finalize(
             if any(targeted_requested.values()):
                 start = time.time()
                 try:
-                    fetched = _resolve_requested_resources(targeted_requested)
+                    fetched = _resolve_requested_resources(targeted_requested, spec=config.spec)
                 except Exception as e:  # noqa: BLE001
                     logger.exception("agentic targeted-fetch failed: %s", e)
                     fetched = []
@@ -1029,6 +1039,7 @@ def orchestrate(
             decomp,
             use_llm=False,  # already did LLM in query_processor
             max_fields=8,
+            spec=config.spec,
         )
         took_struct = time.time() - start
 
