@@ -44,6 +44,65 @@ if [[ -f ".env" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 1.2 — choose which specification to build: NVMe Base vs PCIe Transport.
+# The exported vars are consumed by src/spec_env.py (every Phase-1 module reads
+# them for its data dir / PDF path / page offset / spec tags). With NVME_SPEC
+# unset or "base", all defaults reproduce the original single-spec behavior.
+# See docs/PCIE_MULTI_SPEC_PLAN.md.
+# ---------------------------------------------------------------------------
+select_spec() {
+  local choice="${NVME_SPEC:-}"   # pre-set (env or .env) skips the prompt
+  if [[ -z "$choice" ]]; then
+    echo ""
+    echo "Which specification do you want to run the pipeline for?"
+    echo "  1) base  — NVM Express Base Specification     -> data/"
+    echo "  2) pcie  — NVM Express PCIe Transport Spec     -> data/pcie/"
+    read -rp "spec> [1] " spec_reply
+    case "${spec_reply:-1}" in
+      1|base|Base|BASE)          choice="base" ;;
+      2|pcie|Pcie|PCIE|PCIe)     choice="pcie" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base or 2/pcie)" >&2; exit 1 ;;
+    esac
+  fi
+
+  case "$choice" in
+    base)
+      export NVME_SPEC="base"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_spec_full.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Base Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      # Intentionally NOT setting SPEC_PAGE_OFFSET: each module keeps its own
+      # historical Base offset (toc_rebuild=24, others=23).
+      ;;
+    pcie)
+      export NVME_SPEC="pcie"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_PCIe_transport.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.1}"
+      # The PCIe PDF's cover/TOC length differs from Base, so the offset must
+      # be explicit. Prompt (placeholder default) unless already set.
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    PCIe PAGE_OFFSET (pdf_page - printed_page) [12] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:-12}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+  esac
+
+  echo ""
+  echo "=== spec: $NVME_SPEC ==="
+  echo "    data dir:    $SPEC_DATA_DIR"
+  echo "    pdf:         $SPEC_PDF_PATH"
+  echo "    page offset: ${SPEC_PAGE_OFFSET:-<per-module default>}"
+  echo "    document:    $SPEC_DOCUMENT (v$SPEC_VERSION)"
+  [[ -f "$SPEC_PDF_PATH" ]] || echo "    WARN: source PDF not found at $SPEC_PDF_PATH"
+}
+
+select_spec
+
+# ---------------------------------------------------------------------------
 # Step 1.5 — find a working Python interpreter.
 # On Windows / git-bash, `.venv/bin/python` is often a broken symlink and a
 # bare `python` may not be on PATH. We probe a list of candidates and pick
@@ -283,13 +342,14 @@ fi
 # Every file we touch that already exists is copied here first.
 # ---------------------------------------------------------------------------
 STAMP="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="Backups/pipeline_${STAMP}"
+BACKUP_DIR="Backups/pipeline_${NVME_SPEC}_${STAMP}"
 mkdir -p "$BACKUP_DIR"
 echo ""
 echo "=== backup dir: $BACKUP_DIR ==="
 
 {
   echo "timestamp: $STAMP"
+  echo "spec:      ${NVME_SPEC} (data dir: ${SPEC_DATA_DIR})"
   echo "provider:  ${LLM_PROVIDER:-n/a}"
   echo "git_commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
   echo "selected steps:"

@@ -436,9 +436,10 @@ def build_field_index(fields: list[dict]) -> dict[str, list[dict]]:
 # CLI
 
 if __name__ == "__main__":
-    TABLES_PATH = "data/tables.json"
-    FIELDS_PATH = "data/fields.json"
-    INDEX_PATH = "data/field_index.json"
+    from src import spec_env
+    TABLES_PATH = spec_env.data_path("tables.json")
+    FIELDS_PATH = spec_env.data_path("fields.json")
+    INDEX_PATH = spec_env.data_path("field_index.json")
 
     with open(TABLES_PATH, "r", encoding="utf-8") as f:
         tables = json.load(f)

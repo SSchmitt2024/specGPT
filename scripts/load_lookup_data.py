@@ -201,8 +201,9 @@ def _main(argv: list[str]) -> int:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data"),
-        help="Directory containing fields.json, field_index.json, tables.json",
+        default=Path(os.getenv("SPEC_DATA_DIR", "data")),
+        help="Directory containing fields.json, field_index.json, tables.json "
+             "(defaults to $SPEC_DATA_DIR or 'data')",
     )
     parser.add_argument(
         "--tables",

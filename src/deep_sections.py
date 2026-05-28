@@ -52,7 +52,8 @@ DEEP_SECTION_NUM_RE = re.compile(r"^([A-Z]?\d+(?:\.\d+){3,})\.?$")
 ANY_SECTION_NUM_RE = re.compile(r"^([A-Z]?\d+(?:\.\d+){2,})\.?\s+(.+)")
 
 # Page offset: pdf_page_idx - printed_page_number
-PAGE_OFFSET = 23
+from src import spec_env
+PAGE_OFFSET = spec_env.page_offset(23)
 
 
 # ---------------------------------------------------------------------------
@@ -532,10 +533,10 @@ def validate(
 # CLI
 
 if __name__ == "__main__":
-    PDF_PATH = "nvme_spec/NVMe_spec_full.pdf"
-    TOC_PATH = "data/toc.json"
-    OUTPUT_PATH = "data/toc.json"  # overwrite in place
-    BACKUP_PATH = "data/toc_depth3_backup.json"
+    PDF_PATH = spec_env.pdf_path()
+    TOC_PATH = spec_env.data_path("toc.json")
+    OUTPUT_PATH = spec_env.data_path("toc.json")  # overwrite in place
+    BACKUP_PATH = spec_env.data_path("toc_depth3_backup.json")
 
     with open(TOC_PATH, encoding="utf-8") as f:
         existing_toc = json.load(f)
@@ -585,8 +586,8 @@ if __name__ == "__main__":
     print("\nvalidation:")
     stats = validate(
         enriched,
-        relationships_path="data/relationships.json",
-        fields_path="data/fields.json",
+        relationships_path=spec_env.data_path("relationships.json"),
+        fields_path=spec_env.data_path("fields.json"),
     )
     for k, v in stats.items():
         print(f"  {k}: {v}")

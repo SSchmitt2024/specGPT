@@ -29,11 +29,13 @@ from .client import generate_json
 # ---------------------------------------------------------------------------
 # Paths
 
-PROSE_PATH = "data/prose.json"
-TOC_PATH = "data/toc.json"
-FIELDS_PATH = "data/fields.json"
-OUTPUT_PATH = "data/relationships_llm.json"
-STATE_PATH = "data/relationships_llm_state.json"
+from src import spec_env
+
+PROSE_PATH = spec_env.data_path("prose.json")
+TOC_PATH = spec_env.data_path("toc.json")
+FIELDS_PATH = spec_env.data_path("fields.json")
+OUTPUT_PATH = spec_env.data_path("relationships_llm.json")
+STATE_PATH = spec_env.data_path("relationships_llm_state.json")
 
 # Only call the LLM for sections with at least this many prose characters.
 # Below this, there's nothing for the LLM to extract relationships from.

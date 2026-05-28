@@ -38,6 +38,48 @@ if [[ -f ".env" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Choose which specification to ingest: NVMe Base vs PCIe Transport.
+# Exports SPEC_DATA_DIR (consumed by chunker/embedder/indexer/load_lookup_data)
+# plus the spec metadata tags. With NVME_SPEC unset/"base", behavior is
+# unchanged. See docs/PCIE_MULTI_SPEC_PLAN.md.
+# ---------------------------------------------------------------------------
+select_spec() {
+  local choice="${NVME_SPEC:-}"   # pre-set (env or .env) skips the prompt
+  if [[ -z "$choice" ]]; then
+    echo ""
+    echo "Which specification do you want to ingest?"
+    echo "  1) base  — NVM Express Base Specification     <- data/"
+    echo "  2) pcie  — NVM Express PCIe Transport Spec     <- data/pcie/"
+    read -rp "spec> [1] " spec_reply
+    case "${spec_reply:-1}" in
+      1|base|Base|BASE)          choice="base" ;;
+      2|pcie|Pcie|PCIE|PCIe)     choice="pcie" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base or 2/pcie)" >&2; exit 1 ;;
+    esac
+  fi
+
+  case "$choice" in
+    base)
+      export NVME_SPEC="base"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Base Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      ;;
+    pcie)
+      export NVME_SPEC="pcie"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.1}"
+      ;;
+  esac
+
+  echo ""
+  echo "=== spec: $NVME_SPEC (data dir: $SPEC_DATA_DIR, $SPEC_DOCUMENT v$SPEC_VERSION) ==="
+}
+
+select_spec
+
+# ---------------------------------------------------------------------------
 # Find Python interpreter
 # ---------------------------------------------------------------------------
 export PYTHONUNBUFFERED=1
@@ -256,7 +298,7 @@ fi
 # Backup + overwrite handling
 # ---------------------------------------------------------------------------
 STAMP="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="Backups/phase2_${STAMP}"
+BACKUP_DIR="Backups/phase2_${NVME_SPEC}_${STAMP}"
 mkdir -p "$BACKUP_DIR"
 echo ""
 echo "=== backup dir: $BACKUP_DIR ==="

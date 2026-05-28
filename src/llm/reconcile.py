@@ -52,14 +52,16 @@ from collections import Counter, defaultdict
 # ---------------------------------------------------------------------------
 # Paths
 
-DETERMINISTIC_PATH = "data/relationships.json"
-LLM_PATH = "data/relationships_llm.json"
-TOC_PATH = "data/toc.json"
-FIELDS_PATH = "data/fields.json"
-CARDS_PATH = "data/cards.json"
+from src import spec_env
 
-MERGED_PATH = "data/relationships_merged.json"
-REGISTRY_PATH = "data/entity_registry.json"
+DETERMINISTIC_PATH = spec_env.data_path("relationships.json")
+LLM_PATH = spec_env.data_path("relationships_llm.json")
+TOC_PATH = spec_env.data_path("toc.json")
+FIELDS_PATH = spec_env.data_path("fields.json")
+CARDS_PATH = spec_env.data_path("cards.json")
+
+MERGED_PATH = spec_env.data_path("relationships_merged.json")
+REGISTRY_PATH = spec_env.data_path("entity_registry.json")
 
 
 # ---------------------------------------------------------------------------

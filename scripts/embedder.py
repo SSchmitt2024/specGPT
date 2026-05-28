@@ -123,4 +123,4 @@ def run(data_dir: str = "data") -> list[dict]:
 
 
 if __name__ == "__main__":
-    run(sys.argv[1] if len(sys.argv) > 1 else "data")
+    run(sys.argv[1] if len(sys.argv) > 1 else os.getenv("SPEC_DATA_DIR", "data"))

@@ -28,12 +28,14 @@ import pymupdf
 # Constants                                                                    #
 # ---------------------------------------------------------------------------- #
 
-PDF_PATH = "nvme_spec/NVMe_spec_full.pdf"
-OUTPUT_PATH = "data/toc.json"
-BACKUP_PATH = "data/toc_old_backup.json"
+from src import spec_env
+
+PDF_PATH = spec_env.pdf_path()
+OUTPUT_PATH = spec_env.data_path("toc.json")
+BACKUP_PATH = spec_env.data_path("toc_old_backup.json")
 
 # PDF page index → printed page number.  Printed page 1 = PDF page 25 (0-indexed 24).
-PAGE_OFFSET = 24
+PAGE_OFFSET = spec_env.page_offset(24)
 
 # Extract section number from bookmark title: "3.2.1.1 Namespace Overview" → ("3.2.1.1", "Namespace Overview")
 # Also handles appendix sub-sections: "A.1 Overview", "B.5.1. Shadow Doorbell..."

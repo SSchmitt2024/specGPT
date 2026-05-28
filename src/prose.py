@@ -91,7 +91,8 @@ LINE_Y_TOL = 2.5
 HEADING_SEARCH_WINDOW_PAGES = 4
 
 # Page offset: PDF page index - printed page number. printed p.1 is pdf idx 24.
-PAGE_OFFSET = 23
+from src import spec_env
+PAGE_OFFSET = spec_env.page_offset(23)
 
 # Inclusive bounds on the PDF page index where real content lives.
 # The full spec is 784 pages; content starts at pdf idx 24 (printed p.1).
@@ -780,10 +781,10 @@ def summarize(sections: list[dict]) -> None:
 # CLI
 
 if __name__ == "__main__":
-    PDF_PATH = "nvme_spec/NVMe_spec_full.pdf"
-    TOC_PATH = "data/toc.json"
-    SECTIONS_OUT = "data/prose.json"
-    DEFS_OUT = "data/definitions.json"
+    PDF_PATH = spec_env.pdf_path()
+    TOC_PATH = spec_env.data_path("toc.json")
+    SECTIONS_OUT = spec_env.data_path("prose.json")
+    DEFS_OUT = spec_env.data_path("definitions.json")
 
     first_arg = sys.argv[1] if len(sys.argv) > 1 else None
     last_arg = sys.argv[2] if len(sys.argv) > 2 else None
@@ -796,7 +797,7 @@ if __name__ == "__main__":
 
     summarize(sections)
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(spec_env.data_dir(), exist_ok=True)
     with open(SECTIONS_OUT, "w", encoding="utf-8") as f:
         json.dump(sections, f, indent=2, ensure_ascii=False)
     print(f"\nwrote {SECTIONS_OUT}")
