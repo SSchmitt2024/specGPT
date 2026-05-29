@@ -704,7 +704,108 @@ FRONTEND_HTML = """<!DOCTYPE html>
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
             --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+            --focus-ring: 0 0 0 3px rgba(28,25,23,0.08);
         }
+
+        /* ─── Dark theme ──────────────────────────────────────────────────
+           Activated by data-theme="dark" on <html> (see the boot script in
+           <head> + the top-left toggle). The whole UI is driven by the
+           tokens above, so flipping them recolours nearly everything; a few
+           targeted overrides below cover surfaces with hardcoded colours
+           (primary buttons, agentic popups, the red robot button). */
+        html[data-theme="dark"] {
+            --bg: #1c1917;
+            --bg-soft: #171411;
+            --bg-muted: #292524;
+            --border: #2c2825;
+            --border-strong: #44403c;
+            --text: #f5f5f4;
+            --text-muted: #d6d3d1;
+            --text-subtle: #a8a29e;
+            --text-faint: #78716c;
+            --accent: #6366f1;
+            --accent-soft: #292524;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+            --focus-ring: 0 0 0 3px rgba(99,102,241,0.3);
+        }
+        html[data-theme="dark"] body { background: #0f0d0b; }
+        /* Primary (accent) buttons keep white text; just fix the hover that
+           hardcodes pure black in light mode. config-toggle/cost-summary set
+           their own bg via higher-specificity rules and are unaffected. */
+        html[data-theme="dark"] button:hover { background: #4f46e5; border-color: #4f46e5; }
+        /* Agentic confirm/config popups (hardcoded light palette). */
+        html[data-theme="dark"] .ag-confirm,
+        html[data-theme="dark"] .ag-config {
+            background: var(--bg); border-color: var(--border-strong); color: var(--text);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+        }
+        html[data-theme="dark"] .ag-confirm-sub,
+        html[data-theme="dark"] .ag-config-sub,
+        html[data-theme="dark"] .ag-confirm-key { color: var(--text-subtle); }
+        html[data-theme="dark"] .ag-confirm-val { color: var(--text); }
+        html[data-theme="dark"] .ag-confirm-rows {
+            background: var(--bg-soft); border-color: var(--border);
+        }
+        html[data-theme="dark"] .ag-config-header,
+        html[data-theme="dark"] .ag-config-footer { border-color: var(--border); }
+        html[data-theme="dark"] .ag-confirm-btn-cancel,
+        html[data-theme="dark"] .ag-confirm-btn-edit {
+            background: var(--bg-muted); border-color: var(--border-strong); color: var(--text-muted);
+        }
+        html[data-theme="dark"] .ag-confirm-btn-cancel:hover,
+        html[data-theme="dark"] .ag-confirm-btn-edit:hover { background: var(--border); }
+        /* Red robot toggle: dark-tinted resting state. */
+        html[data-theme="dark"] .agentic-square-btn { background: #2a1414; border-color: #5c2626; }
+        html[data-theme="dark"] .agentic-square-btn:hover { background: #3a1a1a; border-color: #7f2d2d; }
+        /* Error banners. */
+        html[data-theme="dark"] .error { background: #2a1414; border-color: #5c2626; }
+        /* Focus rings on inputs/buttons use the token. */
+        html[data-theme="dark"] #query-input:focus,
+        html[data-theme="dark"] .config-item input:focus,
+        html[data-theme="dark"] .config-item select:focus { box-shadow: var(--focus-ring); }
+
+        /* ─── Dark-mode toggle — pill switch hugging the left screen edge ─ */
+        .theme-toggle {
+            position: fixed;
+            left: 10px;
+            top: 14px;
+            z-index: 30;
+            width: 48px;
+            height: 26px;
+            padding: 0;
+            border-radius: 999px;
+            border: 1px solid var(--border-strong);
+            background: var(--bg-muted);
+            cursor: pointer;
+            display: inline-block;
+            transition: background 0.18s, border-color 0.18s;
+        }
+        .theme-toggle:hover { border-color: var(--text-faint); }
+        .theme-toggle-knob {
+            position: absolute;
+            top: 50%;
+            left: 2px;
+            transform: translateY(-50%);
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: var(--bg);
+            border: 1px solid var(--border-strong);
+            box-shadow: var(--shadow-sm);
+            color: var(--text-subtle);
+            display: grid;
+            place-items: center;
+            transition: left 0.18s ease;
+        }
+        html[data-theme="dark"] .theme-toggle { background: var(--accent); border-color: var(--accent); }
+        html[data-theme="dark"] .theme-toggle-knob {
+            left: 24px; background: #f5f5f4; border-color: var(--accent); color: var(--accent);
+        }
+        .theme-toggle-knob svg { display: block; width: 12px; height: 12px; }
+        /* Moon in light mode (click → dark); sun in dark mode (click → light). */
+        .theme-toggle .icon-sun { display: none; }
+        html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+        html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -2220,10 +2321,36 @@ FRONTEND_HTML = """<!DOCTYPE html>
             font-family: var(--font-mono);
         }
     </style>
+    <script>
+        // Apply the saved (or system-preferred) theme before first paint to
+        // avoid a light-mode flash on load.
+        (function () {
+            try {
+                var saved = localStorage.getItem("specgpt-theme");
+                var dark = saved ? saved === "dark"
+                    : window.matchMedia("(prefers-color-scheme: dark)").matches;
+                if (dark) document.documentElement.setAttribute("data-theme", "dark");
+            } catch (e) { /* localStorage unavailable — default to light */ }
+        })();
+    </script>
 </head>
 <body>
     <header>
         <div class="container">
+            <button id="theme-toggle" class="theme-toggle" type="button" role="switch"
+                    title="Toggle dark mode" aria-label="Toggle dark mode">
+                <span class="theme-toggle-knob">
+                    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+                    </svg>
+                    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="4"></circle>
+                        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+                    </svg>
+                </span>
+            </button>
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <div>
                     <h1>specGPT</h1>
@@ -3785,6 +3912,25 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
 
         document.addEventListener("DOMContentLoaded", () => {
+            // Dark-mode toggle (top-left). The initial theme is applied by the
+            // boot script in <head>; here we just handle clicks + persistence.
+            const themeToggle = document.getElementById("theme-toggle");
+            if (themeToggle) {
+                const syncChecked = () =>
+                    themeToggle.setAttribute("aria-checked",
+                        document.documentElement.getAttribute("data-theme") === "dark");
+                syncChecked();
+                themeToggle.addEventListener("click", () => {
+                    const root = document.documentElement;
+                    const dark = root.getAttribute("data-theme") === "dark";
+                    if (dark) root.removeAttribute("data-theme");
+                    else root.setAttribute("data-theme", "dark");
+                    syncChecked();
+                    try { localStorage.setItem("specgpt-theme", dark ? "light" : "dark"); }
+                    catch (e) { /* localStorage unavailable — toggle still works for the session */ }
+                });
+            }
+
             document.getElementById("ag-confirm-cancel").addEventListener("click", closeAgenticConfirm);
             document.getElementById("ag-confirm-run").addEventListener("click", () => {
                 closeAgenticConfirm();

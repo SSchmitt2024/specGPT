@@ -176,34 +176,5 @@ CREATE TABLE IF NOT EXISTS spec_tables (
     section_id    TEXT,
     raw_text      TEXT,
     table_json    JSONB,
-    data          JSONB NOT NULL,
-    PRIMARY KEY (spec, figure_number)
+    data          JSONB NOT NULL
 );
-
--- ── Migration for EXISTING lookup tables (created before the multi-spec work)─
--- Adds the `spec` column and widens the primary key to include it. Idempotent:
--- safe to run repeatedly. Existing rows backfill to spec='base'.
-ALTER TABLE spec_fields      ADD COLUMN IF NOT EXISTS spec text NOT NULL DEFAULT 'base';
-ALTER TABLE spec_field_index ADD COLUMN IF NOT EXISTS spec text NOT NULL DEFAULT 'base';
-ALTER TABLE spec_tables      ADD COLUMN IF NOT EXISTS spec text NOT NULL DEFAULT 'base';
-
-DO $$
-BEGIN
-  -- spec_fields: ensure PK is (spec, name)
-  IF EXISTS (SELECT 1 FROM pg_constraint
-             WHERE conrelid = 'spec_fields'::regclass AND contype = 'p'
-               AND pg_get_constraintdef(oid) = 'PRIMARY KEY (name)') THEN
-    ALTER TABLE spec_fields DROP CONSTRAINT spec_fields_pkey;
-    ALTER TABLE spec_fields ADD CONSTRAINT spec_fields_pkey PRIMARY KEY (spec, name);
-  END IF;
-
-  -- spec_tables: ensure PK is (spec, figure_number)
-  IF EXISTS (SELECT 1 FROM pg_constraint
-             WHERE conrelid = 'spec_tables'::regclass AND contype = 'p'
-               AND pg_get_constraintdef(oid) = 'PRIMARY KEY (figure_number)') THEN
-    ALTER TABLE spec_tables DROP CONSTRAINT spec_tables_pkey;
-    ALTER TABLE spec_tables ADD CONSTRAINT spec_tables_pkey PRIMARY KEY (spec, figure_number);
-  END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS spec_field_index_spec_name_idx ON spec_field_index (spec, field_name);
