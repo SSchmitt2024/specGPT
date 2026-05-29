@@ -247,7 +247,7 @@ _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "y
 # corpus (e.g. RDMA/TCP) is ingested.
 AVAILABLE_SPECS = [
     {"id": "base", "label": "Base Specification", "version": "2.1"},
-    {"id": "pcie", "label": "PCIe Transport", "version": "1.1"},
+    {"id": "pcie", "label": "PCIe Transport", "version": "1.3"},
 ]
 _VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
 

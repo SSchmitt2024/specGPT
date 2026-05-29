@@ -230,6 +230,10 @@ def assemble_context(
             "section_id": section_id,
             "section_title": section_title,
             "content_type": content_type,
+            # Carry provenance so citations can be labelled by spec/page.
+            "spec": chunk.get("spec"),
+            "spec_document": chunk.get("spec_document"),
+            "pdf_pages": chunk.get("pdf_pages") or [],
             "tokens_used": chunk_tokens,
         })
 
@@ -281,6 +285,12 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
                 "section_id": section_id,
                 "section_title": chunk.get("section_title", ""),
                 "content_type": chunk.get("content_type", "prose"),
+                # Provenance: which spec/document + page this citation came from,
+                # so the UI can label whether it's Base or PCIe (the chunk shape
+                # already carries these — see search._shape).
+                "spec": chunk.get("spec"),
+                "spec_document": chunk.get("spec_document"),
+                "pdf_pages": chunk.get("pdf_pages") or [],
                 "hallucinated": False,
             })
         else:

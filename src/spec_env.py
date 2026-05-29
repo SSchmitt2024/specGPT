@@ -55,14 +55,29 @@ def pdf_path(default: str = DEFAULT_PDF_PATH) -> str:
     return os.getenv("SPEC_PDF_PATH") or default
 
 
+# Canonical baseline for SPEC_PAGE_OFFSET: the 0-indexed page-iteration
+# convention used by deep_sections / prose / tables / fields (Base default 23).
+# toc_rebuild reads 1-indexed bookmark pages from ``doc.get_toc()``, which run
+# exactly one higher, so its Base default is 24 (= baseline + 1). That +1
+# relationship lives only in the per-module call-site defaults, so when
+# SPEC_PAGE_OFFSET overrides them it must be preserved — otherwise toc pages and
+# content pages drift apart by one. See docs/PCIE_MULTI_SPEC_PLAN.md §4/§11.
+_BASELINE_PAGE_OFFSET = 23
+
+
 def page_offset(default: int) -> int:
     """``pdf_page - printed_page`` offset. ``SPEC_PAGE_OFFSET`` wins; else the
     caller's existing per-module Base default (which differs slightly across
-    modules, so it is passed in rather than centralized)."""
+    modules, so it is passed in rather than centralized).
+
+    ``SPEC_PAGE_OFFSET`` is expressed in the 0-indexed page-iteration convention
+    (baseline 23). Each call site's ``default`` carries its own convention delta
+    relative to that baseline (e.g. toc_rebuild's 24 → +1), which is re-applied
+    on top of the override so all modules stay mutually consistent."""
     raw = os.getenv("SPEC_PAGE_OFFSET")
     if raw is None or raw.strip() == "":
         return default
-    return int(raw)
+    return int(raw) + (default - _BASELINE_PAGE_OFFSET)
 
 
 def spec_document(default: str = DEFAULT_SPEC_DOCUMENT) -> str:

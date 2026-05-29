@@ -78,14 +78,17 @@ select_spec() {
     pcie)
       export NVME_SPEC="pcie"
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
-      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_PCIe_transport.pdf}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_PCIe_full.pdf}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
-      export SPEC_VERSION="${SPEC_VERSION:-1.1}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
       # The PCIe PDF's cover/TOC length differs from Base, so the offset must
-      # be explicit. Prompt (placeholder default) unless already set.
+      # be explicit. Verified against NVMe_PCIe_full.pdf (Rev 1.3): printed
+      # p.6 == 0-indexed pdf idx 5, so the baseline (page-iteration) offset is
+      # -1 (toc_rebuild auto-adds its +1 — see src/spec_env.py). Prompt unless
+      # already set.
       if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
-        read -rp "    PCIe PAGE_OFFSET (pdf_page - printed_page) [12] " off_reply
-        export SPEC_PAGE_OFFSET="${off_reply:-12}"
+        read -rp "    PCIe PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
       fi
       mkdir -p "$SPEC_DATA_DIR"
       ;;
@@ -175,27 +178,31 @@ STEP_MODULE=(
   "src.llm.reconcile"
   "src.llm.generate_cards"
 )
+# Output/input paths are scoped to the active spec's data dir ($SPEC_DATA_DIR,
+# exported by select_spec above; "data" for base, "data/pcie" for pcie) so
+# backup + overwrite prompts target the spec actually being built.
+DD="$SPEC_DATA_DIR"
 STEP_OUTPUTS=(
-  "data/toc.json"
-  "data/toc.json"
-  "data/tables.json"
-  "data/prose.json data/definitions.json"
-  "data/fields.json data/field_index.json"
-  "data/relationships.json"
-  "data/relationships_llm.json data/relationships_llm_state.json"
-  "data/relationships_merged.json data/entity_registry.json data/cards.json"
-  "data/cards.json data/cards_state.json"
+  "$DD/toc.json"
+  "$DD/toc.json"
+  "$DD/tables.json"
+  "$DD/prose.json $DD/definitions.json"
+  "$DD/fields.json $DD/field_index.json"
+  "$DD/relationships.json"
+  "$DD/relationships_llm.json $DD/relationships_llm_state.json"
+  "$DD/relationships_merged.json $DD/entity_registry.json $DD/cards.json"
+  "$DD/cards.json $DD/cards_state.json"
 )
 STEP_INPUTS=(
   ""
-  "data/toc.json"
+  "$DD/toc.json"
   ""
-  "data/toc.json"
-  "data/tables.json"
-  "data/toc.json data/tables.json"
-  "data/prose.json data/toc.json data/fields.json"
-  "data/relationships.json data/relationships_llm.json data/toc.json data/fields.json data/cards.json"
-  "data/toc.json data/prose.json data/tables.json data/relationships.json"
+  "$DD/toc.json"
+  "$DD/tables.json"
+  "$DD/toc.json $DD/tables.json"
+  "$DD/prose.json $DD/toc.json $DD/fields.json"
+  "$DD/relationships.json $DD/relationships_llm.json $DD/toc.json $DD/fields.json $DD/cards.json"
+  "$DD/toc.json $DD/prose.json $DD/tables.json $DD/relationships.json"
 )
 STEP_LLM=(
   "no" "no" "no" "no" "no" "no" "yes" "yes" "yes"

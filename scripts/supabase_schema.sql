@@ -58,6 +58,11 @@ CREATE INDEX IF NOT EXISTS spec_chunks_figure_number_idx ON spec_chunks (figure_
 -- ── RPC: vector search ────────────────────────────────────────────────────
 -- Returns the top match_count rows by cosine similarity to query_embedding,
 -- after applying the filter object's optional constraints.
+-- NOTE: the multi-spec revision ADDS spec/spec_document to the RETURNS TABLE.
+-- Postgres refuses to change a function's return type via CREATE OR REPLACE
+-- (error 42P13), so the pre-multi-spec definition must be dropped first. The
+-- arg signature is stable (vector, int, jsonb).
+DROP FUNCTION IF EXISTS match_spec_chunks(vector, int, jsonb);
 CREATE OR REPLACE FUNCTION match_spec_chunks(
   query_embedding vector(512),
   match_count     int   DEFAULT 10,
@@ -96,6 +101,8 @@ $$;
 -- ── RPC: tsvector full-text search ────────────────────────────────────────
 -- Uses ts_rank_cd over the generated tsv column. Stems via 'english' config
 -- (good for prose). True Okapi BM25 runs client-side; see bm25_index.py.
+-- Dropped first for the same return-type reason as match_spec_chunks above.
+DROP FUNCTION IF EXISTS search_spec_chunks_text(text, int, jsonb);
 CREATE OR REPLACE FUNCTION search_spec_chunks_text(
   query_text  text,
   match_count int   DEFAULT 10,
@@ -157,7 +164,9 @@ CREATE TABLE IF NOT EXISTS spec_field_index (
     figure_number TEXT,
     data          JSONB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS spec_field_index_name_idx ON spec_field_index (spec, field_name);
+-- NB: the (spec, field_name) index is created at the end of this file, AFTER the
+-- migration ALTERs add `spec` to pre-existing tables — creating it here would
+-- reference a column that doesn't exist yet on an already-deployed table.
 
 -- One row per table (from tables.json), keyed by (spec, figure_number).
 CREATE TABLE IF NOT EXISTS spec_tables (

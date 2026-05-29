@@ -62,8 +62,11 @@ def test_pcie_overrides_apply():
         assert spec_env.data_dir() == "data/pcie"
         assert spec_env.data_path("tables.json") == str(Path("data/pcie") / "tables.json")
         assert spec_env.pdf_path() == "nvme_spec/NVMe_PCIe_transport.pdf"
-        # Explicit offset wins over the per-module default.
+        # Explicit offset wins over the per-module default. SPEC_PAGE_OFFSET is
+        # in the baseline (page-iteration, 23) convention; toc_rebuild's 24
+        # default keeps its +1 delta so toc and content pages stay aligned.
         assert spec_env.page_offset(23) == 12
+        assert spec_env.page_offset(24) == 13
         assert spec_env.spec_document() == "NVM Express PCIe Transport Specification"
         assert spec_env.spec_version() == "1.1"
     finally:

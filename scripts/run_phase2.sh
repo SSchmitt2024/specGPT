@@ -69,7 +69,7 @@ select_spec() {
       export NVME_SPEC="pcie"
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
-      export SPEC_VERSION="${SPEC_VERSION:-1.1}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
       ;;
   esac
 
@@ -141,25 +141,28 @@ STEP_SCRIPT=(
   "scripts/eval_gen.py"
   "scripts/eval_run.py"
 )
+# Output/input paths are scoped to the active spec's data dir ($SPEC_DATA_DIR,
+# exported by select_spec above; "data" for base, "data/pcie" for pcie).
+DD="$SPEC_DATA_DIR"
 STEP_OUTPUTS=(
-  "data/chunks_prose.json"
-  "data/chunks_tables.json"
-  "data/chunks_embedded.json"
+  "$DD/chunks_prose.json"
+  "$DD/chunks_tables.json"
+  "$DD/chunks_embedded.json"
   ""
   ""
   ""
-  "data/eval_set.json"
-  "data/eval_results.json"
+  "$DD/eval_set.json"
+  "$DD/eval_results.json"
 )
 STEP_INPUTS=(
-  "data/prose.json data/cards.json"
-  "data/tables.json data/cards.json"
-  "data/chunks_prose.json data/chunks_tables.json"
+  "$DD/prose.json $DD/cards.json"
+  "$DD/tables.json $DD/cards.json"
+  "$DD/chunks_prose.json $DD/chunks_tables.json"
   ""
-  "data/chunks_embedded.json"
-  "data/fields.json data/field_index.json data/tables.json"
-  "data/cards.json data/fields.json data/field_index.json"
-  "data/eval_set.json"
+  "$DD/chunks_embedded.json"
+  "$DD/fields.json $DD/field_index.json $DD/tables.json"
+  "$DD/cards.json $DD/fields.json $DD/field_index.json"
+  "$DD/eval_set.json"
 )
 STEP_API=(
   "no"
