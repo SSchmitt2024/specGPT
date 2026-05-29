@@ -1410,6 +1410,18 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
         #global-model-select:focus { outline: none; }
 
+        /* ─── Global spec (middle header) ─────────────────── */
+        #global-spec-select {
+            border: 0;
+            background: transparent;
+            color: var(--text);
+            font-size: 12.5px;
+            font-family: var(--font-sans);
+            cursor: pointer;
+            padding: 2px 0;
+            max-width: 260px;
+        }
+
         /* ─── Loading row ─────────────────────────────────────────────── */
         .loading {
             background: var(--bg);
