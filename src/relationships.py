@@ -526,10 +526,11 @@ def build_relationships(
 # CLI
 
 if __name__ == "__main__":
-    TOC_PATH       = "data/toc.json"
-    TABLES_PATH    = "data/tables.json"
-    PROSE_PATH     = "data/prose.json"          # optional, produced by 1.3
-    OUTPUT_PATH    = "data/relationships.json"
+    from src import spec_env
+    TOC_PATH       = spec_env.data_path("toc.json")
+    TABLES_PATH    = spec_env.data_path("tables.json")
+    PROSE_PATH     = spec_env.data_path("prose.json")          # optional, produced by 1.3
+    OUTPUT_PATH    = spec_env.data_path("relationships.json")
 
     with open(TOC_PATH, encoding="utf-8") as f:
         toc = json.load(f)

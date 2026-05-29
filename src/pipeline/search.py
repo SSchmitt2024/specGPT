@@ -166,7 +166,7 @@ def voyage_client() -> "voyageai.Client":
 # jsonb keys understood by the SQL RPCs.
 _FILTER_KEYS = (
     "content_type", "section_prefix", "has_normative",
-    "figure_number", "spec_version",
+    "figure_number", "spec_version", "spec",
 )
 
 
@@ -196,6 +196,10 @@ def _shape(row: dict, score: float, method: str) -> dict:
         "pdf_pages":     row.get("pdf_pages") or [],
         "figure_number": row.get("figure_number"),
         "has_normative": bool(row.get("has_normative")),
+        # Provenance: which spec this chunk came from (present once the RPCs
+        # return it; None on older deployments). Lets the UI label citations.
+        "spec":          row.get("spec"),
+        "spec_document": row.get("spec_document"),
         "score":         float(score),
         "method":        method,
     }

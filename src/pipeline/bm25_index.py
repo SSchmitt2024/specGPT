@@ -72,7 +72,7 @@ _SCORE_EPS = 1e-9
 # Columns needed to build the index and shape downstream results.
 _CORPUS_COLS = (
     "id, section_id, section_title, content_type, text_raw, "
-    "pdf_pages, figure_number, has_normative, spec_version"
+    "pdf_pages, figure_number, has_normative, spec_version, spec, spec_document"
 )
 
 
@@ -105,6 +105,9 @@ def _matches_filter(row: dict, filt: dict) -> bool:
         return False
     sv = filt.get("spec_version")
     if sv and row.get("spec_version") != sv:
+        return False
+    sp_spec = filt.get("spec")
+    if sp_spec and row.get("spec") != sp_spec:
         return False
     return True
 

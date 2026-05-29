@@ -43,16 +43,19 @@ from .client import generate_json
 # ---------------------------------------------------------------------------
 # Paths
 
-TOC_PATH = "data/toc.json"
-PROSE_PATH = "data/prose.json"
-TABLES_PATH = "data/tables.json"
-RELATIONSHIPS_PATH = "data/relationships.json"
-OUTPUT_PATH = "data/cards.json"
-STATE_PATH = "data/cards_state.json"
+from src import spec_env
 
-# Spec identity (override via CLI if multiple specs get indexed).
-DEFAULT_SPEC_DOCUMENT = "NVM Express Base Specification"
-DEFAULT_SPEC_VERSION = "2.1"
+TOC_PATH = spec_env.data_path("toc.json")
+PROSE_PATH = spec_env.data_path("prose.json")
+TABLES_PATH = spec_env.data_path("tables.json")
+RELATIONSHIPS_PATH = spec_env.data_path("relationships.json")
+OUTPUT_PATH = spec_env.data_path("cards.json")
+STATE_PATH = spec_env.data_path("cards_state.json")
+
+# Spec identity. Defaults come from the active spec (NVME_SPEC env), and can
+# still be overridden per-run via the CLI flags below.
+DEFAULT_SPEC_DOCUMENT = spec_env.spec_document()
+DEFAULT_SPEC_VERSION = spec_env.spec_version()
 
 # LLM-summary gating.
 #

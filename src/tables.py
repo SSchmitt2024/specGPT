@@ -978,10 +978,11 @@ def extract_tables(
 # CLI
 
 if __name__ == "__main__":
-    PDF_PATH        = "nvme_spec/NVMe_spec_full.pdf"
-    PAGE_OFFSET     = 23  # PDF idx 24 is printed p.1
+    from src import spec_env
+    PDF_PATH        = spec_env.pdf_path()
+    PAGE_OFFSET     = spec_env.page_offset(23)  # PDF idx 24 is printed p.1
     FIRST_CONTENT   = 24  # skip cover + TOC
-    OUTPUT_PATH     = "data/tables.json"
+    OUTPUT_PATH     = spec_env.data_path("tables.json")
 
     tables = extract_tables(
         PDF_PATH,

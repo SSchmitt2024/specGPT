@@ -40,6 +40,11 @@ BATCH_SIZE = 200
 ALL_TABLES = ("fields", "field_index", "tables")
 
 
+def _spec() -> str:
+    """Active spec id from the environment (set by the runner scripts)."""
+    return (os.getenv("NVME_SPEC") or "base").strip().lower() or "base"
+
+
 # ---------------------------------------------------------------------------
 # Env / client
 
@@ -68,8 +73,9 @@ def _get_client():
 # ---------------------------------------------------------------------------
 # Row builders
 
-def _fields_row(record: dict) -> dict:
+def _fields_row(record: dict, spec: str) -> dict:
     return {
+        "spec":          spec,
         "name":          str(record.get("field_name") or "").upper().strip(),
         "description":   record.get("description"),
         "offset":        str(record.get("offset") or "") or None,
@@ -79,7 +85,7 @@ def _fields_row(record: dict) -> dict:
     }
 
 
-def _field_index_rows(field_index: dict) -> list[dict]:
+def _field_index_rows(field_index: dict, spec: str) -> list[dict]:
     """Flatten field_index dict (name → [records]) into rows."""
     rows: list[dict] = []
     for field_name, entries in field_index.items():
@@ -87,6 +93,7 @@ def _field_index_rows(field_index: dict) -> list[dict]:
             entries = [entries]
         for entry in entries:
             rows.append({
+                "spec":          spec,
                 "field_name":    field_name.upper().strip(),
                 "section_id":    entry.get("section_id"),
                 "figure_number": str(entry.get("figure_number") or "") or None,
@@ -95,11 +102,12 @@ def _field_index_rows(field_index: dict) -> list[dict]:
     return rows
 
 
-def _tables_row(record: dict) -> dict | None:
+def _tables_row(record: dict, spec: str) -> dict | None:
     fig = record.get("figure_number")
     if fig is None:
         return None
     return {
+        "spec":          spec,
         "figure_number": str(fig),
         "title":         record.get("title"),
         "section_id":    record.get("section_id"),
@@ -128,15 +136,15 @@ def _upsert_batched(client, table: str, rows: list[dict], conflict_col: str | No
     return uploaded
 
 
-def load_fields(client, data_dir: Path) -> None:
+def load_fields(client, data_dir: Path, spec: str) -> None:
     path = data_dir / "fields.json"
     records = json.loads(path.read_text(encoding="utf-8"))
-    rows = [_fields_row(r) for r in records if r.get("field_name")]
+    rows = [_fields_row(r, spec) for r in records if r.get("field_name")]
     # Remove rows with empty name after normalization
     rows = [r for r in rows if r["name"]]
     # The same field name can appear in multiple registers; spec_fields uses
-    # name as PRIMARY KEY, so keep the first occurrence. field_index.json is
-    # the authoritative store for "same name, multiple locations".
+    # (spec, name) as PRIMARY KEY, so keep the first occurrence. field_index.json
+    # is the authoritative store for "same name, multiple locations".
     seen: set = set()
     deduped: list[dict] = []
     for r in rows:
@@ -145,28 +153,29 @@ def load_fields(client, data_dir: Path) -> None:
         seen.add(r["name"])
         deduped.append(r)
     rows = deduped
-    print(f"spec_fields: upserting {len(rows)} rows...")
-    n = _upsert_batched(client, "spec_fields", rows, conflict_col="name")
+    print(f"spec_fields: upserting {len(rows)} rows (spec={spec})...")
+    n = _upsert_batched(client, "spec_fields", rows, conflict_col="spec,name")
     print(f"  done — {n} rows")
 
 
-def load_field_index(client, data_dir: Path) -> None:
+def load_field_index(client, data_dir: Path, spec: str) -> None:
     path = data_dir / "field_index.json"
     field_index = json.loads(path.read_text(encoding="utf-8"))
-    rows = _field_index_rows(field_index)
-    print(f"spec_field_index: replacing {len(rows)} rows...")
-    # Delete all then insert — no natural unique key across (name, section, figure)
-    client.table("spec_field_index").delete().neq("id", 0).execute()
+    rows = _field_index_rows(field_index, spec)
+    print(f"spec_field_index: replacing {len(rows)} rows (spec={spec})...")
+    # Delete only THIS spec's rows then insert — no natural unique key across
+    # (spec, name, section, figure), and we must not wipe the other spec.
+    client.table("spec_field_index").delete().eq("spec", spec).execute()
     n = _upsert_batched(client, "spec_field_index", rows)
     print(f"  done — {n} rows")
 
 
-def load_tables(client, data_dir: Path) -> None:
+def load_tables(client, data_dir: Path, spec: str) -> None:
     path = data_dir / "tables.json"
     records = json.loads(path.read_text(encoding="utf-8"))
-    rows = [r for r in (_tables_row(rec) for rec in records) if r is not None]
-    print(f"spec_tables: upserting {len(rows)} rows...")
-    n = _upsert_batched(client, "spec_tables", rows, conflict_col="figure_number")
+    rows = [r for r in (_tables_row(rec, spec) for rec in records) if r is not None]
+    print(f"spec_tables: upserting {len(rows)} rows (spec={spec})...")
+    n = _upsert_batched(client, "spec_tables", rows, conflict_col="spec,figure_number")
     print(f"  done — {n} rows")
 
 
@@ -175,6 +184,7 @@ def load_tables(client, data_dir: Path) -> None:
 
 def run(data_dir: Path, tables: list[str]) -> None:
     client = _get_client()
+    spec = _spec()
 
     loaders = {
         "fields":      load_fields,
@@ -191,7 +201,7 @@ def run(data_dir: Path, tables: list[str]) -> None:
         if not path_map[name].exists():
             print(f"ERROR: {path_map[name]} not found — skipping {name}")
             continue
-        loaders[name](client, data_dir)
+        loaders[name](client, data_dir, spec)
 
     print("\nAll done.")
 
@@ -201,8 +211,9 @@ def _main(argv: list[str]) -> int:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data"),
-        help="Directory containing fields.json, field_index.json, tables.json",
+        default=Path(os.getenv("SPEC_DATA_DIR", "data")),
+        help="Directory containing fields.json, field_index.json, tables.json "
+             "(defaults to $SPEC_DATA_DIR or 'data')",
     )
     parser.add_argument(
         "--tables",

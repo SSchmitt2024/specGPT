@@ -12,3 +12,5 @@ CLAUDE.md
 /Backups
 ruvector.db
 *.db
+.DS_Store
+

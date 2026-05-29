@@ -81,7 +81,10 @@ def test_extract_citations_strips_trailing_dot():
     )
     assert cits == [{
         "section_id": "5.2.1", "section_title": "X",
-        "content_type": "prose", "hallucinated": False,
+        "content_type": "prose",
+        # Provenance fields default to None/[] when the context chunk omits them.
+        "spec": None, "spec_document": None, "pdf_pages": [],
+        "hallucinated": False,
     }]
 
 

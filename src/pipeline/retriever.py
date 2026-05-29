@@ -40,9 +40,19 @@ logger = logging.getLogger(__name__)
 
 
 DATA_DIR = Path("data")
-FIELD_INDEX_PATH = DATA_DIR / "field_index.json"
-FIELDS_PATH = DATA_DIR / "fields.json"
-TABLES_PATH = DATA_DIR / "tables.json"
+
+DEFAULT_SPEC = "base"
+
+
+def _norm_spec(spec: str | None) -> str:
+    return (spec or DEFAULT_SPEC).strip().lower() or DEFAULT_SPEC
+
+
+def _spec_data_dir(spec: str) -> Path:
+    """Local-JSON fallback dir for a spec. Base lives at data/; others under
+    data/<spec>/ (mirrors scripts/rerun_pipeline.sh's SPEC_DATA_DIR)."""
+    spec = _norm_spec(spec)
+    return DATA_DIR if spec == DEFAULT_SPEC else DATA_DIR / spec
 
 # Page size for paginated Supabase reads. PostgREST may impose a server-side
 # `db-max-rows` cap below this, so loaders advance by the actual rows
@@ -50,11 +60,12 @@ TABLES_PATH = DATA_DIR / "tables.json"
 _LOOKUP_PAGE_SIZE = 1000
 
 
-def _paginate(table: str, columns: str, *, order_col: str) -> list[dict]:
+def _paginate(table: str, columns: str, *, order_col: str, spec: str | None = None) -> list[dict]:
     """Page through `table` selecting `columns`, ordered by `order_col`.
 
-    Robust against PostgREST max-rows truncation: advance by actual batch
-    size and stop only on empty batch.
+    When `spec` is given, restrict to rows tagged with that spec so Base and
+    PCIe lookups stay isolated. Robust against PostgREST max-rows truncation:
+    advance by actual batch size and stop only on empty batch.
     """
     from src.pipeline.search import supabase_client
 
@@ -62,9 +73,11 @@ def _paginate(table: str, columns: str, *, order_col: str) -> list[dict]:
     rows: list[dict] = []
     start = 0
     while True:
+        builder = client.table(table).select(columns)
+        if spec is not None:
+            builder = builder.eq("spec", spec)
         resp = (
-            client.table(table)
-            .select(columns)
+            builder
             .order(order_col)
             .range(start, start + _LOOKUP_PAGE_SIZE - 1)
             .execute()
@@ -117,18 +130,20 @@ def _supabase_available() -> bool:
     return False
 
 
-@lru_cache(maxsize=1)
-def load_field_index() -> dict[str, list[dict]]:
+@lru_cache(maxsize=None)
+def load_field_index(spec: str = DEFAULT_SPEC) -> dict[str, list[dict]]:
     """
-    Map field_name → list of field records.
+    Map field_name → list of field records, scoped to `spec`.
 
-    When Supabase is configured, the read is paginated so PostgREST's
-    server-side row cap can't silently truncate the field index. Falls
-    back to the local JSON snapshot when Supabase isn't configured.
+    When Supabase is configured, the read is paginated (and filtered by spec)
+    so PostgREST's server-side row cap can't silently truncate the field
+    index. Falls back to the spec's local JSON snapshot when Supabase isn't
+    configured. Cached per spec.
     """
+    spec = _norm_spec(spec)
     if _supabase_available():
         try:
-            rows = _paginate("spec_field_index", "field_name, data", order_col="id")
+            rows = _paginate("spec_field_index", "field_name, data", order_col="id", spec=spec)
             result: dict[str, list[dict]] = {}
             for row in rows:
                 result.setdefault(row["field_name"], []).append(row["data"])
@@ -138,35 +153,37 @@ def load_field_index() -> dict[str, list[dict]]:
             # serving an empty index for the rest of the process lifetime.
         except Exception as e:  # noqa: BLE001
             logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
-    with open(FIELD_INDEX_PATH, encoding="utf-8") as f:
+    with open(_spec_data_dir(spec) / "field_index.json", encoding="utf-8") as f:
         return json.load(f)
 
 
-@lru_cache(maxsize=1)
-def load_fields() -> list[dict]:
+@lru_cache(maxsize=None)
+def load_fields(spec: str = DEFAULT_SPEC) -> list[dict]:
+    spec = _norm_spec(spec)
     if _supabase_available():
         try:
-            rows = _paginate("spec_fields", "data", order_col="name")
+            rows = _paginate("spec_fields", "data", order_col="name", spec=spec)
             result = [row["data"] for row in rows]
             if result:
                 return result
         except Exception as e:  # noqa: BLE001
             logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
-    with open(FIELDS_PATH, encoding="utf-8") as f:
+    with open(_spec_data_dir(spec) / "fields.json", encoding="utf-8") as f:
         return json.load(f)
 
 
-@lru_cache(maxsize=1)
-def load_tables_by_figure() -> dict[str, dict]:
+@lru_cache(maxsize=None)
+def load_tables_by_figure(spec: str = DEFAULT_SPEC) -> dict[str, dict]:
+    spec = _norm_spec(spec)
     if _supabase_available():
         try:
-            rows = _paginate("spec_tables", "figure_number, data", order_col="figure_number")
+            rows = _paginate("spec_tables", "figure_number, data", order_col="figure_number", spec=spec)
             result = {str(r["figure_number"]): r["data"] for r in rows if r.get("figure_number")}
             if result:
                 return result
         except Exception as e:  # noqa: BLE001
             logger.warning("Supabase lookup load failed (%s); falling back to local JSON snapshot", e)
-    with open(TABLES_PATH, encoding="utf-8") as f:
+    with open(_spec_data_dir(spec) / "tables.json", encoding="utf-8") as f:
         tables = json.load(f)
     return {str(t.get("figure_number")): t for t in tables if t.get("figure_number") is not None}
 
@@ -406,9 +423,10 @@ def structured_lookup(
     *,
     use_llm: bool = False,
     max_fields: int = 8,
+    spec: str = DEFAULT_SPEC,
 ) -> StructuredLookupResult:
     """
-    Return exact field/table evidence for lookup-style queries.
+    Return exact field/table evidence for lookup-style queries, scoped to `spec`.
 
     Pass either a raw query string or the output of `process_query()`. For raw
     strings, `use_llm=False` by default so this can run cheaply inside a web
@@ -428,8 +446,8 @@ def structured_lookup(
     if not query:
         raise ValueError("query is empty")
 
-    field_index = load_field_index()
-    tables_by_figure = load_tables_by_figure()
+    field_index = load_field_index(spec)
+    tables_by_figure = load_tables_by_figure(spec)
 
     bit_ranges = _query_bit_ranges(query)
     field_keys = _field_keys_from_entities(entities)
