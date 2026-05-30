@@ -247,7 +247,7 @@ _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "y
 # the value the retrievers filter on. Add a row here when a new transport
 # corpus (e.g. RDMA/TCP) is ingested.
 AVAILABLE_SPECS = [
-    {"id": "base", "label": "Base Specification", "version": "2.1"},
+    {"id": "base", "label": "Base Specification", "version": "2.3"},
     {"id": "pcie", "label": "PCIe Transport", "version": "1.3"},
 ]
 _VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
