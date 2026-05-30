@@ -1109,6 +1109,7 @@ a { color: var(--accent); text-decoration: none; }
 .empty-mark { width:52px; height:52px; border-radius:14px; background:var(--surface); border:1px solid var(--border);
   display:grid; place-items:center; margin:0 auto 18px; box-shadow:var(--shadow-sm); color:var(--ink); }
 .empty-mark svg { width:26px; height:26px; }
+.empty-mark img { width:34px; height:34px; object-fit:contain; }
 .empty h2 { font-size:22px; font-weight:600; letter-spacing:-0.025em; margin-bottom:8px; }
 .empty p { font-size:14px; color:var(--t-subtle); max-width:460px; margin:0 auto 26px; line-height:1.6; }
 .examples { display:flex; flex-wrap:wrap; gap:9px; justify-content:center; max-width:720px; margin:0 auto; }
@@ -1226,8 +1227,7 @@ a { color: var(--accent); text-decoration: none; }
 .pipe { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); overflow:hidden; }
 .pipe-head { display:flex; align-items:center; gap:12px; padding:13px 18px; width:100%; background:transparent; border:0; text-align:left; transition:background .12s; }
 .pipe-head:hover { background:var(--surface-2); }
-.pipe-head > .lead { width:18px; height:18px; color:var(--t-subtle); flex:none; }
-.pipe-head > img.lead { object-fit:contain; }
+.pipe-head > svg.lead { width:16px; height:16px; color:var(--t-subtle); flex:none; }
 .pipe-title { font-size:13px; font-weight:600; color:var(--ink); white-space:nowrap; }
 .pipe-summary { display:flex; gap:14px; font-size:12px; color:var(--t-subtle); font-family:var(--mono); white-space:nowrap; margin-left:6px; }
 .pipe-summary b { color:var(--t-muted); font-weight:500; }
@@ -1566,7 +1566,7 @@ a { color: var(--accent); text-decoration: none; }
 
             <div id="empty-state" class="empty">
                 <div class="empty-mark">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
+                    <img src="/static/favicon.png" alt="">
                 </div>
                 <h2>Ask the NVMe specification anything</h2>
                 <p>Type a question and get a grounded, citation-backed answer. Every source
@@ -1602,8 +1602,7 @@ a { color: var(--accent); text-decoration: none; }
 
                             <div id="pipeline-disclosure" class="pipe">
                                 <button class="pipe-head" id="pipe-head" type="button">
-                                    <img class="lead" src="/static/favicon.png" alt="">
-
+                                    <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
                                     <span class="pipe-title">How this answer was found</span>
                                     <span class="pipe-summary" id="pipe-summary"></span>
                                     <span class="pipe-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
