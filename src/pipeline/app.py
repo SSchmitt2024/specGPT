@@ -1109,7 +1109,7 @@ a { color: var(--accent); text-decoration: none; }
 .empty-mark { width:52px; height:52px; border-radius:14px; background:var(--surface); border:1px solid var(--border);
   display:grid; place-items:center; margin:0 auto 18px; box-shadow:var(--shadow-sm); color:var(--ink); }
 .empty-mark svg { width:26px; height:26px; }
-.empty-mark img { width:34px; height:34px; object-fit:contain; }
+.empty-mark img { width:41px; height:41px; object-fit:contain; }
 .empty h2 { font-size:22px; font-weight:600; letter-spacing:-0.025em; margin-bottom:8px; }
 .empty p { font-size:14px; color:var(--t-subtle); max-width:460px; margin:0 auto 26px; line-height:1.6; }
 .examples { display:flex; flex-wrap:wrap; gap:9px; justify-content:center; max-width:720px; margin:0 auto; }
