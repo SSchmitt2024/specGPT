@@ -4087,10 +4087,10 @@ a { color: var(--accent); text-decoration: none; }
         /* ── empty-state examples ────────────────────────────────────────── */
         (function () {
             var EXAMPLES = [
-                "What does CIRN indicate?",
-                "What does CIU indicate?",
-                "Which Identify Controller fields relate to RTD3?",
-                "What is the role of the ANARS bit in CMIC?"
+                "Which command's Dword tells you whether a feature is saveable?",
+                "Which bit in OACS indicates whether directives are supported?",
+                "How do you unfreeze a personality using PCAS?",
+                "Which feature corresponds to FID 17h?"
             ];
             var box = document.getElementById("examples");
             if (!box) return;
