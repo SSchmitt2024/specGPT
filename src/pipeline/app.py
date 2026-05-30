@@ -5,28 +5,28 @@ Exposes the full retrieval + generation pipeline as a web service, gated
 by a shared-password login (see src/pipeline/auth.py for the threat model).
 
 Endpoints (auth-gated unless marked public):
-  GET  /healthz       — public liveness check (Railway/k8s healthcheck)
-  GET  /login         — public; renders the password form
-  POST /login         — public; validates password, sets session cookie
-  POST /logout        — public; clears session cookie
-  GET  /              — gated; serves the web UI (or redirects to /login)
-  POST /api/query     — gated; runs the pipeline
-  GET  /api/config    — gated; returns default PipelineConfig
+  GET  /healthz       - public liveness check (Railway/k8s healthcheck)
+  GET  /login         - public; renders the password form
+  POST /login         - public; validates password, sets session cookie
+  POST /logout        - public; clears session cookie
+  GET  /              - gated; serves the web UI (or redirects to /login)
+  POST /api/query     - gated; runs the pipeline
+  GET  /api/config    - gated; returns default PipelineConfig
 
 Required env vars:
-  APP_PASSWORD     — plaintext shared password (hashed at startup, wiped from memory)
-  SESSION_SECRET   — ≥16-byte string used as HMAC key for session cookies
-  SUPABASE_URL / SUPABASE_KEY / VOYAGE_API_KEY / ANTHROPIC_API_KEY — pipeline backends
+  APP_PASSWORD     - plaintext shared password (hashed at startup, wiped from memory)
+  SESSION_SECRET   - ≥16-byte string used as HMAC key for session cookies
+  SUPABASE_URL / SUPABASE_KEY / VOYAGE_API_KEY / ANTHROPIC_API_KEY - pipeline backends
 
 Optional env vars (model backends):
-  GEMINI_API_KEY   — required when using any gemini-* model
+  GEMINI_API_KEY   - required when using any gemini-* model
 
 Optional env vars:
-  DEBUG_PIPELINE   — "1" to include full trace in responses (default: off)
-  PORT             — server port (default: 8000)
-  HOST             — server host (default: 127.0.0.1)
-  COOKIE_SECURE    — "0" to allow non-HTTPS cookies for local dev (default: on)
-  LOG_LEVEL        — Python logging level (default: INFO)
+  DEBUG_PIPELINE   - "1" to include full trace in responses (default: off)
+  PORT             - server port (default: 8000)
+  HOST             - server host (default: 127.0.0.1)
+  COOKIE_SECURE    - "0" to allow non-HTTPS cookies for local dev (default: on)
+  LOG_LEVEL        - Python logging level (default: INFO)
 
 Run:
   python -m src.pipeline.app
@@ -36,6 +36,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -48,7 +49,7 @@ from pathlib import Path
 def _load_dotenv(path: str = ".env") -> int:
     """Populate `os.environ` from a KEY=value file. Production env vars win.
 
-    Only meaningful for local dev — Railway/Cloudflare/etc. inject vars
+    Only meaningful for local dev - Railway/Cloudflare/etc. inject vars
     directly and there is no .env file to find. Without this, the Anthropic
     SDK (which reads `ANTHROPIC_API_KEY` from `os.environ`) and any other
     consumer of plain `os.environ` can't see `.env` settings, even though
@@ -77,7 +78,7 @@ _load_dotenv()
 
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -184,12 +185,12 @@ class QueryResponse(BaseModel):
     # when the model would have requested more context.
     gap_hint: dict | None = None
     # Opaque handle the UI passes to /api/refine to resume from the
-    # already-computed first-pass state (no Stages 1–4 redo).
+    # already-computed first-pass state (no Stages 1-4 redo).
     request_id: str | None = None
 
 
 class RefineRequest(BaseModel):
-    """Request body for /api/refine — resumes the prior /api/query call by
+    """Request body for /api/refine - resumes the prior /api/query call by
     request_id, runs only Stage 5 (gap analysis + targeted fetch + follow-up
     retrieval + re-rerank + Opus regen) against the cached first-pass state.
     """
@@ -199,7 +200,7 @@ class RefineRequest(BaseModel):
 
 
 # ============================================================================
-# Refine cache — in-process LRU mapping request_id → first-pass state.
+# Refine cache - in-process LRU mapping request_id → first-pass state.
 #
 # Cleared on process restart; bounded so a noisy session can't OOM the box.
 # Single-worker uvicorn is the supported deploy, so the in-process cache is
@@ -237,7 +238,7 @@ DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "0").lower() in ("1", "true", "yes"
 
 # Separate switch from DEBUG_PIPELINE: /docs, /redoc, /openapi.json are auto-
 # added by FastAPI with NO auth. They don't let anyone call gated endpoints,
-# but they enumerate the API surface to unauthenticated visitors — different
+# but they enumerate the API surface to unauthenticated visitors - different
 # blast radius than the trace, so it gets its own variable. Off by default.
 _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "yes")
 
@@ -270,7 +271,7 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 def _client_ip(request: Request) -> str:
     """Best-effort client IP. Trusts X-Forwarded-For only if explicitly opted in
-    via TRUST_PROXY_HEADERS=1 — otherwise the throttle can be bypassed by
+    via TRUST_PROXY_HEADERS=1 - otherwise the throttle can be bypassed by
     spoofing the header."""
     if os.getenv("TRUST_PROXY_HEADERS", "0").lower() in ("1", "true", "yes"):
         fwd = request.headers.get("x-forwarded-for")
@@ -326,15 +327,23 @@ def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
   <link rel="icon" type="image/png" href="/static/favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {{
-      --bg: #ffffff; --bg-soft: #fafaf9; --bg-muted: #f5f5f4;
-      --border: #e7e5e4; --border-strong: #d6d3d1;
-      --text: #1c1917; --text-muted: #57534e; --text-subtle: #78716c; --text-faint: #a8a29e;
-      --accent: #1c1917; --danger: #b91c1c;
-      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+      --bg: #ffffff; --bg-soft: #fbfbfc; --bg-muted: #f1f1f4;
+      --border: #e7e7eb; --border-strong: #dadadf;
+      --text: #18181b; --text-muted: #52525b; --text-subtle: #71717a; --text-faint: #a1a1aa;
+      --accent: #2d68e6; --danger: #dc2626;
+      --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #141417; --bg-soft: #0c0c0e; --bg-muted: #1d1d23;
+        --border: #26262d; --border-strong: #33333c;
+        --text: #f4f4f5; --text-muted: #a1a1aa; --text-subtle: #8a8a93; --text-faint: #5f5f68;
+        --accent: #5b8cff; --danger: #f87171;
+      }}
     }}
     * {{ box-sizing: border-box; }}
     body {{ font-family: var(--font-sans);
@@ -409,9 +418,9 @@ def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    """Liveness check — intentionally unauthenticated so external healthchecks work.
+    """Liveness check - intentionally unauthenticated so external healthchecks work.
 
-    Does NOT exercise Supabase/Voyage/Anthropic — those have cost. It just
+    Does NOT exercise Supabase/Voyage/Anthropic - those have cost. It just
     confirms the process is up and importing. Add a /readyz if you ever
     want a deep healthcheck.
     """
@@ -507,7 +516,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
     latency_ms = (time.time() - start) * 1000
 
     # Cache first-pass state so /api/refine can resume without redoing
-    # Stages 1–4. Only meaningful when the request landed in non-agentic
+    # Stages 1-4. Only meaningful when the request landed in non-agentic
     # mode (agentic queries already ran the loop and have nothing to resume).
     if not req.agentic:
         _refine_cache_set(request_id, {
@@ -533,10 +542,105 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
     )
 
 
+def _dump_model(model: BaseModel) -> dict:
+    """Serialize a pydantic model to a plain dict across pydantic v1/v2."""
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+@app.post("/api/query/stream")
+async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_auth)):
+    """Streaming variant of /api/query.
+
+    Emits newline-delimited JSON: a ``{"type":"progress","stage","took_ms"}``
+    line as each pipeline stage completes, then a terminal
+    ``{"type":"done","data": <QueryResponse>}`` (or ``{"type":"error",...}``).
+    The final ``data`` payload is identical to what /api/query returns, so the
+    client renders it the same way. Same auth + validation as /api/query.
+    """
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="query cannot be empty")
+    try:
+        config = PipelineConfig(**(req.config or {}))
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid config: {e}")
+    if config.spec not in _VALID_SPEC_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown spec: {config.spec!r}")
+
+    debug_trace = req.debug and DEBUG_PIPELINE
+    request_id = uuid.uuid4().hex[:12]
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_progress(evt: dict) -> None:
+        # Invoked from the orchestrate worker thread; hop back onto the loop.
+        loop.call_soon_threadsafe(queue.put_nowait, {"type": "progress", **evt})
+
+    async def _drive() -> None:
+        start = time.time()
+        try:
+            result = await asyncio.to_thread(
+                orchestrate, req.query, config=config, debug=debug_trace,
+                agentic=req.agentic, on_progress=on_progress,
+            )
+            latency_ms = (time.time() - start) * 1000
+            if not req.agentic:
+                _refine_cache_set(request_id, {
+                    "query": result["query"],
+                    "deduplicated": result.get("deduplicated") or [],
+                    "answer": result["answer"],
+                    "citations": result["citations"],
+                    "context_chunks": result.get("sources") or [],
+                    "tokens_used": result.get("tokens_used"),
+                })
+            resp = QueryResponse(
+                query=result["query"],
+                answer=result["answer"],
+                citations=result["citations"],
+                config=result["config"],
+                pipeline_trace=result.get("pipeline_trace") if debug_trace else None,
+                latency_ms=latency_ms,
+                tokens_used=result.get("tokens_used"),
+                agentic=bool(result.get("agentic")),
+                gap_hint=result.get("gap_hint"),
+                request_id=request_id if not req.agentic else None,
+            )
+            queue.put_nowait({"type": "done", "data": _dump_model(resp)})
+        except GenerationError as e:
+            logger.warning("Stream generation failure [%s]: %s", request_id, e.cause)
+            detail = _generation_error_detail(e, request_id, include_trace=debug_trace)
+            queue.put_nowait({"type": "error", "detail": detail})
+        except Exception as e:
+            logger.exception("Stream pipeline error [%s]: %s", request_id, e)
+            queue.put_nowait({"type": "error",
+                              "detail": {"error": "pipeline_error", "request_id": request_id}})
+        finally:
+            queue.put_nowait(None)  # sentinel: end of stream
+
+    async def _gen():
+        task = asyncio.create_task(_drive())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield json.dumps(item) + "\n"
+        finally:
+            # Client disconnected or stream closed; stop driving. The orchestrate
+            # worker thread can't be force-killed but its result is discarded.
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        _gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/refine", response_model=QueryResponse)
 async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -> QueryResponse:
     """Resume a prior /api/query by request_id and run the agentic
-    refinement against the cached first-pass state — no Stages 1–4 redo.
+    refinement against the cached first-pass state - no Stages 1-4 redo.
     Returns the same QueryResponse shape as /api/query with the refined
     Opus answer.
     """
@@ -602,6 +706,94 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         agentic=True,
         gap_hint=None,
         request_id=req.request_id,
+    )
+
+
+@app.post("/api/refine/stream")
+async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_auth)):
+    """Streaming variant of /api/refine — same NDJSON protocol as
+    /api/query/stream (progress lines, then a terminal done/error). Lets the
+    UI show live agentic-loop progress during the Opus regen, which is the
+    longest-running path (20–60s)."""
+    seed = _refine_cache_get(req.request_id)
+    if seed is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "refine_state_missing",
+                    "note": "request_id is unknown or has been evicted from the cache; resubmit the original query"},
+        )
+    try:
+        config = PipelineConfig(**(req.config or {}))
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid config: {e}")
+    if config.spec not in _VALID_SPEC_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown spec: {config.spec!r}")
+
+    debug_trace = req.debug and DEBUG_PIPELINE
+    request_id = req.request_id
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_progress(evt: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, {"type": "progress", **evt})
+
+    async def _drive() -> None:
+        start = time.time()
+        try:
+            result = await asyncio.to_thread(
+                orchestrate, seed["query"], config=config, debug=debug_trace,
+                agentic=True, refine_seed=seed, on_progress=on_progress,
+            )
+            latency_ms = (time.time() - start) * 1000
+            # Refresh cache so a second refine builds on the latest Opus output.
+            _refine_cache_set(request_id, {
+                "query": result["query"],
+                "deduplicated": result.get("deduplicated") or [],
+                "answer": result["answer"],
+                "citations": result["citations"],
+                "context_chunks": result.get("sources") or [],
+                "tokens_used": result.get("tokens_used"),
+            })
+            resp = QueryResponse(
+                query=result["query"],
+                answer=result["answer"],
+                citations=result["citations"],
+                config=result["config"],
+                pipeline_trace=result.get("pipeline_trace") if debug_trace else None,
+                latency_ms=latency_ms,
+                tokens_used=result.get("tokens_used"),
+                agentic=True,
+                gap_hint=None,
+                request_id=request_id,
+            )
+            queue.put_nowait({"type": "done", "data": _dump_model(resp)})
+        except GenerationError as e:
+            logger.warning("Stream refine generation failure [%s]: %s", request_id, e.cause)
+            detail = _generation_error_detail(e, request_id, include_trace=debug_trace)
+            queue.put_nowait({"type": "error", "detail": detail})
+        except Exception as e:
+            logger.exception("Stream refine error [%s]: %s", request_id, e)
+            queue.put_nowait({"type": "error",
+                              "detail": {"error": "refine_error", "request_id": request_id}})
+        finally:
+            queue.put_nowait(None)
+
+    async def _gen():
+        task = asyncio.create_task(_drive())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield json.dumps(item) + "\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        _gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -676,1662 +868,525 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <link rel="icon" type="image/png" href="/static/favicon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        /* ─── Minimalist internal-tool theme ────────────────────────────
-           Adapted from the Claude Design handoff bundle: Linear/Vercel/Stripe
-           dashboard aesthetic — single near-black accent on stone backgrounds,
-           hairline borders, Inter UI + JetBrains Mono for technical data. All
-           existing class names and HTML structure preserved. */
-        :root {
-            --bg: #ffffff;
-            --bg-soft: #fafaf9;
-            --bg-muted: #f5f5f4;
-            --border: #e7e5e4;
-            --border-strong: #d6d3d1;
-            --text: #1c1917;
-            --text-muted: #57534e;
-            --text-subtle: #78716c;
-            --text-faint: #a8a29e;
-            --accent: #1c1917;
-            --accent-soft: #f5f5f4;
-            --danger: #b91c1c;
-            --warn: #a16207;
-            --ok: #15803d;
-            --indigo: #4f46e5;
-            --radius: 6px;
-            --radius-sm: 4px;
-            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
-            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
-            --focus-ring: 0 0 0 3px rgba(28,25,23,0.08);
-        }
+:root {
+  /* zinc neutrals */
+  --canvas:   #fbfbfc;
+  --surface:  #ffffff;
+  --surface-2:#f6f6f8;
+  --subtle:   #f1f1f4;
+  --border:   #e7e7eb;
+  --border-2: #dadadf;
+  --ink:      #18181b;
+  --t-strong: #27272a;
+  --t-muted:  #52525b;
+  --t-subtle: #71717a;
+  --t-faint:  #a1a1aa;
+  --accent:      #2d68e6;
+  --accent-ink:  #1d4ed8;
+  --accent-soft: #eef3fe;
+  --accent-bd:   #cbdcfb;
+  --ok:    #15803d;
+  --ok-soft:#e8f6ee;
+  --warn:  #b45309;
+  --warn-soft:#fbf2e3;
+  --danger:#dc2626;
+  --danger-soft:#fdecec;
+  /* aliases used by legacy engine CSS */
+  --bg: var(--canvas); --bg-soft: var(--surface-2); --bg-muted: var(--subtle);
+  --text: var(--ink); --text-muted: var(--t-muted); --text-subtle: var(--t-subtle); --text-faint: var(--t-faint);
+  --border-strong: var(--border-2);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-sans: var(--sans);
+  --font-mono: var(--mono);
+  --shadow-sm: 0 1px 2px rgba(24,24,27,.05);
+  --shadow-md: 0 4px 16px -6px rgba(24,24,27,.12), 0 1px 3px rgba(24,24,27,.06);
+  --shadow-pop: 0 12px 40px -8px rgba(24,24,27,.22), 0 2px 8px rgba(24,24,27,.10);
+  --pad-shell: 32px;
+  --gap-block: 22px;
+  --composer-pad: 18px;
+  --answer-fs: 15px;
+}
+.density-compact { --pad-shell: 22px; --gap-block: 14px; --composer-pad: 13px; --answer-fs: 14px; }
+.density-comfy   { --pad-shell: 44px; --gap-block: 30px; --composer-pad: 24px; --answer-fs: 16px; }
 
-        /* ─── Dark theme ──────────────────────────────────────────────────
-           Activated by data-theme="dark" on <html> (see the boot script in
-           <head> + the top-left toggle). The whole UI is driven by the
-           tokens above, so flipping them recolours nearly everything; a few
-           targeted overrides below cover surfaces with hardcoded colours
-           (primary buttons, agentic popups, the red robot button). */
-        html[data-theme="dark"] {
-            --bg: #1c1917;
-            --bg-soft: #171411;
-            --bg-muted: #292524;
-            --border: #2c2825;
-            --border-strong: #44403c;
-            --text: #f5f5f4;
-            --text-muted: #d6d3d1;
-            --text-subtle: #a8a29e;
-            --text-faint: #78716c;
-            --accent: #6366f1;
-            --accent-soft: #292524;
-            --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
-            --focus-ring: 0 0 0 3px rgba(99,102,241,0.3);
-        }
-        html[data-theme="dark"] body { background: #0f0d0b; }
-        /* Primary (accent) buttons keep white text; just fix the hover that
-           hardcodes pure black in light mode. config-toggle/cost-summary set
-           their own bg via higher-specificity rules and are unaffected. */
-        html[data-theme="dark"] button:hover { background: #4f46e5; border-color: #4f46e5; }
-        /* Agentic confirm/config popups (hardcoded light palette). */
-        html[data-theme="dark"] .ag-confirm,
-        html[data-theme="dark"] .ag-config {
-            background: var(--bg); border-color: var(--border-strong); color: var(--text);
-            box-shadow: 0 12px 40px rgba(0,0,0,0.55);
-        }
-        html[data-theme="dark"] .ag-confirm-sub,
-        html[data-theme="dark"] .ag-config-sub,
-        html[data-theme="dark"] .ag-confirm-key { color: var(--text-subtle); }
-        html[data-theme="dark"] .ag-confirm-val { color: var(--text); }
-        html[data-theme="dark"] .ag-confirm-rows {
-            background: var(--bg-soft); border-color: var(--border);
-        }
-        html[data-theme="dark"] .ag-config-header,
-        html[data-theme="dark"] .ag-config-footer { border-color: var(--border); }
-        html[data-theme="dark"] .ag-confirm-btn-cancel,
-        html[data-theme="dark"] .ag-confirm-btn-edit {
-            background: var(--bg-muted); border-color: var(--border-strong); color: var(--text-muted);
-        }
-        html[data-theme="dark"] .ag-confirm-btn-cancel:hover,
-        html[data-theme="dark"] .ag-confirm-btn-edit:hover { background: var(--border); }
-        /* Red robot toggle: dark-tinted resting state. */
-        html[data-theme="dark"] .agentic-square-btn { background: #2a1414; border-color: #5c2626; }
-        html[data-theme="dark"] .agentic-square-btn:hover { background: #3a1a1a; border-color: #7f2d2d; }
-        /* Error banners. */
-        html[data-theme="dark"] .error { background: #2a1414; border-color: #5c2626; }
-        /* Focus rings on inputs/buttons use the token. */
-        html[data-theme="dark"] #query-input:focus,
-        html[data-theme="dark"] .config-item input:focus,
-        html[data-theme="dark"] .config-item select:focus { box-shadow: var(--focus-ring); }
+[data-theme="dark"] {
+  --canvas:   #0c0c0e;
+  --surface:  #141417;
+  --surface-2:#191920;
+  --subtle:   #1d1d23;
+  --border:   #26262d;
+  --border-2: #33333c;
+  --ink:      #f4f4f5;
+  --t-strong: #e4e4e7;
+  --t-muted:  #a1a1aa;
+  --t-subtle: #8a8a93;
+  --t-faint:  #5f5f68;
+  --accent:      #5b8cff;
+  --accent-ink:  #82a6ff;
+  --accent-soft: #16213d;
+  --accent-bd:   #284070;
+  --ok:    #4ade80;
+  --ok-soft:#13251a;
+  --warn:  #d8a657;
+  --warn-soft:#2a2113;
+  --danger:#f87171;
+  --danger-soft:#2c1717;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 4px 18px -6px rgba(0,0,0,.6), 0 1px 3px rgba(0,0,0,.4);
+  --shadow-pop: 0 16px 48px -8px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.5);
+}
 
-        /* ─── Dark-mode toggle — pill switch hugging the left screen edge ─ */
-        .theme-toggle {
-            position: fixed;
-            left: 10px;
-            top: 14px;
-            z-index: 30;
-            width: 48px;
-            height: 26px;
-            padding: 0;
-            border-radius: 999px;
-            border: 1px solid var(--border-strong);
-            background: var(--bg-muted);
-            cursor: pointer;
-            display: inline-block;
-            transition: background 0.18s, border-color 0.18s;
-        }
-        .theme-toggle:hover { border-color: var(--text-faint); }
-        .theme-toggle-knob {
-            position: absolute;
-            top: 50%;
-            left: 2px;
-            transform: translateY(-50%);
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            background: var(--bg);
-            border: 1px solid var(--border-strong);
-            box-shadow: var(--shadow-sm);
-            color: var(--text-subtle);
-            display: grid;
-            place-items: center;
-            transition: left 0.18s ease;
-        }
-        html[data-theme="dark"] .theme-toggle { background: var(--accent); border-color: var(--accent); }
-        html[data-theme="dark"] .theme-toggle-knob {
-            left: 24px; background: #f5f5f4; border-color: var(--accent); color: var(--accent);
-        }
-        .theme-toggle-knob svg { display: block; width: 12px; height: 12px; }
-        /* Moon in light mode (click → dark); sun in dark mode (click → light). */
-        .theme-toggle .icon-sun { display: none; }
-        html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
-        html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+* { margin:0; padding:0; box-sizing:border-box; }
+html { height:100%; background:var(--canvas); }
+body { min-height:100%; }
+body {
+  font-family: var(--sans);
+  background: var(--canvas);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.006em;
+  font-feature-settings: "ss01", "cv01";
+}
+::selection { background: var(--accent-soft); }
+button { font-family: inherit; cursor: pointer; }
+input, select, textarea { font-family: inherit; }
+.mono { font-family: var(--mono); font-feature-settings: normal; letter-spacing: 0; }
+a { color: var(--accent); text-decoration: none; }
+.hidden { display: none !important; }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 8px; border: 2px solid var(--canvas); }
+*::-webkit-scrollbar-thumb:hover { background: var(--t-faint); }
 
-        body {
-            font-family: var(--font-sans);
-            font-feature-settings: "cv11", "ss01";
-            background: var(--bg-soft);
-            color: var(--text);
-            font-size: 14px;
-            line-height: 1.5;
-            -webkit-font-smoothing: antialiased;
-            letter-spacing: -0.005em;
-        }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fadeUp { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
+@keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
 
-        .container {
-            max-width: 1100px;
-            margin: 0 auto;
-            padding: 0 20px;
-        }
+/* shell */
+.app { min-height:100vh; display:flex; flex-direction:column; }
+.wrap, .container { width:100%; max-width:1200px; margin:0 auto; padding:0 var(--pad-shell); }
 
-        /* ─── Topbar / header ─────────────────────────────────────────── */
-        header {
-            background: var(--bg);
-            color: var(--text);
-            border-bottom: 1px solid var(--border);
-            padding: 14px 0 12px;
-            margin-bottom: 18px;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-        header h1 {
-            font-size: 14px;
-            font-weight: 600;
-            letter-spacing: -0.01em;
-            line-height: 1.3;
-            margin: 0;
-            color: var(--text);
-        }
-        header p {
-            font-size: 12px;
-            color: var(--text-subtle);
-            line-height: 1.4;
-            margin-top: 2px;
-            opacity: 1;
-        }
+/* topbar */
+.topbar { position:sticky; top:0; z-index:30; background:color-mix(in srgb, var(--surface) 82%, transparent);
+  backdrop-filter:saturate(1.4) blur(12px); border-bottom:1px solid var(--border); }
+.topbar-inner { display:flex; align-items:center; justify-content:space-between; height:58px; gap:12px; }
+.brand { display:flex; align-items:center; gap:11px; min-width:0; }
+.brand-mark { width:30px; height:30px; border-radius:8px; background:var(--ink); color:var(--surface);
+  display:grid; place-items:center; box-shadow:var(--shadow-sm); flex:none; }
+.brand-mark svg { width:17px; height:17px; }
+.brand-name { font-size:15px; font-weight:600; letter-spacing:-0.02em; white-space:nowrap; }
+.brand-name b { color:var(--accent); font-weight:600; }
+.brand-tag { font-size:11px; color:var(--t-faint); font-weight:500; margin-left:2px; white-space:nowrap;
+  padding:2px 7px; border:1px solid var(--border); border-radius:99px; letter-spacing:.01em; }
+.topbar-right { display:flex; align-items:center; gap:10px; flex:none; }
+.topbar-form { margin:0; display:inline-flex; }
 
-        /* ─── Composer / search section ───────────────────────────────── */
-        .search-section {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            box-shadow: var(--shadow-sm);
-            padding: 12px 14px;
-            margin-bottom: 14px;
-        }
-        .search-box {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 10px;
-        }
-        #query-input {
-            flex: 1;
-            padding: 9px 11px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            font-size: 14px;
-            background: var(--bg);
-            color: var(--text);
-            font-family: inherit;
-            letter-spacing: -0.005em;
-            transition: border-color 0.12s, box-shadow 0.12s;
-        }
-        #query-input::placeholder { color: var(--text-faint); }
-        #query-input:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(28,25,23,0.08);
-        }
+/* spec + model pickers */
+.picker { display:flex; align-items:center; gap:8px; height:34px; padding:0 6px 0 11px;
+  border:1px solid var(--border); border-radius:8px; background:var(--surface); transition:border-color .14s; }
+.picker:hover { border-color:var(--border-2); }
+.picker-lbl { font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--t-faint); font-weight:600; white-space:nowrap; }
+.picker select { border:0; background:transparent; color:var(--ink); font-size:13px; font-weight:500;
+  outline:none; cursor:pointer; max-width:180px; }
+.ghost-btn { height:34px; padding:0 13px; border:1px solid var(--border); border-radius:8px; background:var(--surface);
+  color:var(--t-muted); font-size:13px; font-weight:500; transition:all .14s; white-space:nowrap; }
+.ghost-btn:hover { background:var(--surface-2); border-color:var(--border-2); color:var(--ink); }
+.icon-btn { width:34px; height:34px; display:grid; place-items:center; border:1px solid var(--border);
+  border-radius:8px; background:var(--surface); color:var(--t-muted); transition:all .14s; flex:none; }
+.icon-btn:hover { background:var(--surface-2); border-color:var(--border-2); color:var(--ink); }
+.icon-btn svg { width:16px; height:16px; }
+.icon-sun { display:none; }
+[data-theme="dark"] .icon-sun { display:block; }
+[data-theme="dark"] .icon-moon { display:none; }
 
-        button {
-            height: 36px;
-            padding: 0 14px;
-            background: var(--accent);
-            color: #fff;
-            border: 1px solid var(--accent);
-            border-radius: var(--radius-sm);
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            font-family: inherit;
-            letter-spacing: -0.005em;
-            transition: background 0.12s, border-color 0.12s, color 0.12s;
-            white-space: nowrap;
-        }
-        button:hover { background: #000; border-color: #000; }
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none !important;
-        }
+/* main */
+.main { flex:1; padding-top:var(--gap-block); padding-bottom:80px; }
 
-        .config-toggle {
-            background: var(--bg);
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-            font-weight: 500;
-            font-size: 12.5px;
-            padding: 0 12px;
-            height: 36px;
-        }
-        .config-toggle:hover {
-            background: var(--bg-muted);
-            border-color: var(--border-strong);
-            color: var(--text);
-        }
+/* composer */
+.composer { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-md); padding:var(--composer-pad); transition:border-color .15s, box-shadow .2s; }
+.composer.focus { border-color:var(--accent-bd); box-shadow:var(--shadow-md), 0 0 0 4px var(--accent-soft); }
+/* agentic on: highlight the composer with the accent + a slight glow */
+.composer.agentic-active { border-color:var(--accent);
+  background:radial-gradient(ellipse at center,
+    color-mix(in srgb, var(--accent) 13%, transparent),
+    color-mix(in srgb, var(--accent) 4%, transparent) 72%), var(--surface);
+  box-shadow:var(--shadow-md), 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent); }
+.composer-row { display:flex; align-items:center; gap:10px; }
+.composer-input-wrap { flex:1; display:flex; align-items:center; gap:10px; padding-left:4px; min-width:0; }
+.composer-input-wrap > svg { width:19px; height:19px; color:var(--t-faint); flex:none; }
+.composer input { flex:1; border:0; background:transparent; color:var(--ink); font-size:17px;
+  letter-spacing:-0.01em; outline:none; padding:8px 0; min-width:0; }
+.composer input::placeholder { color:var(--t-faint); }
+.ask-btn { height:42px; padding:0 20px; border-radius:9px; border:1px solid var(--ink); background:var(--ink);
+  color:var(--surface); font-size:14px; font-weight:600; letter-spacing:-0.01em; display:inline-flex;
+  align-items:center; gap:8px; transition:transform .08s, filter .14s, opacity .14s; flex:none; }
+.ask-btn:hover { filter:brightness(1.18); }
+.ask-btn:active { transform:translateY(1px); }
+.ask-btn:disabled { opacity:.4; cursor:not-allowed; filter:none; }
+.ask-btn svg { width:15px; height:15px; }
 
-        /* ─── Agentic toggle row (legacy — kept hidden so existing JS
-             that reads/writes #agentic-toggle still works) ─────────────── */
-        .agentic-row { display: none !important; }
+/* control strip */
+.controls { display:flex; align-items:center; gap:8px; margin-top:13px; padding-top:13px;
+  border-top:1px dashed var(--border); flex-wrap:wrap; }
+.controls-spacer { flex:1; }
+.pill { display:inline-flex; align-items:center; gap:7px; height:32px; padding:0 12px; border-radius:99px;
+  border:1px solid var(--border); background:var(--surface); color:var(--t-muted); font-size:12.5px;
+  font-weight:500; transition:all .14s; position:relative; }
+.pill:hover { border-color:var(--border-2); color:var(--ink); background:var(--surface-2); }
+.pill svg { width:14px; height:14px; }
+.pill.on { background:var(--accent-soft); border-color:var(--accent-bd); color:var(--accent-ink); }
+.pill.on .pill-dot { background:var(--accent); }
+.pill-dot { width:7px; height:7px; border-radius:50%; background:var(--t-faint); transition:background .14s; }
+.cost-chip { display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 12px 0 10px;
+  border-radius:99px; border:1px solid var(--border); background:var(--surface); font-size:12px; color:var(--t-subtle); cursor:pointer; }
+.cost-chip:hover { border-color:var(--border-2); }
+.cost-chip .cost-total { color:var(--ink); font-weight:500; font-size:12.5px; font-family:var(--mono); }
+.cost-chip .cost-total.cost-warn { color:var(--warn); }
+.cost-chip .cost-total.cost-high { color:var(--danger); }
+.cost-chip-lbl { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--t-faint); font-weight:600; white-space:nowrap; }
+.cost-chip .cost-context { display:none; }
+.cost-chip .cost-toggle { color:var(--t-faint); font-size:9px; }
 
-        /* ─── Square red robot button in the search bar ───────────────── */
-        .agentic-square-btn {
-            width: 36px;
-            height: 36px;
-            padding: 0;
-            background: #fff8f8;
-            color: #ef4444;
-            border: 1px solid #fecaca;
-            border-radius: var(--radius-sm);
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: background 0.12s, border-color 0.12s, color 0.12s;
-            flex: 0 0 36px;
-        }
-        .agentic-square-btn:hover {
-            background: #fff1f1;
-            border-color: #fca5a5;
-            color: #dc2626;
-        }
-        .agentic-square-btn.active {
-            background: #ef4444;
-            border-color: #ef4444;
-            color: #fff;
-        }
-        .agentic-square-btn.active:hover {
-            background: #dc2626;
-            border-color: #dc2626;
-            color: #fff;
-        }
-        .agentic-square-btn svg { display: block; width: 20px; height: 20px; }
+/* cost breakdown popover (under the cost chip) */
+.cost-breakdown { display:none; }
+.cost-estimator.open .cost-breakdown { display:block; position:absolute; right:0; margin-top:8px; z-index:40;
+  width:380px; background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
+  box-shadow:var(--shadow-pop); padding:14px; animation:fadeUp .14s ease; }
+.cost-estimator { position:relative; }
+.cost-row { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:6px 0; border-bottom:1px dashed var(--border); }
+.cost-row:last-of-type { border-bottom:0; }
+.cost-row-name { font-size:12.5px; color:var(--t-strong); display:flex; flex-direction:column; gap:2px; }
+.cost-row-name small { color:var(--t-faint); font-size:11px; }
+.cost-row-value { font-family:var(--mono); font-size:12px; color:var(--t-muted); white-space:nowrap; }
+.cost-row-total { border-top:1px solid var(--border); border-bottom:0; margin-top:4px; padding-top:9px; }
+.cost-row-total .cost-row-value { color:var(--ink); font-weight:600; }
+.cost-disclaimer { margin-top:10px; font-size:11px; color:var(--t-faint); line-height:1.5; }
 
-        /* Enable-toggle row inside the agentic config popup */
-        .ag-config-enable-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 8px 12px;
-            background: #fff8f8;
-            border: 1px solid #fecaca;
-            border-radius: var(--radius-sm);
-            font-size: 12.5px;
-            color: var(--text-subtle);
-            margin-bottom: 12px;
-        }
-        .ag-config-enable-row label {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-            font-weight: 500;
-            color: var(--text);
-        }
-        .ag-config-enable-row input[type="checkbox"] {
-            transform: scale(1.05);
-            cursor: pointer;
-            accent-color: var(--accent);
-        }
-        .ag-config-enable-row .ag-config-enable-hint {
-            color: var(--text-subtle);
-            font-weight: 400;
-            font-size: 11.5px;
-        }
+/* config popover */
+.config-panel, .agentic-config { display:none; }
+.config-panel.open { display:block; position:absolute; z-index:40; margin-top:8px; left:0; width:520px;
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
+  box-shadow:var(--shadow-pop); padding:16px; animation:fadeUp .14s ease; }
+.config-pop-wrap { position:relative; }
+.config-panel > strong { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+  color:var(--t-subtle); font-weight:600; margin-bottom:13px; }
+.config-section-label { font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--t-faint);
+  font-weight:600; margin:16px 0 9px; }
+.config-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:11px 14px; }
+.config-item.config-item-wide { grid-column:1 / -1; }
+.config-item label { display:block; font-size:11px; color:var(--t-subtle); font-weight:500; margin-bottom:5px; }
+.config-item input[type=number], .config-item select { width:100%; height:32px; padding:0 9px; border:1px solid var(--border);
+  border-radius:var(--radius-xs); background:var(--surface); color:var(--ink); font-size:13px; outline:none; font-family:var(--mono); }
+.config-item input:focus, .config-item select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+.config-item label > input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); vertical-align:-2px; margin-right:6px; }
+.config-item label:has(input[type=checkbox]) { display:flex; align-items:center; font-size:13px; color:var(--ink); font-weight:500; margin-top:18px; }
 
-        .agentic-config {
-            background: #fff8f8;
-            padding: 12px 14px;
-            border: 1px solid #fecaca;
-            border-top: none;
-            border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-            margin-top: 0;
-        }
-        .agentic-config.hidden { display: none; }
-        .agentic-config .config-item label { color: var(--text-subtle); }
+/* agentic config is always visible inside the config popover and the
+   refine-time overlay, regardless of the legacy .hidden toggle */
+.config-panel .agentic-config,
+.config-panel .agentic-config.hidden { display:block !important; }
 
-        /* ─── Cost estimator ──────────────────────────────────────────── */
-        .cost-estimator {
-            margin-top: 10px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            font-size: 13px;
-            overflow: hidden;
-        }
-        .cost-summary {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 8px 12px;
-            cursor: pointer;
-            user-select: none;
-            background: var(--bg);
-            transition: background 0.12s;
-        }
-        .cost-summary:hover { background: var(--bg-soft); }
-        .cost-icon { display: none; }
-        .cost-label {
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-faint);
-            font-weight: 600;
-        }
-        .cost-total {
-            font-family: var(--font-mono);
-            font-weight: 500;
-            color: var(--text);
-            font-size: 13px;
-        }
-        .cost-total.cost-warn { color: var(--warn); }
-        .cost-total.cost-high { color: var(--danger); }
-        .cost-context {
-            color: var(--text-subtle);
-            font-size: 11.5px;
-        }
-        .cost-toggle {
-            margin-left: auto;
-            color: var(--text-faint);
-            font-size: 10px;
-            transition: transform 0.15s;
-        }
-        .cost-estimator.open .cost-toggle { transform: rotate(180deg); }
-        .cost-breakdown {
-            display: none;
-            padding: 6px 12px 12px;
-            border-top: 1px solid var(--border);
-            background: var(--bg-soft);
-        }
-        .cost-estimator.open .cost-breakdown { display: block; }
-        .cost-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            padding: 5px 0;
-            border-bottom: 1px dashed var(--border);
-            font-size: 12.5px;
-        }
-        .cost-row:last-child { border-bottom: 0; }
-        .cost-row-name { color: var(--text-muted); }
-        .cost-row-name small {
-            color: var(--text-faint);
-            margin-left: 8px;
-            font-size: 11.5px;
-        }
-        .cost-row-value {
-            font-family: var(--font-mono);
-            color: var(--text);
-            font-weight: 500;
-            font-size: 12px;
-        }
-        .cost-row.cost-row-total {
-            margin-top: 5px;
-            padding-top: 9px;
-            border-top: 1px solid var(--border);
-            border-bottom: 0;
-        }
-        .cost-row.cost-row-total .cost-row-value { color: var(--text); font-weight: 600; }
-        .cost-row.cost-row-total .cost-row-name b { color: var(--text); }
-        .cost-disclaimer {
-            margin-top: 10px;
-            color: var(--text-faint);
-            font-size: 11.5px;
-            font-style: normal;
-            line-height: 1.5;
-        }
+/* agentic-row (hint text under composer when agentic on) */
+.agentic-row { display:none; }
+.agentic-row.active { display:flex; gap:10px; align-items:flex-start; margin-top:12px; padding:11px 13px;
+  background:var(--accent-soft); border:1px solid var(--accent-bd); border-radius:var(--radius-sm); }
+.agentic-row label { display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600; color:var(--accent-ink); white-space:nowrap; }
+.agentic-row label input { accent-color:var(--accent); width:15px; height:15px; }
+.agentic-hint { font-size:12px; color:var(--t-muted); line-height:1.5; }
 
-        /* ─── Agent activity strip (now sits in the light header) ─────── */
-        .agent-strip {
-            margin-top: 12px;
-            padding: 8px 12px;
-            background: var(--bg-soft);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            gap: 8px 14px;
-            color: var(--text-muted);
-            font-size: 12.5px;
-            line-height: 1.4;
-            min-height: 36px;
-        }
-        .agent-strip-label {
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-faint);
-            font-weight: 600;
-            margin-right: 4px;
-            padding-right: 12px;
-            border-right: 1px solid var(--border);
-        }
-        .agent-strip-empty {
-            color: var(--text-subtle);
-            font-style: normal;
-            font-size: 12.5px;
-        }
-        .agent-strip-state {
-            display: inline-flex;
-            align-items: center;
-            gap: 7px;
-            font-size: 12.5px;
-            color: var(--text-muted);
-            background: var(--bg);
-            padding: 3px 10px;
-            border-radius: 11px;
-            border: 1px solid var(--border);
-        }
-        .agent-strip-state .dot {
-            width: 7px; height: 7px;
-            border-radius: 50%;
-            background: var(--text-faint);
-            display: inline-block;
-        }
-        .agent-strip-state.state-ok    .dot { background: var(--ok); }
-        .agent-strip-state.state-warn  .dot { background: var(--warn); }
-        .agent-strip-state.state-agent .dot { background: var(--indigo); }
-        .agent-strip-state.state-error .dot { background: var(--danger); }
-        .agent-strip-state b { color: var(--text); font-weight: 600; }
-        .agent-strip-state .strip-latency {
-            font-family: var(--font-mono);
-            color: var(--text-subtle);
-        }
-        .agent-strip-reason {
-            flex: 1;
-            min-width: 200px;
-            color: var(--text-subtle);
-            font-size: 12.5px;
-        }
-        .agent-strip-actions { margin-left: auto; }
-        .agent-strip-chips {
-            display: inline-flex;
-            flex-wrap: wrap;
-            gap: 4px;
-            align-items: center;
-        }
-        .agent-strip-chip {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            color: var(--text-muted);
-            font-size: 11px;
-            padding: 2px 7px;
-            border-radius: 10px;
-            font-family: var(--font-mono);
-        }
-        .agent-strip-chip.chip-section { color: var(--text-muted); }
-        .agent-strip-details {
-            flex-basis: 100%;
-            margin-top: 6px;
-            padding-top: 8px;
-            border-top: 1px dashed var(--border);
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px 16px;
-            font-size: 12px;
-            color: var(--text-subtle);
-        }
-        .agent-strip-details .detail-group {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .agent-strip-details .detail-label {
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-faint);
-            font-weight: 600;
-        }
-        .run-agentic-btn {
-            height: 28px;
-            padding: 0 12px;
-            background: var(--accent);
-            color: #fff;
-            font-size: 12.5px;
-            font-weight: 500;
-            border: 1px solid var(--accent);
-            border-radius: var(--radius-sm);
-            cursor: pointer;
-            font-family: inherit;
-            letter-spacing: -0.005em;
-        }
-        .run-agentic-btn:hover { background: #000; border-color: #000; }
-        .run-agentic-btn:disabled {
-            background: var(--bg-muted);
-            border-color: var(--border);
-            color: var(--text-faint);
-            cursor: not-allowed;
-        }
+/* empty state */
+.empty { text-align:center; padding:54px 20px 30px; }
+.empty-mark { width:52px; height:52px; border-radius:14px; background:var(--surface); border:1px solid var(--border);
+  display:grid; place-items:center; margin:0 auto 18px; box-shadow:var(--shadow-sm); color:var(--ink); }
+.empty-mark svg { width:26px; height:26px; }
+.empty h2 { font-size:22px; font-weight:600; letter-spacing:-0.025em; margin-bottom:8px; }
+.empty p { font-size:14px; color:var(--t-subtle); max-width:460px; margin:0 auto 26px; line-height:1.6; }
+.examples { display:flex; flex-wrap:wrap; gap:9px; justify-content:center; max-width:720px; margin:0 auto; }
+.ex-chip { padding:9px 15px; border:1px solid var(--border); border-radius:99px; background:var(--surface);
+  color:var(--t-muted); font-size:13px; transition:all .14s; box-shadow:var(--shadow-sm); }
+.ex-chip:hover { border-color:var(--accent-bd); color:var(--accent-ink); background:var(--accent-soft); transform:translateY(-1px); }
 
-        /* ─── Agentic confirm popup ───────────────────────────────────── */
-        .ag-confirm-overlay {
-            position: fixed; inset: 0; z-index: 9000;
-            background: rgba(15,23,42,0.25);
-            display: flex; align-items: center; justify-content: center;
-        }
-        .ag-confirm-overlay.hidden { display: none; }
-        .ag-confirm {
-            background: #fff;
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            box-shadow: 0 12px 40px rgba(15,23,42,0.18);
-            width: 340px; max-width: 92vw;
-            padding: 20px 20px 16px;
-            font-size: 13px; color: #1e293b;
-        }
-        .ag-confirm-title {
-            font-weight: 700; font-size: 14.5px; margin-bottom: 4px;
-        }
-        .ag-confirm-sub {
-            font-size: 12px; color: #64748b; margin-bottom: 14px;
-        }
-        .ag-confirm-rows {
-            background: #f8fafc; border: 1px solid #e2e8f0;
-            border-radius: 7px; padding: 10px 12px;
-            margin-bottom: 14px; display: grid;
-            grid-template-columns: 1fr 1fr; gap: 6px 12px;
-        }
-        .ag-confirm-row { display: contents; }
-        .ag-confirm-key { font-size: 11.5px; color: #64748b; }
-        .ag-confirm-val { font-size: 11.5px; color: #1e293b; font-weight: 600; font-family: var(--font-mono); }
-        .ag-confirm-actions {
-            display: flex; gap: 8px; justify-content: flex-end;
-        }
-        .ag-confirm-btn {
-            height: 30px; padding: 0 13px; border-radius: 6px;
-            font-size: 12.5px; font-weight: 500; cursor: pointer;
-            font-family: inherit; border: 1px solid transparent;
-        }
-        .ag-confirm-btn-cancel {
-            background: #f1f5f9; border-color: #e2e8f0; color: #475569;
-        }
-        .ag-confirm-btn-cancel:hover { background: #e2e8f0; }
-        .ag-confirm-btn-edit {
-            background: #fff; border-color: #e2e8f0; color: #475569;
-        }
-        .ag-confirm-btn-edit:hover { background: #f1f5f9; }
-        .ag-confirm-btn-run {
-            background: var(--accent); border-color: var(--accent); color: #fff;
-        }
-        .ag-confirm-btn-run:hover { background: #000; border-color: #000; }
+/* results split */
+#results { margin-top:var(--gap-block); }
+.split { display:grid; grid-template-columns:minmax(0,1fr) 332px; gap:var(--gap-block); align-items:start; }
+@media (max-width:880px){ .split { grid-template-columns:1fr; } }
+.split-main { min-width:0; display:flex; flex-direction:column; gap:var(--gap-block); }
 
-        /* ─── Agentic config popup (Edit config →) ───────────────────── */
-        .ag-config-overlay {
-            position: fixed; inset: 0; z-index: 9001;
-            background: rgba(15,23,42,0.25);
-            display: flex; align-items: center; justify-content: center;
-        }
-        .ag-config-overlay.hidden { display: none; }
-        .ag-config {
-            background: #fff;
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            box-shadow: 0 12px 40px rgba(15,23,42,0.18);
-            width: 560px; max-width: 94vw; max-height: 88vh;
-            display: flex; flex-direction: column;
-            font-size: 13px; color: #1e293b;
-        }
-        .ag-config-header {
-            padding: 16px 18px 10px;
-            border-bottom: 1px solid #f1f5f9;
-        }
-        .ag-config-title { font-weight: 700; font-size: 14.5px; }
-        .ag-config-sub { font-size: 12px; color: #64748b; margin-top: 2px; }
-        .ag-config-body {
-            padding: 14px 18px; overflow: auto; flex: 1 1 auto;
-        }
-        /* When agentic-config is hosted inside the popup, drop the colored
-           card chrome so the popup itself owns the surface. */
-        .ag-config-body .agentic-config {
-            background: transparent;
-            border: none;
-            padding: 0;
-            border-radius: 0;
-        }
-        .ag-config-footer {
-            padding: 12px 18px 16px;
-            border-top: 1px solid #f1f5f9;
-            display: flex; gap: 8px; justify-content: flex-end;
-        }
+/* answer card */
+.answer-box { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); overflow:hidden; }
+.answer-meta { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--surface-2); }
+.meta-q { font-size:13px; font-weight:600; color:var(--ink); margin-right:auto; letter-spacing:-0.01em;
+  max-width:58%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.badge { display:inline-flex; align-items:center; gap:5px; height:22px; padding:0 8px; border-radius:99px;
+  font-size:11px; font-weight:500; font-family:var(--mono); border:1px solid var(--border); color:var(--t-muted); background:var(--surface); }
+.badge svg { width:11px; height:11px; }
+.badge.ok { color:var(--ok); background:var(--ok-soft); border-color:transparent; }
+.badge.warn { color:var(--warn); background:var(--warn-soft); border-color:transparent; }
+.badge.accent { color:var(--accent-ink); background:var(--accent-soft); border-color:var(--accent-bd); }
+.answer-box > h3 { display:none; }
+.answer-text { padding:8px 22px 22px; }
 
-        /* inline status text used in agent strip (no pill/bubble) */
-        .strip-status {
-            font-size: 12.5px;
-            font-weight: 600;
-            color: var(--text-muted);
-        }
-        .strip-status-ok { color: var(--ok); }
+/* markdown */
+.answer-text { font-size:var(--answer-fs); line-height:1.72; color:var(--t-strong); }
+.answer-text > *:first-child { margin-top:14px; }
+.answer-text h1 { font-size:17px; font-weight:600; color:var(--ink); margin:22px 0 10px; }
+.answer-text h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--t-subtle); font-weight:600; margin:24px 0 10px; }
+.answer-text h3 { font-size:15px; font-weight:600; color:var(--ink); margin:20px 0 8px; }
+.answer-text p { margin:0 0 13px; }
+.answer-text strong { color:var(--ink); font-weight:600; }
+.answer-text em { color:var(--t-muted); }
+.answer-text ul, .answer-text ol { margin:0 0 14px; padding-left:22px; }
+.answer-text li { margin:0 0 7px; }
+.answer-text li::marker { color:var(--t-faint); }
+.answer-text code { font-family:var(--mono); font-size:.88em; background:var(--subtle); border:1px solid var(--border);
+  padding:1px 5px; border-radius:5px; color:var(--accent-ink); }
+.answer-text pre { background:var(--subtle); border:1px solid var(--border); border-radius:var(--radius-xs); padding:12px 14px; overflow:auto; margin:0 0 14px; }
+.answer-text pre code { background:transparent; border:0; padding:0; }
+.answer-text blockquote { margin:0 0 14px; padding:10px 16px; background:var(--warn-soft); border-left:3px solid var(--warn);
+  border-radius:0 var(--radius-xs) var(--radius-xs) 0; color:var(--t-muted); font-size:.95em; }
+.answer-text blockquote p { margin:0; }
+.answer-text table { width:100%; border-collapse:collapse; margin:0 0 14px; font-size:.92em; }
+.answer-text th, .answer-text td { border:1px solid var(--border); padding:7px 10px; text-align:left; }
+.answer-text th { background:var(--surface-2); font-weight:600; }
+.answer-text.streaming::after { content:"\\2589"; color:var(--accent); animation:pulse 1s infinite; margin-left:1px; }
 
-        /* ─── Config panel ────────────────────────────────────────────── */
-        .config-panel {
-            display: none;
-            background: var(--bg-soft);
-            padding: 12px 14px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            margin-top: 8px;
-        }
-        .config-panel.open { display: block; }
-        .config-panel strong {
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-faint);
-            font-weight: 600;
-            display: block;
-            margin-bottom: 10px;
-        }
+/* citation chips inside answer */
+.cite-chip { font-family:var(--mono); font-size:.82em; font-weight:500; color:var(--accent-ink);
+  background:var(--accent-soft); border:1px solid var(--accent-bd); border-radius:5px; padding:0 5px 1px;
+  cursor:pointer; white-space:nowrap; transition:background .12s, box-shadow .12s; }
+.cite-chip::before { content:"\\00a7"; opacity:.6; margin-right:1px; }
+.cite-chip:hover, .cite-chip.hot { background:var(--accent); color:#fff; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
 
-        .config-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 12px 14px;
-            margin-top: 4px;
-        }
-        .config-item {
-            display: flex;
-            flex-direction: column;
-        }
-        .config-item label {
-            font-size: 10.5px;
-            font-weight: 500;
-            color: var(--text-subtle);
-            margin-bottom: 4px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-        .config-item input,
-        .config-item select {
-            padding: 6px 9px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            font-size: 12.5px;
-            background: var(--bg);
-            color: var(--text);
-            font-family: var(--font-mono);
-        }
-        .config-item select { font-family: var(--font-sans); cursor: pointer; }
-        .config-item input:focus,
-        .config-item select:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(28,25,23,0.08);
-        }
-        .config-item input[type="checkbox"] {
-            accent-color: var(--accent);
-            width: auto;
-            margin-right: 6px;
-        }
-        .config-item.config-item-wide { grid-column: span 2; }
+/* latency tag in answer meta (legacy id #latency reused) */
+#latency { display:none; }
 
-        /* ─── Global model picker (top-right header) ─────────────────── */
-        .global-model-picker {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12px;
-            color: var(--text-muted);
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            padding: 4px 8px;
-        }
-        .global-model-picker-label {
-            font-weight: 500;
-            text-transform: uppercase;
-            font-size: 10.5px;
-            letter-spacing: 0.04em;
-            color: var(--text-subtle);
-        }
-        #global-model-select {
-            border: 0;
-            background: transparent;
-            color: var(--text);
-            font-size: 12.5px;
-            font-family: var(--font-sans);
-            cursor: pointer;
-            padding: 2px 0;
-            max-width: 260px;
-        }
-        #global-model-select:focus { outline: none; }
+/* sources sidebar */
+.sources { position:sticky; top:74px; }
+.sources-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:11px; padding:0 2px; }
+.sources-head h3 { font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--t-subtle); font-weight:600; white-space:nowrap; }
+.sources-count { font-size:11px; color:var(--t-faint); font-family:var(--mono); }
+.src-list { display:flex; flex-direction:column; gap:8px; }
+.src { display:block; text-align:left; width:100%; background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:11px 12px; transition:all .14s; box-shadow:var(--shadow-sm); cursor:default; }
+.src:hover, .src.hot { border-color:var(--accent-bd); box-shadow:var(--shadow-sm), 0 0 0 3px var(--accent-soft); transform:translateY(-1px); }
+.src-top { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+.src-sec { font-family:var(--mono); font-size:12.5px; font-weight:600; color:var(--accent-ink); }
+.src-type { font-size:10px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; padding:1px 6px;
+  border-radius:4px; background:var(--subtle); color:var(--t-subtle); }
+.src-dot { margin-left:auto; width:7px; height:7px; border-radius:50%; flex:none; }
+.src-dot.ok { background:var(--ok); }
+.src-dot.warn { background:var(--warn); }
+.src-title { font-size:12.5px; color:var(--t-muted); line-height:1.45; }
+.sources-foot { margin-top:12px; padding:10px 12px; border:1px dashed var(--border); border-radius:var(--radius-sm);
+  font-size:11.5px; color:var(--t-faint); line-height:1.5; display:flex; gap:8px; align-items:flex-start; }
+.sources-foot svg { width:13px; height:13px; flex:none; margin-top:2px; color:var(--t-faint); }
 
-        /* ─── Global spec (middle header) ─────────────────── */
-        #global-spec-select {
-            border: 0;
-            background: transparent;
-            color: var(--text);
-            font-size: 12.5px;
-            font-family: var(--font-sans);
-            cursor: pointer;
-            padding: 2px 0;
-            max-width: 260px;
-        }
+/* gap hint / agent strip (reused #agent-strip) */
+.agent-strip { display:none; }
+.agent-strip.has-content { display:block; }
+.gap-card { display:flex; gap:13px; align-items:flex-start; padding:14px 16px; border-radius:var(--radius); }
+.gap-card.warn { background:var(--warn-soft); border:1px solid color-mix(in srgb, var(--warn) 30%, transparent); }
+.gap-card.ok   { background:var(--ok-soft);  border:1px solid color-mix(in srgb, var(--ok) 28%, transparent); }
+.gap-card.accent { background:var(--accent-soft); border:1px solid var(--accent-bd); }
+.gap-card.muted { background:var(--surface); border:1px solid var(--border); }
+.gap-ico { width:30px; height:30px; border-radius:8px; display:grid; place-items:center; flex:none; }
+.gap-card.warn .gap-ico { background:color-mix(in srgb, var(--warn) 16%, var(--surface)); color:var(--warn); }
+.gap-card.ok .gap-ico   { background:color-mix(in srgb, var(--ok) 16%, var(--surface)); color:var(--ok); }
+.gap-card.accent .gap-ico { background:color-mix(in srgb, var(--accent) 16%, var(--surface)); color:var(--accent); }
+.gap-card.muted .gap-ico { background:var(--subtle); color:var(--t-subtle); }
+.gap-ico svg { width:16px; height:16px; }
+.gap-body { flex:1; min-width:0; }
+.gap-title { font-size:13px; font-weight:600; color:var(--ink); margin-bottom:2px; display:flex; align-items:center; gap:8px; }
+.gap-latency { font-family:var(--mono); font-size:11px; color:var(--t-faint); font-weight:400; }
+.gap-note { font-size:12.5px; color:var(--t-muted); line-height:1.5; }
+.gap-details { margin-top:9px; display:flex; flex-direction:column; gap:7px; }
+.detail-group { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+.detail-label { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--t-faint); font-weight:600; min-width:54px; }
+.gap-chips { display:flex; gap:5px; flex-wrap:wrap; }
+.gap-chip { font-family:var(--mono); font-size:11px; padding:1px 7px; border-radius:5px; background:var(--surface); border:1px solid var(--border); color:var(--t-muted); }
+.gap-chip.chip-section { color:var(--accent-ink); border-color:var(--accent-bd); background:var(--accent-soft); }
+.gap-act { height:32px; padding:0 14px; border-radius:8px; border:1px solid var(--warn); background:transparent;
+  color:var(--warn); font-size:12.5px; font-weight:600; white-space:nowrap; transition:all .14s; flex:none; align-self:center; display:inline-flex; align-items:center; gap:6px; }
+.gap-act:hover { background:var(--warn); color:#fff; }
+.gap-act:disabled { opacity:.5; cursor:default; }
+.gap-act svg { width:15px; height:15px; }
 
-        /* ─── Loading row ─────────────────────────────────────────────── */
-        .loading {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 14px;
-            box-shadow: var(--shadow-sm);
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            color: var(--text);
-            font-size: 13.5px;
-        }
-        .loading-spinner {
-            width: 18px; height: 18px;
-            border: 2px solid var(--border);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            flex-shrink: 0;
-            animation: loading-spin 0.7s linear infinite;
-        }
-        .loading-body {
-            flex: 1;
-            min-width: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 3px;
-        }
-        .loading-title {
-            font-weight: 500;
-            color: var(--text);
-            line-height: 1.3;
-            font-size: 13.5px;
-        }
-        .loading-meta {
-            font-size: 11.5px;
-            color: var(--text-subtle);
-            font-family: var(--font-mono);
-            letter-spacing: 0;
-        }
-        .loading-meta .loading-dots::after {
-            content: "";
-            display: inline-block;
-            width: 14px;
-            text-align: left;
-            animation: loading-dots 1.4s steps(4, end) infinite;
-        }
-        .loading-cancel {
-            height: 28px;
-            padding: 0 12px;
-            background: var(--bg);
-            color: var(--danger);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            font-size: 12.5px;
-            font-weight: 500;
-            cursor: pointer;
-            flex-shrink: 0;
-            font-family: inherit;
-        }
-        .loading-cancel:hover {
-            background: #fef2f2;
-            border-color: #fecaca;
-        }
-        .loading-cancel:active { transform: scale(0.97); }
+/* pipeline disclosure (wraps viz + trace + models) */
+.pipe { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); overflow:hidden; }
+.pipe-head { display:flex; align-items:center; gap:12px; padding:13px 18px; width:100%; background:transparent; border:0; text-align:left; transition:background .12s; }
+.pipe-head:hover { background:var(--surface-2); }
+.pipe-head > svg.lead { width:16px; height:16px; color:var(--t-subtle); flex:none; }
+.pipe-title { font-size:13px; font-weight:600; color:var(--ink); white-space:nowrap; }
+.pipe-summary { display:flex; gap:14px; font-size:12px; color:var(--t-subtle); font-family:var(--mono); white-space:nowrap; margin-left:6px; }
+.pipe-summary b { color:var(--t-muted); font-weight:500; }
+.pipe-chev { color:var(--t-faint); transition:transform .18s; margin-left:auto; display:grid; flex:none; }
+.pipe-chev svg { width:16px; height:16px; }
+.pipe.open .pipe-chev { transform:rotate(180deg); }
+.pipe-body { display:none; padding:6px 18px 18px; border-top:1px solid var(--border); }
+.pipe.open .pipe-body { display:block; animation:fadeUp .2s ease; }
+/* When expanded, the trace breaks out of the answer column to (near) full
+   screen width so the flow chart has room. The .split sidebar (332px) + gap
+   shift the main column's center left of the viewport center, so we re-center
+   by offsetting the transform by half that amount. */
+.pipe.open { position:relative; z-index:20; width:min(96vw, 1500px);
+  left:50%; transform:translateX(calc(-50% + (332px + var(--gap-block)) / 2)); }
+@media (max-width:880px) { .pipe.open { width:auto; left:auto; transform:none; } }
 
-        @keyframes loading-spin { to { transform: rotate(360deg); } }
-        @keyframes loading-dots {
-            0%   { content: ""; }
-            25%  { content: "."; }
-            50%  { content: ".."; }
-            75%  { content: "..."; }
-            100% { content: ""; }
-        }
+/* pipeline viz */
+.viz-section { margin-top:8px; }
+.viz-header-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
+.viz-header-row h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--t-subtle); font-weight:600; }
+.viz-sub { font-size:11.5px; color:var(--t-faint); line-height:1.5; max-width:560px; margin-top:4px; }
+.viz-nav { display:flex; align-items:center; gap:8px; flex:none; }
+.viz-nav-btn { width:28px; height:28px; border:1px solid var(--border); border-radius:7px; background:var(--surface); color:var(--t-muted); display:grid; place-items:center; }
+.viz-nav-btn:hover { border-color:var(--border-2); color:var(--ink); }
+.viz-nav-label { font-size:11.5px; color:var(--t-subtle); font-family:var(--mono); white-space:nowrap; }
+.viz-container { position:relative; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:14px; overflow:auto; }
+.viz-container svg { max-width:100%; height:auto; }
+.viz-empty { color:var(--t-faint); font-size:12.5px; padding:24px; text-align:center; }
+/* node hover highlight */
+#pipeline-viz g.node { transition:filter .12s ease; }
+#pipeline-viz g.node:hover { filter:drop-shadow(0 3px 9px rgba(0,0,0,.24)); }
+#pipeline-viz g.node:hover rect,
+#pipeline-viz g.node:hover polygon,
+#pipeline-viz g.node:hover circle,
+#pipeline-viz g.node:hover path { stroke-width:2.5px !important; }
+/* per-iteration pass navigation (top-right of the chart) */
+.viz-pass-nav { position:absolute; right:10px; top:10px; z-index:5; display:flex; align-items:center; gap:5px; padding:4px 6px; background:var(--surface); border:1px solid var(--border); border-radius:9px; box-shadow:var(--shadow-sm); }
+.viz-pass-nav button { width:26px; height:26px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--t-muted); display:grid; place-items:center; font-size:14px; line-height:1; padding:0; cursor:pointer; transition:border-color .12s, color .12s; }
+.viz-pass-nav button:hover:not(:disabled) { border-color:var(--border-2); color:var(--ink); }
+.viz-pass-nav button:disabled { opacity:.35; cursor:default; }
+.viz-pass-label { font-size:11.5px; color:var(--t-subtle); font-family:var(--mono); white-space:nowrap; padding:0 3px; }
+.viz-legend { display:flex; flex-wrap:wrap; gap:10px 16px; margin-top:10px; }
+.viz-legend-item { display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--t-subtle); }
+.viz-legend-swatch { width:11px; height:11px; border-radius:3px; border:1px solid; flex:none; }
 
-        /* ─── Error banner ────────────────────────────────────────────── */
-        .error {
-            background: #fef2f2;
-            color: var(--danger);
-            padding: 10px 14px;
-            border: 1px solid #fecaca;
-            border-radius: var(--radius-sm);
-            margin-bottom: 14px;
-            font-size: 13px;
-        }
+/* trace details */
+.trace-details { margin-top:14px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden; }
+.trace-summary { display:flex; align-items:center; gap:9px; padding:11px 14px; cursor:pointer; font-size:12.5px; font-weight:600; color:var(--ink); list-style:none; }
+.trace-summary::-webkit-details-marker { display:none; }
+.trace-summary:hover { background:var(--surface-2); }
+.trace-count { color:var(--t-faint); font-weight:400; font-family:var(--mono); font-size:11.5px; }
+.trace-summary-chevron { margin-left:auto; color:var(--t-faint); font-size:10px; transition:transform .18s; }
+.trace-details[open] .trace-summary-chevron { transform:rotate(180deg); }
+#pipeline-stages { padding:6px 14px 14px; }
+.pipeline-stage { border-bottom:1px dashed var(--border); }
+.pipeline-stage:last-child { border-bottom:0; }
+.pipeline-stage.stage-group-agentic { background:color-mix(in srgb, var(--accent) 4%, transparent); border-radius:var(--radius-xs); }
+.stage-header { display:flex; align-items:center; gap:12px; padding:11px 8px; cursor:pointer; }
+.stage-header:hover { background:var(--surface-2); }
+.stage-title-block { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px; }
+.stage-name { font-size:13px; font-weight:500; color:var(--ink); }
+.stage-index { color:var(--t-faint); font-family:var(--mono); margin-right:6px; font-size:11.5px; }
+.stage-subtitle { font-size:11.5px; color:var(--t-faint); }
+.stage-time { font-family:var(--mono); font-size:11.5px; color:var(--t-faint); flex:none; }
+.stage-time-slow { color:var(--warn); }
+.stage-toggle { color:var(--t-faint); font-size:10px; transition:transform .18s; flex:none; }
+.stage-header.open .stage-toggle { transform:rotate(180deg); }
+.stage-content { display:none; padding:4px 8px 14px; }
+.stage-content.open { display:block; }
+.stage-metrics { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+.stage-chip { font-family:var(--mono); font-size:11px; padding:2px 8px; border-radius:5px; background:var(--subtle); border:1px solid var(--border); color:var(--t-muted); }
+.stage-chip-ok { color:var(--ok); background:var(--ok-soft); border-color:transparent; }
+.stage-chip-warn { color:var(--warn); background:var(--warn-soft); border-color:transparent; }
+.stage-chip-error { color:var(--danger); background:var(--danger-soft); border-color:transparent; }
+.stage-chip-info { color:var(--accent-ink); background:var(--accent-soft); border-color:var(--accent-bd); }
+.stage-chip-skipped { color:var(--t-faint); }
+.stage-kv { display:flex; gap:12px; padding:6px 0; font-size:12.5px; align-items:flex-start; }
+.stage-kv-label { min-width:120px; flex:none; color:var(--t-subtle); font-weight:500; }
+.stage-kv-value { flex:1; min-width:0; color:var(--t-strong); }
+.stage-kv-value code { font-family:var(--mono); font-size:.9em; background:var(--subtle); padding:1px 5px; border-radius:4px; border:1px solid var(--border); }
+.stage-list { margin:0; padding-left:18px; }
+.stage-list li { margin:2px 0; }
+.stage-tag { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; padding:2px 8px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); margin:2px 4px 2px 0; }
+.stage-tag-kind { font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--t-faint); }
+.stage-mono { font-family:var(--mono); }
+.stage-meta { color:var(--t-faint); }
+.stage-hits { width:100%; border-collapse:collapse; font-size:11.5px; margin-top:4px; }
+.stage-hits th, .stage-hits td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
+.stage-hits th { color:var(--t-faint); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.04em; }
+.stage-raw { margin-top:10px; }
+.stage-raw summary { font-size:11.5px; color:var(--t-subtle); cursor:pointer; }
+.stage-json { font-family:var(--mono); font-size:11px; background:var(--subtle); border:1px solid var(--border); border-radius:var(--radius-xs); padding:10px; overflow:auto; margin-top:6px; max-height:340px; color:var(--t-muted); }
 
-        /* ─── Results / answer card ───────────────────────────────────── */
-        .results-section {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 0;
-            box-shadow: var(--shadow-sm);
-            overflow: hidden;
-            margin-bottom: 0;
-        }
-        #latency {
-            color: var(--text-subtle) !important;
-            font-family: var(--font-mono);
-            font-size: 11.5px !important;
-            padding: 12px 22px 0 !important;
-            margin: 0 !important;
-        }
+/* model panel */
+.model-panel { margin-top:14px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden; }
+.model-panel-header { display:flex; align-items:center; gap:9px; padding:11px 14px; width:100%; background:transparent; border:0; text-align:left; font-size:12.5px; font-weight:600; color:var(--ink); }
+.model-panel-header:hover { background:var(--surface-2); }
+.model-panel-badge { font-family:var(--mono); font-size:11px; color:var(--ok); background:var(--ok-soft); padding:1px 8px; border-radius:99px; }
+.model-panel-chevron { margin-left:auto; color:var(--t-faint); font-size:10px; }
+.model-panel-body { display:none; padding:0 14px 14px; }
+.model-panel-body.open { display:block; }
+.model-table { width:100%; border-collapse:collapse; font-size:11.5px; margin-top:6px; }
+.model-table th, .model-table td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--border); }
+.model-table th { color:var(--t-faint); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.04em; }
+.model-table code { font-family:var(--mono); font-size:.92em; color:var(--accent-ink); }
+.model-table .model-note { color:var(--t-faint); }
+.model-row-active { background:var(--accent-soft); }
+.model-cost-row { display:flex; gap:8px; align-items:baseline; margin-top:12px; padding-top:10px; border-top:1px dashed var(--border); font-size:12px; color:var(--t-muted); font-family:var(--mono); }
+.model-cost-label { color:var(--t-subtle); font-family:var(--sans); font-weight:500; }
+.model-cost-sep { color:var(--t-faint); }
+.model-cost-total { color:var(--ink); font-weight:600; }
 
-        .answer-box {
-            background: var(--bg);
-            padding: 8px 22px 22px;
-            margin-bottom: 0;
-            border-left: none;
-            border-radius: 0;
-        }
-        .answer-box h3 {
-            color: var(--text-faint);
-            margin-bottom: 8px;
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            font-weight: 600;
-        }
-        .answer-text {
-            line-height: 1.65;
-            color: var(--text);
-            font-size: 14.5px;
-        }
-        /* Blinking caret while text is rolling out, chatbot-style. */
-        .answer-text.streaming::after {
-            content: "▊";
-            display: inline-block;
-            margin-left: 1px;
-            color: var(--accent);
-            font-weight: 400;
-            animation: answer-caret-blink 0.9s steps(1) infinite;
-            vertical-align: baseline;
-        }
-        @keyframes answer-caret-blink {
-            50% { opacity: 0; }
-        }
+/* loading */
+.loading { display:flex; align-items:center; gap:13px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); padding:18px 20px; }
+.loading-spinner { width:18px; height:18px; border:2px solid var(--border-2); border-top-color:var(--accent); border-radius:50%; animation:spin .7s linear infinite; flex:none; }
+.loading-body { flex:1; min-width:0; }
+.loading-title { font-size:14px; font-weight:600; color:var(--ink); }
+.loading-meta { font-size:12px; color:var(--t-subtle); font-family:var(--mono); }
+.loading-cancel { height:30px; padding:0 13px; border:1px solid var(--border); border-radius:7px; background:var(--surface); color:var(--t-muted); font-size:12.5px; font-weight:500; }
+.loading-cancel:hover:not(:disabled) { border-color:var(--danger); color:var(--danger); }
+.loading-cancel:disabled { opacity:.5; cursor:default; }
+/* live progress — a single "Thinking…" line with a cycling activity ticker */
+.loading { align-items:flex-start; }
+.loading-ticker { margin-top:3px; font-size:13px; color:var(--accent-ink); line-height:1.5;
+  min-height:1.5em; will-change:opacity, transform; }
+.loading-ticker.ticker-in { animation:tickerIn .42s cubic-bezier(.16,.84,.44,1); }
+@keyframes tickerIn { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:none; } }
 
-        .citations {
-            background: var(--bg-soft);
-            padding: 14px 22px 16px;
-            border-top: 1px solid var(--border);
-            border-left: none;
-            border-radius: 0;
-            margin-bottom: 0;
-        }
-        .citations h3 {
-            color: var(--text-faint);
-            margin-bottom: 10px;
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            font-weight: 600;
-        }
-        .citation-item {
-            padding: 6px 0;
-            border-top: 1px solid var(--border);
-            font-size: 13px;
-            color: var(--text-muted);
-        }
-        .citation-item:first-of-type {
-            border-top: 0;
-            padding-top: 0;
-        }
-        .citation-item:last-child {
-            border-bottom: none;
-        }
-        .citation-section {
-            color: var(--text);
-            font-weight: 500;
-            font-family: var(--font-mono);
-            font-size: 12px;
-            margin-right: 6px;
-        }
+/* error */
+.error { background:var(--danger-soft); color:var(--danger); border:1px solid color-mix(in srgb, var(--danger) 30%, transparent); border-radius:var(--radius-sm); padding:12px 15px; font-size:13px; }
 
-        /* ─── Pipeline trace cards ────────────────────────────────────── */
-        .pipeline-section { margin-top: 16px; }
-        .pipeline-section h2 {
-            font-size: 13px;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: var(--text);
-            letter-spacing: -0.005em;
-        }
+/* stage popup */
+.stage-popup { position:fixed; z-index:2000; top:80px; left:50%; transform:translateX(-50%); width:min(560px,92vw); max-height:78vh;
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius); box-shadow:var(--shadow-pop); display:flex; flex-direction:column; }
+.stage-popup-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); cursor:move; font-weight:600; font-size:13px; color:var(--ink); }
+.stage-popup-close { width:26px; height:26px; border:0; background:transparent; color:var(--t-faint); border-radius:6px; font-size:14px; }
+.stage-popup-close:hover { background:var(--surface-2); color:var(--ink); }
+.stage-popup-body { padding:14px 16px; overflow:auto; }
 
-        .pipeline-stage {
-            background: var(--bg);
-            border-top: 1px solid var(--border);
-            border-radius: 0;
-            border-left: 0;
-            border-right: 0;
-            border-bottom: 0;
-            margin-bottom: 0;
-            overflow: hidden;
-            transition: background 0.12s;
-        }
-        .pipeline-stage:first-child { border-top: 0; }
-        .pipeline-stage:hover { background: var(--bg); }
-        .pipeline-stage.stage-group-agentic,
-        .pipeline-stage.stage-group-normal {
-            border-left: 0;
-        }
-
-        .stage-header {
-            padding: 9px 14px;
-            background: var(--bg);
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-            user-select: none;
-            transition: background 0.12s;
-        }
-        .stage-header:hover { background: var(--bg-soft); }
-        .stage-header.open { background: var(--bg-soft); }
-
-        .stage-title-block { flex: 1; min-width: 0; }
-        .stage-name {
-            font-weight: 500;
-            color: var(--text);
-            font-size: 13px;
-            display: block;
-            line-height: 1.35;
-        }
-        .stage-index {
-            color: var(--text-faint);
-            font-weight: 500;
-            margin-right: 6px;
-            font-family: var(--font-mono);
-            font-size: 11.5px;
-        }
-        .stage-subtitle {
-            display: block;
-            font-size: 12px;
-            color: var(--text-subtle);
-            margin-top: 2px;
-            font-weight: 400;
-        }
-
-        .stage-time {
-            font-family: var(--font-mono);
-            font-size: 11.5px;
-            color: var(--text-subtle);
-            background: transparent;
-            padding: 0;
-            border-radius: 0;
-            white-space: nowrap;
-            flex-shrink: 0;
-        }
-        .stage-time.stage-time-slow { color: var(--warn); background: transparent; }
-
-        .stage-toggle {
-            color: var(--text-faint);
-            font-size: 10px;
-            transition: transform 0.15s;
-            flex-shrink: 0;
-        }
-        .stage-header.open .stage-toggle { transform: rotate(180deg); }
-
-        .stage-content {
-            display: none;
-            padding: 12px 18px 16px 42px;
-            border-top: 1px solid var(--border);
-            background: var(--bg-soft);
-        }
-        .stage-content.open { display: block; }
-
-        .stage-metrics {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
-            margin-bottom: 12px;
-        }
-        .stage-chip {
-            font-size: 11.5px;
-            background: var(--bg);
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-weight: 400;
-            font-family: var(--font-mono);
-        }
-        .stage-chip.stage-chip-error {
-            background: #fef2f2;
-            color: var(--danger);
-            border-color: #fecaca;
-        }
-        .stage-chip.stage-chip-warn {
-            background: #fefce8;
-            color: var(--warn);
-            border-color: #fde68a;
-        }
-        .stage-chip.stage-chip-ok {
-            background: #f0fdf4;
-            color: var(--ok);
-            border-color: #bbf7d0;
-        }
-        .stage-chip.stage-chip-info {
-            background: #eef2ff;
-            color: #3730a3;
-            border-color: #c7d2fe;
-        }
-        .stage-chip.stage-chip-skipped {
-            background: var(--bg-muted);
-            color: var(--text-subtle);
-            border-color: var(--border);
-            font-style: normal;
-        }
-
-        .stage-kv {
-            display: grid;
-            grid-template-columns: 140px 1fr;
-            gap: 14px;
-            padding: 6px 0;
-            border-top: 1px solid var(--border);
-            font-size: 12.5px;
-            align-items: start;
-        }
-        .stage-kv:first-of-type { border-top: 0; padding-top: 0; }
-        .stage-kv-label {
-            color: var(--text-subtle);
-            font-weight: 500;
-            font-size: 11.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            padding-top: 2px;
-        }
-        .stage-kv-value {
-            color: var(--text);
-            min-width: 0;
-            word-break: break-word;
-        }
-        .stage-kv-value code {
-            background: var(--bg-muted);
-            padding: 1px 5px;
-            border-radius: 3px;
-            font-size: 12px;
-            border: 1px solid var(--border);
-            font-family: var(--font-mono);
-            color: var(--text);
-        }
-
-        .stage-list { margin: 0; padding-left: 18px; color: var(--text); }
-        .stage-list li { margin: 3px 0; }
-
-        .stage-tag {
-            display: inline-block;
-            background: var(--bg);
-            color: var(--text-muted);
-            font-size: 11.5px;
-            padding: 2px 8px;
-            border-radius: 10px;
-            margin: 2px 4px 2px 0;
-            border: 1px solid var(--border);
-            font-family: var(--font-mono);
-        }
-        .stage-tag-kind {
-            color: var(--text-faint);
-            font-size: 11px;
-            margin-left: 4px;
-        }
-
-        .stage-mono { font-family: var(--font-mono); font-size: 12px; }
-        .stage-meta { color: var(--text-subtle); }
-
-        .stage-hits {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            overflow: hidden;
-        }
-        .stage-hits thead th {
-            background: var(--bg-muted);
-            color: var(--text-subtle);
-            text-align: left;
-            font-weight: 500;
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            padding: 6px 10px;
-            border-bottom: 1px solid var(--border);
-        }
-        .stage-hits tbody td {
-            padding: 6px 10px;
-            border-top: 1px solid var(--border);
-            vertical-align: top;
-            font-family: var(--font-mono);
-            font-size: 11.5px;
-            color: var(--text);
-        }
-        .stage-hits tbody tr:first-child td { border-top: 0; }
-
-        .stage-raw {
-            margin-top: 14px;
-            border-top: 1px dashed var(--border);
-            padding-top: 10px;
-        }
-        .stage-raw summary {
-            cursor: pointer;
-            font-size: 11.5px;
-            color: var(--text-subtle);
-            user-select: none;
-            font-weight: 500;
-        }
-        .stage-raw summary:hover { color: var(--text); }
-        .stage-raw[open] summary { margin-bottom: 8px; }
-        .stage-json {
-            background: #0c0c0c;
-            color: #e5e5e5;
-            padding: 12px 14px;
-            border-radius: var(--radius-sm);
-            overflow-x: auto;
-            font-family: var(--font-mono);
-            font-size: 11.5px;
-            line-height: 1.5;
-            margin: 0;
-        }
-
-        .hidden { display: none !important; }
-
-        footer {
-            text-align: center;
-            margin-top: 50px;
-            padding: 20px;
-            color: var(--text-faint);
-            font-size: 11.5px;
-        }
-
-        @media (max-width: 768px) {
-            .config-grid { grid-template-columns: 1fr; }
-            .search-box { flex-direction: column; }
-            button { width: 100%; }
-        }
-
-        /* ─── Markdown rendering inside .answer-text ──────────────────── */
-        .answer-text h1, .answer-text h2, .answer-text h3, .answer-text h4 {
-            color: var(--text);
-            margin: 1em 0 0.4em;
-            line-height: 1.3;
-            font-weight: 600;
-            letter-spacing: -0.01em;
-        }
-        .answer-text h1 { font-size: 1.4em; }
-        .answer-text h2 { font-size: 1.2em; }
-        .answer-text h3 { font-size: 1.05em; }
-        .answer-text h4 { font-size: 1em; }
-        .answer-text > *:first-child { margin-top: 0; }
-        .answer-text > *:last-child  { margin-bottom: 0; }
-        .answer-text p { margin: 0.7em 0; }
-        .answer-text ul, .answer-text ol { margin: 0.7em 0; padding-left: 1.4em; }
-        .answer-text li { margin: 0.25em 0; }
-        .answer-text li > p { margin: 0.25em 0; }
-        .answer-text strong { color: var(--text); font-weight: 600; }
-        .answer-text em { color: var(--text-muted); }
-        .answer-text blockquote {
-            border-left: 2px solid var(--border-strong);
-            color: var(--text-muted);
-            margin: 0.8em 0;
-            padding: 0.2em 0.9em;
-            background: var(--bg-soft);
-            border-radius: 0 3px 3px 0;
-        }
-        .answer-text code {
-            font-family: var(--font-mono);
-            font-size: 0.88em;
-            background: var(--bg-muted);
-            padding: 1px 5px;
-            border-radius: 3px;
-            color: var(--text);
-            border: 1px solid var(--border);
-        }
-        .answer-text pre {
-            background: #0c0c0c;
-            color: #e5e5e5;
-            padding: 12px 14px;
-            border-radius: var(--radius-sm);
-            overflow-x: auto;
-            margin: 0.8em 0;
-            line-height: 1.45;
-            font-size: 0.88em;
-            font-family: var(--font-mono);
-        }
-        .answer-text pre code {
-            background: transparent;
-            border: 0;
-            padding: 0;
-            color: inherit;
-            font-size: 1em;
-        }
-        .answer-text table {
-            border-collapse: collapse;
-            margin: 0.9em 0;
-            width: 100%;
-            font-size: 0.92em;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            overflow: hidden;
-        }
-        .answer-text th, .answer-text td {
-            border-bottom: 1px solid var(--border);
-            border-left: 0;
-            border-right: 0;
-            padding: 8px 11px;
-            text-align: left;
-            vertical-align: top;
-        }
-        .answer-text th {
-            background: var(--bg-muted);
-            color: var(--text-muted);
-            font-weight: 600;
-        }
-        .answer-text tr:last-child td { border-bottom: 0; }
-        .answer-text tr:nth-child(even) td { background: var(--bg-soft); }
-        .answer-text a {
-            color: var(--text);
-            text-decoration: underline;
-            text-underline-offset: 2px;
-            text-decoration-color: var(--border-strong);
-        }
-        .answer-text a:hover { text-decoration-color: var(--text); }
-        .answer-text hr {
-            border: 0;
-            border-top: 1px solid var(--border);
-            margin: 1.2em 0;
-        }
-
-        /* ─── Pipeline visualization (Mermaid DAG) ────────────────────── */
-        .viz-section {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 14px 16px 12px;
-            margin: 14px 0;
-            box-shadow: var(--shadow-sm);
-        }
-        .viz-section h2 {
-            font-size: 13px;
-            color: var(--text);
-            margin: 0 0 2px;
-            font-weight: 600;
-            letter-spacing: -0.005em;
-        }
-        .viz-section .viz-sub {
-            font-size: 12px;
-            color: var(--text-subtle);
-            margin-bottom: 12px;
-            line-height: 1.45;
-        }
-        .viz-container {
-            overflow-x: auto;
-            background:
-                radial-gradient(circle at 1px 1px, var(--border) 1px, transparent 0);
-            background-size: 22px 22px;
-            background-color: var(--bg-soft);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            padding: 24px 18px;
-            min-height: 220px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .viz-container .mermaid { text-align: center; width: 100%; }
-        .viz-container svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
-        .viz-container .nodeLabel,
-        .viz-container .label,
-        .viz-container foreignObject div {
-            font-family: var(--font-sans) !important;
-            font-size: 12px !important;
-            line-height: 1.4 !important;
-            letter-spacing: -0.005em;
-        }
-        .viz-container .nodeLabel b { font-weight: 600; }
-        .viz-container .nodeLabel .vz-sub {
-            display: block;
-            font-size: 11px;
-            opacity: 0.75;
-            margin-top: 2px;
-            font-weight: 400;
-        }
-        .viz-container .nodeLabel .vz-time {
-            display: block;
-            font-size: 10.5px;
-            margin-top: 3px;
-            opacity: 0.65;
-            font-family: var(--font-mono);
-        }
-        .viz-container .node rect,
-        .viz-container .node polygon,
-        .viz-container .node path {
-            filter: drop-shadow(0 1px 1.5px rgba(0,0,0,0.04));
-        }
-        .viz-container .edgePath path {
-            stroke-width: 1.2px !important;
-            stroke: var(--text-faint) !important;
-        }
-        .viz-container .arrowheadPath,
-        .viz-container marker path {
-            fill: var(--text-faint) !important;
-            stroke: var(--text-faint) !important;
-        }
-
-        .viz-empty {
-            color: var(--text-faint);
-            text-align: center;
-            font-size: 12.5px;
-            padding: 28px;
-            font-style: normal;
-            width: 100%;
-        }
-
-        .viz-legend {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px 16px;
-            margin-top: 14px;
-            padding: 10px 12px;
-            background: var(--bg-soft);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            font-size: 11.5px;
-        }
-        .viz-legend-item {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            color: var(--text-muted);
-        }
-        .viz-legend-swatch {
-            width: 10px; height: 10px;
-            border-radius: 3px;
-            border: 1px solid rgba(0,0,0,0.06);
-            flex-shrink: 0;
-        }
-
-        .viz-header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 4px;
-        }
-        .viz-nav {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            flex-shrink: 0;
-        }
-        .viz-nav-btn {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            width: 28px;
-            height: 28px;
-            font-size: 13px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--text-muted);
-            padding: 0;
-        }
-        .viz-nav-btn:hover:not(:disabled) {
-            background: var(--bg-muted);
-            border-color: var(--border-strong);
-            color: var(--text);
-        }
-        .viz-nav-btn:disabled { opacity: 0.35; cursor: default; }
-        .viz-nav-label {
-            font-size: 11.5px;
-            color: var(--text-subtle);
-            min-width: 64px;
-            text-align: center;
-            font-variant-numeric: tabular-nums;
-            font-family: var(--font-mono);
-        }
-
-        /* ─── Collapsed trace accordion ───────────────────────────────── */
-        .trace-details { margin: 14px 0; }
-        .trace-summary {
-            cursor: pointer;
-            list-style: none;
-            padding: 10px 14px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            user-select: none;
-            transition: background 0.12s;
-            letter-spacing: -0.005em;
-        }
-        .trace-summary:hover { background: var(--bg-soft); }
-        .trace-summary::-webkit-details-marker { display: none; }
-        .trace-summary::marker { display: none; }
-        .trace-details[open] .trace-summary {
-            border-radius: 8px 8px 0 0;
-            border-bottom-color: var(--border);
-        }
-        .trace-summary-chevron {
-            margin-left: auto;
-            font-size: 10px;
-            color: var(--text-faint);
-            transition: transform 0.15s;
-        }
-        .trace-details[open] .trace-summary-chevron { transform: rotate(180deg); }
-        .trace-count {
-            font-size: 12px;
-            font-weight: 400;
-            color: var(--text-subtle);
-            font-family: var(--font-mono);
-        }
-        .trace-details #pipeline-stages {
-            border: 1px solid var(--border);
-            border-top: none;
-            border-radius: 0 0 8px 8px;
-            background: var(--bg);
-            padding: 0;
-            overflow: hidden;
-        }
-
-        /* ─── Draggable stage detail popup ────────────────────────────── */
-        .stage-popup {
-            position: fixed;
-            z-index: 9999;
-            top: 80px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 480px;
-            max-width: 92vw;
-            max-height: 80vh;
-            background: var(--bg);
-            border: 1px solid var(--border-strong);
-            border-radius: 8px;
-            box-shadow: 0 12px 32px rgba(0,0,0,0.12);
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-        .stage-popup-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px 14px;
-            background: var(--bg-soft);
-            border-bottom: 1px solid var(--border);
-            cursor: grab;
-            user-select: none;
-            flex-shrink: 0;
-        }
-        .stage-popup-header:active { cursor: grabbing; }
-        .stage-popup-title {
-            font-weight: 600;
-            font-size: 13px;
-            color: var(--text);
-            letter-spacing: -0.005em;
-        }
-        .stage-popup-close {
-            background: none;
-            border: none;
-            font-size: 14px;
-            cursor: pointer;
-            color: var(--text-subtle);
-            line-height: 1;
-            padding: 2px 6px;
-            border-radius: 3px;
-            height: auto;
-        }
-        .stage-popup-close:hover {
-            background: var(--bg-muted);
-            color: var(--text);
-        }
-        .stage-popup-body {
-            overflow-y: auto;
-            padding: 12px 14px;
-            flex: 1;
-            font-size: 13px;
-        }
-        .viz-container svg g.node { cursor: pointer; }
-        .viz-container svg g.node:hover rect,
-        .viz-container svg g.node:hover polygon,
-        .viz-container svg g.node:hover path,
-        .viz-container svg g.node:hover circle,
-        .viz-container svg g.node:hover ellipse {
-            filter: brightness(0.96) drop-shadow(0 2px 4px rgba(0,0,0,0.08));
-        }
-
-        /* ─── Model info panel ────────────────────────────────────────── */
-        .model-panel {
-            margin: 14px 0;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            overflow: hidden;
-            font-size: 12.5px;
-            background: var(--bg);
-        }
-        .model-panel-header {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            background: var(--bg);
-            padding: 10px 14px;
-            cursor: pointer;
-            user-select: none;
-            border: none;
-            width: 100%;
-            text-align: left;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text);
-            height: auto;
-            letter-spacing: -0.005em;
-            border-radius: 0;
-        }
-        .model-panel-header:hover { background: var(--bg-soft); }
-        .model-panel-badge {
-            margin-left: auto;
-            background: var(--bg-muted);
-            color: var(--text-muted);
-            font-size: 11.5px;
-            font-weight: 500;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-family: var(--font-mono);
-            border: 1px solid var(--border);
-        }
-        .model-panel-chevron { font-size: 10px; color: var(--text-faint); }
-        .model-panel-body {
-            display: none;
-            padding: 0;
-            background: var(--bg);
-            overflow-x: auto;
-            border-top: 1px solid var(--border);
-        }
-        .model-panel-body.open { display: block; }
-        .model-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-        }
-        .model-table th {
-            text-align: left;
-            padding: 8px 14px;
-            border-bottom: 1px solid var(--border);
-            color: var(--text-subtle);
-            font-weight: 500;
-            white-space: nowrap;
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            background: var(--bg);
-        }
-        .model-table td {
-            padding: 8px 14px;
-            border-bottom: 1px solid var(--border);
-            vertical-align: middle;
-            color: var(--text);
-        }
-        .model-table tr:last-child td { border-bottom: 0; }
-        .model-table code {
-            background: var(--bg-muted);
-            padding: 1px 5px;
-            border-radius: 3px;
-            font-size: 11px;
-            border: 1px solid var(--border);
-            font-family: var(--font-mono);
-        }
-        .model-row-active td {
-            background: var(--bg-muted);
-            font-weight: 500;
-        }
-        .model-row-active td:first-child { position: relative; }
-        .model-row-active td:first-child::before {
-            content: '';
-            position: absolute;
-            left: 0; top: 6px; bottom: 6px;
-            width: 2px;
-            background: var(--accent);
-        }
-        .model-note { color: var(--text-faint); font-style: normal; font-size: 11.5px; }
-        .model-cost-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            align-items: center;
-            margin: 0;
-            padding: 10px 14px;
-            border-top: 1px solid var(--border);
-            background: var(--bg-soft);
-            font-size: 12px;
-            color: var(--text-muted);
-        }
-        .model-cost-label { font-weight: 600; color: var(--text); }
-        .model-cost-sep { color: var(--text-faint); }
-        .model-cost-total {
-            font-weight: 600;
-            color: var(--text);
-            font-size: 12.5px;
-            font-family: var(--font-mono);
-        }
+/* overlays (agentic confirm + config) */
+.ag-confirm-overlay, .ag-config-overlay { position:fixed; inset:0; z-index:2100; background:color-mix(in srgb, var(--ink) 38%, transparent);
+  display:flex; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(2px); animation:fadeUp .14s ease; }
+.ag-confirm, .ag-config { width:min(560px,94vw); max-height:88vh; overflow:auto; background:var(--surface); border:1px solid var(--border-2);
+  border-radius:var(--radius); box-shadow:var(--shadow-pop); padding:22px; }
+.ag-confirm-title, .ag-config-title { font-size:16px; font-weight:600; letter-spacing:-0.02em; color:var(--ink); }
+.ag-confirm-sub, .ag-config-sub { font-size:12.5px; color:var(--t-subtle); margin-top:4px; }
+.ag-config-header { margin-bottom:16px; }
+.ag-confirm-rows { display:grid; grid-template-columns:auto 1fr; gap:8px 16px; margin:16px 0; padding:14px 16px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm); }
+.ag-confirm-key { font-size:12px; color:var(--t-subtle); font-weight:500; }
+.ag-confirm-val { font-size:12.5px; color:var(--ink); font-family:var(--mono); text-align:right; }
+.ag-confirm-actions, .ag-config-footer { display:flex; gap:9px; justify-content:flex-end; margin-top:18px; }
+.ag-confirm-btn { height:36px; padding:0 16px; border-radius:8px; font-size:13px; font-weight:600; border:1px solid var(--border); background:var(--surface); color:var(--t-muted); transition:all .14s; display:inline-flex; align-items:center; gap:6px; }
+.ag-confirm-btn:hover { border-color:var(--border-2); color:var(--ink); background:var(--surface-2); }
+.ag-confirm-btn-run { background:var(--accent); border-color:var(--accent); color:#fff; }
+.ag-confirm-btn-run:hover { filter:brightness(1.1); background:var(--accent); color:#fff; }
+.ag-confirm-btn-edit { border-color:var(--accent-bd); color:var(--accent-ink); background:var(--accent-soft); }
+.ag-config-body { display:flex; flex-direction:column; gap:14px; }
+.ag-config-body .agentic-config,
+.ag-config-body .agentic-config.hidden { display:block !important; }
+.ag-config-body .config-grid { grid-template-columns:1fr 1fr 1fr; }
     </style>
     <script>
         // Apply the saved (or system-preferred) theme before first paint to
@@ -2342,276 +1397,300 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 var dark = saved ? saved === "dark"
                     : window.matchMedia("(prefers-color-scheme: dark)").matches;
                 if (dark) document.documentElement.setAttribute("data-theme", "dark");
-            } catch (e) { /* localStorage unavailable — default to light */ }
+            } catch (e) { /* localStorage unavailable - default to light */ }
         })();
     </script>
 </head>
 <body>
-    <header>
-        <div class="container">
-            <button id="theme-toggle" class="theme-toggle" type="button" role="switch"
-                    title="Toggle dark mode" aria-label="Toggle dark mode">
-                <span class="theme-toggle-knob">
-                    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                         stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-                    </svg>
-                    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                         stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="4"></circle>
-                        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
-                    </svg>
-                </span>
-            </button>
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <h1>specGPT</h1>
-                    <p>Ask questions about NVMe specifications. See exactly how the system found the answer.</p>
-                </div>
-                <div style="display: flex; align-items: center; gap: 10px;">
-                    <label class="global-model-picker" title="Which NVMe specification to search">
-                        <span class="global-model-picker-label">Spec</span>
-                        <select id="global-spec-select"></select>
-                    </label>
-                    <label class="global-model-picker" title="Sets both LLMs at once">
-                        <span class="global-model-picker-label">Model</span>
-                        <select id="global-model-select"></select>
-                    </label>
-                    <form method="post" action="/logout" style="margin: 0;">
-                        <button type="submit" class="config-toggle">Sign out</button>
-                    </form>
-                </div>
+<div id="root" class="app">
+    <header class="topbar">
+        <div class="wrap topbar-inner">
+            <div class="brand">
+                <div class="brand-name">spec<b>GPT</b></div>
+                <span class="brand-tag">NVMe Spec Q&amp;A</span>
             </div>
-            <div id="agent-strip" class="agent-strip" aria-label="Agent activity">
-                <span class="agent-strip-label">Agent</span>
-                <span class="agent-strip-empty">Run a query to see gap hints and one-click follow-ups here.</span>
+            <div class="topbar-right">
+                <button id="theme-toggle" class="icon-btn" type="button" role="switch"
+                        title="Toggle dark mode" aria-label="Toggle dark mode">
+                    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+                    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+                </button>
+                <label class="picker" title="Which NVMe specification to search">
+                    <span class="picker-lbl">Spec</span>
+                    <select id="global-spec-select"></select>
+                </label>
+                <label class="picker" title="Sets both LLMs at once">
+                    <span class="picker-lbl">Model</span>
+                    <select id="global-model-select"></select>
+                </label>
+                <form class="topbar-form" method="post" action="/logout">
+                    <button type="submit" class="ghost-btn">Sign out</button>
+                </form>
             </div>
         </div>
     </header>
 
-    <div class="container"> 
-        <div class="search-section">
-            <div class="search-box">
-                <input
-                    type="text"
-                    id="query-input"
-                    placeholder="Ask a question... e.g., 'What is bit 7 of CDW10?'"
-                    autocomplete="off"
-                >
-                <button id="search-btn">Search</button>
-                <button id="agentic-square-btn" class="agentic-square-btn" type="button"
-                        title="Agentic mode — click to configure" aria-label="Agentic mode">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                         stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <line x1="12" y1="3" x2="12" y2="6"/>
-                        <circle cx="12" cy="2.5" r="1" fill="currentColor" stroke="none"/>
-                        <rect x="4" y="7" width="16" height="12" rx="2.5"/>
-                        <circle cx="9" cy="13" r="1.4" fill="currentColor" stroke="none"/>
-                        <circle cx="15" cy="13" r="1.4" fill="currentColor" stroke="none"/>
-                        <line x1="10" y1="16.5" x2="14" y2="16.5"/>
-                        <line x1="3" y1="13" x2="4" y2="13"/>
-                        <line x1="20" y1="13" x2="21" y2="13"/>
-                    </svg>
-                </button>
-                <button id="config-toggle" class="config-toggle">Config</button>
-            </div>
-
-            <div id="agentic-row" class="agentic-row">
-                <label>
-                    <input type="checkbox" id="agentic-toggle">
-                    <span>Agentic mode</span>
-                </label>
-                <span class="agentic-hint">
-                    Decomposes the answer, runs follow-up retrieval to fill
-                    gaps, then regenerates with Opus + larger context. Slower
-                    (~30-60s) and ~10× the cost leave off for routine queries.
-                </span>
-            </div>
-
-            <div id="agentic-config" class="agentic-config hidden">
-                <div class="config-grid">
-                    <div class="config-item config-item-wide">
-                        <label>Agentic LLM</label>
-                        <select id="config-agentic_model" data-model-select="agentic"></select>
+    <main class="main">
+        <div class="wrap">
+            <div id="composer" class="composer">
+                <div class="composer-row">
+                    <div class="composer-input-wrap">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+                        <input type="text" id="query-input" autocomplete="off"
+                               placeholder="Ask about the NVMe spec...  e.g. What does CIRN indicate?">
                     </div>
-                    <div class="config-item">
-                        <label>Max Follow-ups</label>
-                        <input type="number" id="config-agentic_max_followups" value="3" min="0" max="5">
-                    </div>
-                    <div class="config-item">
-                        <label>Agentic Rerank Top-K</label>
-                        <input type="number" id="config-agentic_rerank_topk" value="14" min="5" max="25">
-                    </div>
-                    <div class="config-item">
-                        <label>Context Tokens</label>
-                        <input type="number" id="config-agentic_max_context_tokens" value="16000" min="4000" max="24000" step="1000">
-                    </div>
-                    <div class="config-item">
-                        <label>Output Tokens</label>
-                        <input type="number" id="config-agentic_max_output_tokens" value="2048" min="512" max="4096" step="256">
-                    </div>
-                    <div class="config-item">
-                        <label><input type="checkbox" id="config-agentic_targeted_fetch" checked> Targeted Fetch</label>
-                    </div>
-                    <div class="config-item">
-                        <label><input type="checkbox" id="config-agentic_recursive"> Recursive</label>
-                    </div>
-                    <div class="config-item">
-                        <label>Max Iterations</label>
-                        <input type="number" id="config-agentic_max_iterations" value="5" min="1" max="10">
-                    </div>
-                </div>
-            </div>
-
-            <div id="config-panel" class="config-panel">
-                <strong>Pipeline Configuration</strong>
-                <div class="config-grid">
-                    <div class="config-item config-item-wide">
-                        <label>Regular LLM</label>
-                        <select id="config-llm_model" data-model-select="llm"></select>
-                    </div>
-                    <div class="config-item">
-                        <label>Vector Top-K</label>
-                        <input type="number" id="config-vector_topk" value="10" min="1" max="50">
-                    </div>
-                    <div class="config-item">
-                        <label>tsvector Top-K</label>
-                        <input type="number" id="config-tsvector_topk" value="10" min="1" max="50">
-                    </div>
-                    <div class="config-item">
-                        <label>BM25 Top-K</label>
-                        <input type="number" id="config-bm25_topk" value="10" min="1" max="50">
-                    </div>
-                    <div class="config-item">
-                        <label>RRF K</label>
-                        <input type="number" id="config-rrf_k" value="60" min="10" max="200">
-                    </div>
-                    <div class="config-item">
-                        <label>RRF Output Top-K</label>
-                        <input type="number" id="config-rrf_output_topk" value="20" min="5" max="50">
-                    </div>
-                    <div class="config-item">
-                        <label>Final Rerank Top-K</label>
-                        <input type="number" id="config-final_rerank_topk" value="7" min="1" max="20">
-                    </div>
-                    <div class="config-item">
-                        <label>Max Sub-Queries</label>
-                        <input type="number" id="config-max_subqueries" value="3" min="1" max="5">
-                    </div>
-                    <div class="config-item">
-                        <label><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
-                    </div>
-                </div>
-            </div>
-
-            <div id="cost-estimator" class="cost-estimator" onclick="toggleCostBreakdown(event)" role="button" aria-expanded="false" tabindex="0">
-                <div class="cost-summary">
-                    <span class="cost-label">Est. cost / query</span>
-                    <span class="cost-total" id="cost-total">$0.00</span>
-                    <span class="cost-context" id="cost-context"></span>
-                    <span class="cost-toggle" id="cost-toggle">▼</span>
-                </div>
-                <div class="cost-breakdown" id="cost-breakdown"></div>
-            </div>
-        </div>
-
-        <div id="results" class="hidden">
-            <div id="error" class="error hidden"></div>
-
-            <div id="loading" class="loading hidden" role="status" aria-live="polite">
-                <div class="loading-spinner" aria-hidden="true"></div>
-                <div class="loading-body">
-                    <div class="loading-title" id="loading-title">Running pipeline</div>
-                    <div class="loading-meta">
-                        <span id="loading-elapsed">0.0s elapsed</span>
-                        <span class="loading-dots"></span>
-                    </div>
-                </div>
-                <button type="button" class="loading-cancel" id="loading-cancel">Cancel</button>
-            </div>
-
-            <div id="answer-section" class="results-section hidden">
-                <div id="latency" style="text-align: right;"></div>
-
-                <div class="answer-box">
-                    <h3>Answer</h3>
-                    <div id="answer-text" class="answer-text"></div>
+                    <button id="search-btn" class="ask-btn">
+                        Ask
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+                    </button>
                 </div>
 
-                <div id="citations-box" class="citations hidden">
-                    <h3>Sources Cited</h3>
-                    <div id="citations-list"></div>
-                </div>
+                <div class="controls">
+                    <div class="config-pop-wrap">
+                        <button id="config-toggle" class="pill" type="button">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></svg>
+                            Config
+                        </button>
+                        <div id="config-panel" class="config-panel">
+                            <strong>Pipeline configuration</strong>
+                            <div class="config-grid">
+                                <div class="config-item config-item-wide">
+                                    <label>Regular LLM</label>
+                                    <select id="config-llm_model" data-model-select="llm"></select>
+                                </div>
+                                <div class="config-item">
+                                    <label>Vector Top-K</label>
+                                    <input type="number" id="config-vector_topk" value="10" min="1" max="50">
+                                </div>
+                                <div class="config-item">
+                                    <label>tsvector Top-K</label>
+                                    <input type="number" id="config-tsvector_topk" value="10" min="1" max="50">
+                                </div>
+                                <div class="config-item">
+                                    <label>BM25 Top-K</label>
+                                    <input type="number" id="config-bm25_topk" value="10" min="1" max="50">
+                                </div>
+                                <div class="config-item">
+                                    <label>RRF K</label>
+                                    <input type="number" id="config-rrf_k" value="60" min="10" max="200">
+                                </div>
+                                <div class="config-item">
+                                    <label>RRF Output Top-K</label>
+                                    <input type="number" id="config-rrf_output_topk" value="20" min="5" max="50">
+                                </div>
+                                <div class="config-item">
+                                    <label>Final Rerank Top-K</label>
+                                    <input type="number" id="config-final_rerank_topk" value="7" min="1" max="20">
+                                </div>
+                                <div class="config-item">
+                                    <label>Max Sub-Queries</label>
+                                    <input type="number" id="config-max_subqueries" value="3" min="1" max="5">
+                                </div>
+                                <div class="config-item">
+                                    <label><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
+                                </div>
+                            </div>
 
-                <div class="viz-section">
-                    <div class="viz-header-row">
-                        <div>
-                            <h2>Pipeline Flow</h2>
-                            <div class="viz-sub">
-                                Each color is a stage family. Branches show per-sub-query
-                                retrieval (semantic · keyword · BM25); all paths merge
-                                through rank fusion → dedup → rerank → generation.
-                                Click any node to inspect its data.
+                            <div class="config-section-label">Agentic refinement</div>
+                            <div id="agentic-config" class="agentic-config">
+                                <div class="config-grid">
+                                    <div class="config-item config-item-wide">
+                                        <label>Agentic LLM</label>
+                                        <select id="config-agentic_model" data-model-select="agentic"></select>
+                                    </div>
+                                    <div class="config-item">
+                                        <label>Max Follow-ups</label>
+                                        <input type="number" id="config-agentic_max_followups" value="3" min="0" max="5">
+                                    </div>
+                                    <div class="config-item">
+                                        <label>Agentic Rerank Top-K</label>
+                                        <input type="number" id="config-agentic_rerank_topk" value="14" min="5" max="25">
+                                    </div>
+                                    <div class="config-item">
+                                        <label>Context Tokens</label>
+                                        <input type="number" id="config-agentic_max_context_tokens" value="16000" min="4000" max="24000" step="1000">
+                                    </div>
+                                    <div class="config-item">
+                                        <label>Output Tokens</label>
+                                        <input type="number" id="config-agentic_max_output_tokens" value="2048" min="512" max="4096" step="256">
+                                    </div>
+                                    <div class="config-item">
+                                        <label><input type="checkbox" id="config-agentic_targeted_fetch" checked> Targeted Fetch</label>
+                                    </div>
+                                    <div class="config-item">
+                                        <label><input type="checkbox" id="config-agentic_recursive"> Recursive</label>
+                                    </div>
+                                    <div class="config-item">
+                                        <label>Max Iterations</label>
+                                        <input type="number" id="config-agentic_max_iterations" value="5" min="1" max="10">
+                                    </div>
+                                </div>
                             </div>
                         </div>
-                        <div id="viz-nav" class="viz-nav" style="display:none">
-                            <button id="viz-nav-prev" class="viz-nav-btn" onclick="vizPrev()" title="Previous pass">&#8592;</button>
-                            <span id="viz-nav-label" class="viz-nav-label">Pass 1 / 1</span>
-                            <button id="viz-nav-next" class="viz-nav-btn" onclick="vizNext()" title="Next pass">&#8594;</button>
-                        </div>
                     </div>
-                    <div id="pipeline-viz" class="viz-container">
-                        <div class="viz-empty">
-                            Run a query to see the pipeline flow.
+
+                    <button id="agentic-pill" class="pill" type="button"
+                            title="Toggle agentic refinement for the next query">
+                        <span class="pill-dot"></span>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="3" x2="12" y2="6"/><circle cx="12" cy="2.6" r="1" fill="currentColor" stroke="none"/><rect x="4" y="7" width="16" height="12" rx="3"/><circle cx="9" cy="13" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.3" fill="currentColor" stroke="none"/><line x1="10" y1="16.5" x2="14" y2="16.5"/></svg>
+                        <span id="agentic-pill-label">Agentic</span>
+                    </button>
+
+                    <div class="controls-spacer"></div>
+
+                    <div id="cost-estimator" class="cost-estimator" role="button" aria-expanded="false" tabindex="0" onclick="toggleCostBreakdown(event)">
+                        <div class="cost-chip cost-summary">
+                            <span class="cost-chip-lbl">Est. cost</span>
+                            <span class="cost-total" id="cost-total">$0.00</span>
+                            <span class="cost-context" id="cost-context"></span>
+                            <span class="cost-toggle" id="cost-toggle">&#9662;</span>
                         </div>
-                    </div>
-                    <div id="pipeline-legend" class="viz-legend" style="display:none">
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#ede9fe;border-color:#a78bfa"></span>Understand</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#d1fae5;border-color:#34d399"></span>Structured lookup</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#dbeafe;border-color:#93c5fd"></span>Semantic / keyword / BM25</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fef3c7;border-color:#fbbf24"></span>Fuse &amp; dedup</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fecaca;border-color:#fca5a5"></span>Rerank</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#1e40af;border-color:#1e3a8a"></span>Generate</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#f3e8ff;border-color:#c084fc"></span>Agentic pass</span>
-                        <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#10b981;border-color:#047857"></span>Final answer</span>
+                        <div class="cost-breakdown" id="cost-breakdown"></div>
                     </div>
                 </div>
 
-                <details id="trace-details" class="trace-details">
-                    <summary class="trace-summary">
-                        Pipeline Trace
-                        <span id="trace-stage-count" class="trace-count"></span>
-                        <span class="trace-summary-chevron">▼</span>
-                    </summary>
-                    <div id="pipeline-stages"></div>
-                </details>
+                <div id="agentic-row" class="agentic-row">
+                    <label>
+                        <input type="checkbox" id="agentic-toggle">
+                        <span>Agentic mode</span>
+                    </label>
+                    <span class="agentic-hint">
+                        Decomposes the answer, runs follow-up retrieval to fill gaps, then
+                        regenerates with the agentic model and a larger context. Slower
+                        (about 30 to 60 seconds) and roughly 10x the cost, so leave it off
+                        for routine queries.
+                    </span>
+                </div>
+            </div>
 
-                <div class="model-panel" id="model-panel">
-                    <button class="model-panel-header" onclick="toggleModelPanel()">
-                        Models &amp; Cost
-                        <span class="model-panel-badge" id="model-cost-badge" style="display:none"></span>
-                        <span class="model-panel-chevron" id="model-panel-chevron">▼</span>
-                    </button>
-                    <div class="model-panel-body" id="model-panel-body">
-                        <table class="model-table" id="model-table">
-                            <thead>
-                                <tr>
-                                    <th>Stage</th><th>Model</th><th>Provider</th>
-                                    <th>$/1M in</th><th>$/1M out</th><th>Note</th>
-                                </tr>
-                            </thead>
-                            <tbody id="model-table-body">
-                                <tr><td colspan="6" style="color:#aaa;font-style:italic">Loading…</td></tr>
-                            </tbody>
-                        </table>
-                        <div class="model-cost-row" id="model-cost-row" style="display:none"></div>
+            <div id="empty-state" class="empty">
+                <div class="empty-mark">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
+                </div>
+                <h2>Ask the NVMe specification anything</h2>
+                <p>Type a question and get a grounded, citation-backed answer. Every source
+                   section is listed alongside, and you can inspect exactly how the answer
+                   was retrieved.</p>
+                <div class="examples" id="examples"></div>
+            </div>
+
+            <div id="results" class="hidden">
+                <div id="error" class="error hidden"></div>
+
+                <div id="loading" class="loading hidden" role="status" aria-live="polite">
+                    <div class="loading-spinner" aria-hidden="true"></div>
+                    <div class="loading-body">
+                        <div class="loading-title" id="loading-title">Thinking…</div>
+                        <div class="loading-ticker" id="loading-ticker"></div>
+                        <div class="loading-meta"><span id="loading-elapsed">0.0s elapsed</span></div>
+                    </div>
+                    <button type="button" class="loading-cancel" id="loading-cancel">Cancel</button>
+                </div>
+
+                <div id="answer-section" class="hidden">
+                    <div class="split">
+                        <div class="split-main">
+                            <div class="answer-box">
+                                <div class="answer-meta" id="answer-meta"></div>
+                                <h3>Answer</h3>
+                                <div id="latency"></div>
+                                <div id="answer-text" class="answer-text"></div>
+                            </div>
+
+                            <div id="agent-strip" class="agent-strip" aria-label="Agent activity"></div>
+
+                            <div id="pipeline-disclosure" class="pipe">
+                                <button class="pipe-head" id="pipe-head" type="button">
+                                    <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
+                                    <span class="pipe-title">How this answer was found</span>
+                                    <span class="pipe-summary" id="pipe-summary"></span>
+                                    <span class="pipe-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
+                                </button>
+                                <div class="pipe-body" id="pipe-body">
+                                    <div class="viz-section">
+                                        <div class="viz-header-row">
+                                            <div>
+                                                <h2>Pipeline flow</h2>
+                                                <div class="viz-sub">
+                                                    Each color is a stage family. Branches show per-sub-query
+                                                    retrieval (semantic, keyword, BM25); all paths merge through
+                                                    rank fusion, dedup, rerank, generation. Click any node to inspect it.
+                                                </div>
+                                            </div>
+                                            <div id="viz-nav" class="viz-nav" style="display:none">
+                                                <button id="viz-nav-prev" class="viz-nav-btn" onclick="vizPrev()" title="Previous pass">&#8592;</button>
+                                                <span id="viz-nav-label" class="viz-nav-label">Pass 1 / 1</span>
+                                                <button id="viz-nav-next" class="viz-nav-btn" onclick="vizNext()" title="Next pass">&#8594;</button>
+                                            </div>
+                                        </div>
+                                        <div id="pipeline-viz" class="viz-container">
+                                            <div class="viz-empty">Run a query to see the pipeline flow.</div>
+                                        </div>
+                                        <div id="pipeline-legend" class="viz-legend" style="display:none">
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#ede9fe;border-color:#a78bfa"></span>Understand</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#d1fae5;border-color:#34d399"></span>Structured lookup</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#dbeafe;border-color:#93c5fd"></span>Semantic / keyword / BM25</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fef3c7;border-color:#fbbf24"></span>Fuse &amp; dedup</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fecaca;border-color:#fca5a5"></span>Rerank</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#1e40af;border-color:#1e3a8a"></span>Generate</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#f3e8ff;border-color:#c084fc"></span>Agentic pass</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#10b981;border-color:#047857"></span>Final answer</span>
+                                        </div>
+                                    </div>
+
+                                    <details id="trace-details" class="trace-details">
+                                        <summary class="trace-summary">
+                                            Pipeline trace
+                                            <span id="trace-stage-count" class="trace-count"></span>
+                                            <span class="trace-summary-chevron">&#9662;</span>
+                                        </summary>
+                                        <div id="pipeline-stages"></div>
+                                    </details>
+
+                                    <div class="model-panel" id="model-panel">
+                                        <button class="model-panel-header" onclick="toggleModelPanel()" type="button">
+                                            Models &amp; cost
+                                            <span class="model-panel-badge" id="model-cost-badge" style="display:none"></span>
+                                            <span class="model-panel-chevron" id="model-panel-chevron">&#9662;</span>
+                                        </button>
+                                        <div class="model-panel-body" id="model-panel-body">
+                                            <table class="model-table" id="model-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>Stage</th><th>Model</th><th>Provider</th>
+                                                        <th>$/1M in</th><th>$/1M out</th><th>Note</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody id="model-table-body">
+                                                    <tr><td colspan="6" class="model-note">Loading...</td></tr>
+                                                </tbody>
+                                            </table>
+                                            <div class="model-cost-row" id="model-cost-row" style="display:none"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <aside class="sources">
+                            <div id="citations-box" class="citations hidden">
+                                <div class="sources-head">
+                                    <h3>Sources cited</h3>
+                                    <span class="sources-count" id="sources-count"></span>
+                                </div>
+                                <div id="citations-list" class="src-list"></div>
+                                <div class="sources-foot">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4m0-4h.01"/></svg>
+                                    <span>Amber dot = section the model referenced but that was not in retrieved context. Green = verified in context.</span>
+                                </div>
+                            </div>
+                        </aside>
                     </div>
                 </div>
             </div>
         </div>
-    </div>
+    </main>
 
-    <!-- Draggable stage-detail popup (hidden until a flowchart node is clicked) -->
     <div id="stage-popup" class="stage-popup" style="display:none" role="dialog" aria-modal="true">
         <div class="stage-popup-header" id="stage-popup-drag-handle">
             <span id="stage-popup-title"></span>
@@ -2620,11 +1699,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div class="stage-popup-body" id="stage-popup-body"></div>
     </div>
 
-    <!-- Agentic-run confirmation overlay -->
     <div id="ag-confirm-overlay" class="ag-confirm-overlay hidden" role="dialog" aria-modal="true">
         <div class="ag-confirm">
             <div class="ag-confirm-title">Run agentic refinement?</div>
-            <div class="ag-confirm-sub">Will run with these settings. Edit config first if needed.</div>
+            <div class="ag-confirm-sub">It will run with these settings. Edit the config first if you need to.</div>
             <div class="ag-confirm-rows" id="ag-confirm-rows"></div>
             <div class="ag-confirm-actions">
                 <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-confirm-cancel">Cancel</button>
@@ -2634,24 +1712,13 @@ FRONTEND_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Agentic config editor popup (opened by "Edit config") -->
     <div id="ag-config-overlay" class="ag-config-overlay hidden" role="dialog" aria-modal="true">
         <div class="ag-config">
             <div class="ag-config-header">
                 <div class="ag-config-title">Agentic refinement config</div>
-                <div class="ag-config-sub">Tweak these settings, then run.</div>
+                <div class="ag-config-sub">Review and tweak these settings, then run the refinement.</div>
             </div>
             <div class="ag-config-body" id="ag-config-body">
-                <div class="ag-config-enable-row">
-                    <label>
-                        <input type="checkbox" id="ag-config-enable">
-                        <span>Enable agentic mode</span>
-                    </label>
-                    <span class="ag-config-enable-hint">
-                        Decomposes the answer, runs follow-up retrieval, then regenerates with the agentic model (~30–60s, ~10× cost).
-                    </span>
-                </div>
-                <!-- agentic-config is reparented in here while the popup is open -->
             </div>
             <div class="ag-config-footer">
                 <button class="ag-confirm-btn ag-confirm-btn-cancel" id="ag-config-cancel">Cancel</button>
@@ -2659,7 +1726,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             </div>
         </div>
     </div>
-
+</div>
 
     <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
          LLM output is partially user-influenced via prompt injection, so we
@@ -2679,13 +1746,29 @@ FRONTEND_HTML = """<!DOCTYPE html>
         marked.setOptions({ gfm: true, breaks: false });
 
         // Mermaid: strict mode so any interpolated label text is encoded by
-        // Mermaid itself; we also defensively scrub our own input.
-        if (typeof mermaid !== "undefined") {
+        // Mermaid itself; we also defensively scrub our own input. The base
+        // theme variables are swapped per light/dark so the flow chart tracks
+        // the page theme (re-applied before every render + on theme toggle).
+        function applyMermaidTheme() {
+            if (typeof mermaid === "undefined") return;
+            var dark = document.documentElement.getAttribute("data-theme") === "dark";
             mermaid.initialize({
                 startOnLoad: false,
                 securityLevel: "strict",
                 theme: "base",
-                themeVariables: {
+                themeVariables: dark ? {
+                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                    fontSize: "12.5px",
+                    primaryColor: "#1b2740",
+                    primaryTextColor: "#e7eaf0",
+                    primaryBorderColor: "#33415e",
+                    lineColor: "#64748b",
+                    textColor: "#cbd5e1",
+                    nodeBorder: "#33415e",
+                    mainBkg: "#1b2740",
+                    clusterBkg: "#141d33",
+                    clusterBorder: "#2a3956",
+                } : {
                     fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
                     fontSize: "12.5px",
                     primaryColor: "#ffffff",
@@ -2709,6 +1792,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 },
             });
         }
+        applyMermaidTheme();
 
         // ─── Model panel ──────────────────────────────────────────────────
         const MODEL_STAGE_LABELS = {
@@ -2745,12 +1829,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
         // per-provider from the price/latency fields so changing this catalog
         // automatically refreshes the badges everywhere.
         //
-        //   in/out      — per-1M-token prices (USD)
-        //   label       — short display name
-        //   defaultFor  — which select(s) default to this model
-        //   tags        — additional tags surfaced in the label
+        //   in/out      - per-1M-token prices (USD)
+        //   label       - short display name
+        //   defaultFor  - which select(s) default to this model
+        //   tags        - additional tags surfaced in the label
         const MODEL_CATALOG = [
-            // Gemini (Google) — cheapest → most expensive
+            // Gemini (Google) - cheapest → most expensive
             {id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite", provider: "Gemini (Google)", in: 0.075, out: 0.30,  speed: 1, tags: []},
             {id: "gemini-2.0-flash",      label: "Gemini 2.0 Flash",      provider: "Gemini (Google)", in: 0.10,  out: 0.40,  speed: 2, tags: []},
             {id: "gemini-2.5-flash",      label: "Gemini 2.5 Flash",      provider: "Gemini (Google)", in: 0.15,  out: 0.60,  speed: 3, tags: []},
@@ -3050,7 +2134,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         //   • Avg chunk:        ~450 tokens (text + section title + header)
         //   • Gap-analysis IO:  ~2200 in / ~400 out
         //   • Targeted-fetch:   ~1200 in / ~250 out
-        // Numbers are coarse but consistent — the goal is "is this $0.01 or
+        // Numbers are coarse but consistent - the goal is "is this $0.01 or
         // $0.50?", not three-decimal precision.
         const COST_ASSUMPTIONS = {
             sys_tokens: 900,
@@ -3130,7 +2214,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 value: normalCost,
             });
 
-            // Optional auto-gap-check (regular mode only — agentic loop has its own).
+            // Optional auto-gap-check (regular mode only - agentic loop has its own).
             if (cfg.auto_gap_check && !cfg.agentic) {
                 const gapCost = _llmCallCost(A.gap_in, A.gap_out, regPrice);
                 rows.push({
@@ -3268,6 +2352,57 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 ? `${stage.took_ms.toFixed(0)}ms` : "";
         }
 
+        // ─── Node color palette (theme-aware) ─────────────────────────────
+        // The classDef set is emitted into the Mermaid definition. Light mode
+        // uses soft pastel fills with dark text; dark mode mirrors each hue as
+        // a deep tint with light text + a mid-saturation stroke so the chart
+        // reads cleanly against the dark surface instead of glowing pastel.
+        function vizClassDefs() {
+            var dark = document.documentElement.getAttribute("data-theme") === "dark";
+            if (dark) {
+                return [
+                    "  classDef input    fill:#e7e5e4,color:#1c1917,stroke:#a8a29e,stroke-width:1.5px,rx:6,ry:6",
+                    "  classDef output   fill:#0f2418,color:#86efac,stroke:#22c55e,stroke-width:1.5px,rx:8,ry:8",
+                    "  classDef stage_qp     fill:#241830,color:#e9d5ff,stroke:#7e22ce,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_struct fill:#0f2418,color:#bbf7d0,stroke:#16a34a,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_skipped fill:#1c1c1a,color:#a8a29e,stroke:#44403c,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
+                    "  classDef stage_subq   fill:#0c1f2e,color:#bae6fd,stroke:#0284c7,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_vector fill:#10203f,color:#bfdbfe,stroke:#2563eb,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_tsv    fill:#0a2226,color:#a5f3fc,stroke:#0891b2,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_bm25   fill:#0a221f,color:#99f6e4,stroke:#0d9488,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_rrf    fill:#241f0a,color:#fde68a,stroke:#ca8a04,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_dedup  fill:#26160c,color:#fed7aa,stroke:#ea580c,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_rerank fill:#260f0f,color:#fecaca,stroke:#dc2626,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_gen    fill:#e7e5e4,color:#1c1917,stroke:#a8a29e,stroke-width:1.5px,rx:6,ry:6",
+                    "  classDef stage_resume   fill:#1c1c1a,color:#a8a29e,stroke:#57534e,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5",
+                    "  classDef stage_gap      fill:#161a3a,color:#c7d2fe,stroke:#4f46e5,stroke-width:1px",
+                    "  classDef stage_followup fill:#161a3a,color:#c7d2fe,stroke:#4f46e5,stroke-width:1px",
+                    "  classDef stage_agen     fill:#c7d2fe,color:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,rx:6,ry:6",
+                    "  classDef stage_tfetch   fill:#0a221f,color:#99f6e4,stroke:#0d9488,stroke-width:1px,rx:5,ry:5",
+                ];
+            }
+            return [
+                "  classDef input    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6",
+                "  classDef output   fill:#ffffff,color:#15803d,stroke:#15803d,stroke-width:1.5px,rx:8,ry:8",
+                "  classDef stage_qp     fill:#fdf4ff,color:#581c87,stroke:#e9d5ff,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_struct fill:#f0fdf4,color:#166534,stroke:#bbf7d0,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
+                "  classDef stage_subq   fill:#f0f9ff,color:#0c4a6e,stroke:#bae6fd,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_tsv    fill:#ecfeff,color:#155e75,stroke:#a5f3fc,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_rrf    fill:#fefce8,color:#854d0e,stroke:#fde68a,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_dedup  fill:#fff7ed,color:#9a3412,stroke:#fed7aa,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_rerank fill:#fef2f2,color:#991b1b,stroke:#fecaca,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_gen    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6",
+                "  classDef stage_resume   fill:#f5f5f4,color:#57534e,stroke:#a8a29e,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5",
+                "  classDef stage_gap      fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px",
+                "  classDef stage_followup fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px",
+                "  classDef stage_agen     fill:#312e81,color:#fff,stroke:#312e81,stroke-width:1.5px,rx:6,ry:6",
+                "  classDef stage_tfetch   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5",
+            ];
+        }
+
         // Compose a node label with title (bold) + optional subtitle (italic)
         // + time. Keeps the visual rhythm consistent across all node types.
         function _label(title, subtitle, stage) {
@@ -3311,7 +2446,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     }).map(s => ({...s, stage: stripIter(s.stage)})));
                 } else {
                     // Pass 2+: only this iteration's agentic stages. The
-                    // base pipeline didn't re-run — the chart starts from
+                    // base pipeline didn't re-run - the chart starts from
                     // what gap analysis requested and shows the follow-up
                     // sub-pipeline (decompose → hybrid search → rerank →
                     // regenerate).
@@ -3374,12 +2509,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
             nodeMap["Q"] = _qStage;
 
             // Refine-mode trace: /api/refine reused a prior /api/query's
-            // first-pass state, so Stages 1–4 didn't run. Emit a "Resume"
+            // first-pass state, so Stages 1-4 didn't run. Emit a "Resume"
             // marker so the diagram still has a visible upstream node feeding
             // into the agentic branch below. Without this we bail with just
             // the Query node and the user sees an empty canvas.
             if (!qp && !refineSeed && !gapEarly) {
-                L.push("  classDef input fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
+                vizClassDefs().forEach(function (c) { L.push(c); });
                 return {def: L.join("\\n"), nodeMap};
             }
             if (refineSeed && !qp) {
@@ -3399,7 +2534,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 nodeMap["QP"] = qp;
             }
 
-            // Structured lookup — side branch that merges back into dedup
+            // Structured lookup - side branch that merges back into dedup
             const sl = stages.structured_lookup;
             let slActive = false;
             if (sl) {
@@ -3508,7 +2643,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 nodeMap["GAP"] = gap;
 
                 if (needs) {
-                    // (a) Targeted resource fetch — direct table/field lookup
+                    // (a) Targeted resource fetch - direct table/field lookup
                     if (tfetch) {
                         const req = (tfetch.input && tfetch.input.requested) || {};
                         const figs = (req.figures || []).length;
@@ -3626,34 +2761,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
             L.push(`  ${agAnswerNode} --> ANS`);
 
             // ─── Color palette ───────────────────────────────────────────────
-            // Soft pastel fills paired with darker strokes and dark text — the
-            // pre-search "thinking" stages run cool (blues/greens), retrieval
-            // sweeps through warm hues, and the agentic loop uses purples to
-            // signal "second pass". Rounded corners + 1.4px strokes give the
-            // diagram a softer, more modern look than flat saturated boxes.
-            // Minimalist palette: monochrome anchors (input/generate),
-            // light tints to keep stage families distinguishable but quiet.
-            L.push("  classDef input    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
-            L.push("  classDef output   fill:#ffffff,color:#15803d,stroke:#15803d,stroke-width:1.5px,rx:8,ry:8");
-            L.push("  classDef stage_qp     fill:#fdf4ff,color:#581c87,stroke:#e9d5ff,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_struct fill:#f0fdf4,color:#166534,stroke:#bbf7d0,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5");
-            L.push("  classDef stage_subq   fill:#f0f9ff,color:#0c4a6e,stroke:#bae6fd,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_tsv    fill:#ecfeff,color:#155e75,stroke:#a5f3fc,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_rrf    fill:#fefce8,color:#854d0e,stroke:#fde68a,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_dedup  fill:#fff7ed,color:#9a3412,stroke:#fed7aa,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_rerank fill:#fef2f2,color:#991b1b,stroke:#fecaca,stroke-width:1px,rx:5,ry:5");
-            L.push("  classDef stage_gen    fill:#1c1917,color:#fff,stroke:#1c1917,stroke-width:1.5px,rx:6,ry:6");
-            // Refine fast-path marker — dashed stone, distinct from other stages.
-            L.push("  classDef stage_resume   fill:#f5f5f4,color:#57534e,stroke:#a8a29e,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5");
-            // Agentic branch — indigo tint sets it apart from the main path.
-            L.push("  classDef stage_gap      fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px");
-            L.push("  classDef stage_followup fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px");
-            L.push("  classDef stage_agen     fill:#312e81,color:#fff,stroke:#312e81,stroke-width:1.5px,rx:6,ry:6");
-            // Targeted fetch — teal family for "direct lookup".
-            L.push("  classDef stage_tfetch   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5");
+            // Theme-aware classDefs (see vizClassDefs): pre-search "thinking"
+            // stages run cool (blues/greens), retrieval sweeps through warm
+            // hues, and the agentic loop uses purples to signal "second pass".
+            // Light mode = soft pastels on white; dark mode = deep tints on the
+            // dark surface, each hue mirrored so families stay distinguishable.
+            vizClassDefs().forEach(function (c) { L.push(c); });
 
             return {def: L.join("\\n"), nodeMap};
         }
@@ -3685,6 +2798,28 @@ FRONTEND_HTML = """<!DOCTYPE html>
             });
         }
 
+        // Per-iteration pass navigation, top-right of the chart. Only shown
+        // when a recursive run produced more than one iteration — each page is
+        // one iteration's flow, navigated with the two arrows.
+        function attachPassNav(host) {
+            if (_vizPages.length <= 1) return;
+            const nav = document.createElement("div");
+            nav.className = "viz-pass-nav";
+            nav.innerHTML =
+                '<button type="button" data-p="prev" title="Previous iteration">\\u2190</button>' +
+                `<span class="viz-pass-label">Pass ${_vizPageIdx + 1} / ${_vizPages.length}</span>` +
+                '<button type="button" data-p="next" title="Next iteration">\\u2192</button>';
+            const prevB = nav.querySelector('[data-p="prev"]');
+            const nextB = nav.querySelector('[data-p="next"]');
+            if (prevB) prevB.disabled = _vizPageIdx === 0;
+            if (nextB) nextB.disabled = _vizPageIdx === _vizPages.length - 1;
+            nav.addEventListener("click", e => {
+                const b = e.target.closest("button"); if (!b) return;
+                if (b.dataset.p === "prev") vizPrev(); else vizNext();
+            });
+            host.appendChild(nav);
+        }
+
         // Render the page at _vizPageIdx and update nav UI.
         async function vizGoTo(idx) {
             if (!_vizPages.length) return;
@@ -3707,18 +2842,21 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             const id = `viz-${++_vizCounter}`;
             try {
+                applyMermaidTheme();
                 const {svg} = await mermaid.render(id, page.def);
                 host.innerHTML = svg;
                 if (legend) legend.style.display = "";
                 attachNodeClickListeners(page.nodeMap);
+                attachPassNav(host);
             } catch (err) {
                 console.error("mermaid render failed:", err, page.def);
                 host.innerHTML = `<div class="viz-empty">Could not render flow: ${escapeHtml(err.message || String(err))}</div>`;
             }
 
-            // Update navigation controls.
-            const isMulti = _vizPages.length > 1;
-            if (nav) nav.style.display = isMulti ? "" : "none";
+            // Update navigation controls. The header-row nav is superseded by
+            // the in-chart top-right pass nav (built in attachPassNav), so keep
+            // it hidden to avoid a duplicate control.
+            if (nav) nav.style.display = "none";
             if (label) label.textContent = `Pass ${_vizPageIdx + 1} / ${_vizPages.length}`;
             if (prevBtn) prevBtn.disabled = _vizPageIdx === 0;
             if (nextBtn) nextBtn.disabled = _vizPageIdx === _vizPages.length - 1;
@@ -3871,22 +3009,18 @@ FRONTEND_HTML = """<!DOCTYPE html>
             // Force visible while it lives inside the popup.
             agConfig.classList.remove("hidden");
             body.appendChild(agConfig);
-            // Sync the popup's enable checkbox with the hidden agentic-toggle.
-            // (Staged only — does not commit until "Done" / "Run".)
-            const enable = document.getElementById("ag-config-enable");
+            // Opening the config popup implies agentic refinement is wanted, so
+            // turn agentic mode on automatically (no in-popup enable toggle).
             const tog = document.getElementById("agentic-toggle");
-            if (enable && tog) enable.checked = tog.checked;
+            if (tog && !tog.checked) {
+                tog.checked = true;
+                tog.dispatchEvent(new Event("change"));
+            }
             // Primary button label: "Run →" when there's a refinement
             // callback waiting, "Done" otherwise.
             const runBtn = document.getElementById("ag-config-run");
             if (runBtn) runBtn.innerHTML = _agConfirmCallback ? "Run &#8594;" : "Done";
             document.getElementById("ag-config-overlay").classList.remove("hidden");
-        }
-
-        function _syncAgenticSquareBtn() {
-            const btn = document.getElementById("agentic-square-btn");
-            const tog = document.getElementById("agentic-toggle");
-            if (btn && tog) btn.classList.toggle("active", tog.checked);
         }
 
         // Hide the popup and return agentic-config to its home in the page.
@@ -3911,14 +3045,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
         }
 
         function commitAgenticConfigPopup() {
-            // Commit the staged "Enable agentic mode" checkbox to the
-            // hidden #agentic-toggle, fan its change event out to the UI.
-            const enable = document.getElementById("ag-config-enable");
-            const tog = document.getElementById("agentic-toggle");
-            if (enable && tog && enable.checked !== tog.checked) {
-                tog.checked = enable.checked;
-                tog.dispatchEvent(new Event("change"));
-            }
+            // Agentic mode is enabled when the popup opens, so there's nothing
+            // to commit here beyond keeping the tweaked config settings.
             _agConfigSnapshot = null;
             _detachAgenticConfigPopup();
         }
@@ -3939,7 +3067,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     else root.setAttribute("data-theme", "dark");
                     syncChecked();
                     try { localStorage.setItem("specgpt-theme", dark ? "light" : "dark"); }
-                    catch (e) { /* localStorage unavailable — toggle still works for the session */ }
+                    catch (e) { /* localStorage unavailable - toggle still works for the session */ }
+                    // Re-render the flow chart so its node colors track the new
+                    // theme (Mermaid bakes colors into the SVG at render time).
+                    if (window._pipeTrace && typeof renderPipelineViz === "function") {
+                        try { renderPipelineViz(window._pipeTrace, window._pipeQuery); } catch (e) {}
+                    }
                 });
             }
 
@@ -3957,7 +3090,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 if (e.target === e.currentTarget) closeAgenticConfirm();
             });
 
-            // Config popup wiring — Cancel reverts in-popup edits; Done/Run
+            // Config popup wiring - Cancel reverts in-popup edits; Done/Run
             // commits them. Edits are NOT applied until commit.
             document.getElementById("ag-config-cancel").addEventListener("click", () => {
                 cancelAgenticConfigPopup();
@@ -3976,12 +3109,6 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 }
             });
 
-            // Square red robot button → opens the same agentic config popup.
-            const sqBtn = document.getElementById("agentic-square-btn");
-            if (sqBtn) sqBtn.addEventListener("click", openAgenticConfigPopup);
-
-            // Initial visual sync.
-            _syncAgenticSquareBtn();
         });
 
         // Wire up drag on popup header once the DOM is ready.
@@ -4050,15 +3177,11 @@ FRONTEND_HTML = """<!DOCTYPE html>
         const errorDiv = document.getElementById("error");
         const answerSection = document.getElementById("answer-section");
         const agenticToggle = document.getElementById("agentic-toggle");
-        const agenticRow = document.getElementById("agentic-row");
         const agenticConfig = document.getElementById("agentic-config");
         agenticToggle.addEventListener("change", () => {
-            agenticRow.classList.toggle("active", agenticToggle.checked);
+            const composerEl = document.getElementById("composer");
+            if (composerEl) composerEl.classList.toggle("agentic-active", agenticToggle.checked);
             agenticConfig.classList.toggle("hidden", !agenticToggle.checked);
-            _syncAgenticSquareBtn();
-            // Keep the popup's enable checkbox in sync if it's open.
-            const enable = document.getElementById("ag-config-enable");
-            if (enable) enable.checked = agenticToggle.checked;
         });
 
         // Config panel toggle
@@ -4093,6 +3216,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 cancelBtn.disabled = false;
                 cancelBtn.textContent = "Cancel";
             }
+            _startThinking();
             loadingDiv.classList.remove("hidden");
             // Disable search to prevent concurrent submits while a query runs.
             if (searchBtn) searchBtn.disabled = true;
@@ -4109,8 +3233,148 @@ FRONTEND_HTML = """<!DOCTYPE html>
         function _stopLoading() {
             loadingDiv.classList.add("hidden");
             if (_loadingTimer) { clearInterval(_loadingTimer); _loadingTimer = null; }
+            _stopThinking();
             if (searchBtn) searchBtn.disabled = false;
             _activeAbort = null;
+        }
+
+        // ─── "Thinking about…" cycling ticker ─────────────────────────────
+        // Instead of listing every pipeline stage, show one calm line whose
+        // text cycles. Generic phrases rotate on a timer so it feels alive;
+        // when a real stage arrives we surface its phrase immediately.
+        var THINK_MAP = {
+            "query_processor":               "breaking your question into parts",
+            "structured_lookup":             "looking up named fields and tables",
+            "hybrid_search.vector_search":   "searching the specification",
+            "hybrid_search.tsvector_search": "scanning for key terms",
+            "hybrid_search.bm25_search":     "ranking keyword matches",
+            "hybrid_search.rrf_merge":       "fusing the search results",
+            "hybrid_search.total":           "searching the specification",
+            "result_dedup":                  "gathering the most relevant sections",
+            "final_rerank":                  "ranking the best matches",
+            "generation":                    "writing a grounded answer",
+            "query.followup":                "planning follow-up questions",
+            "sub_query":                     "working through a sub-question",
+            "refine.seed":                   "resuming from earlier work",
+            "agentic.gap_analysis":          "checking the answer for gaps",
+            "agentic.targeted_fetch":        "fetching specific figures and fields",
+            "agentic.followup_search":       "following up on a sub-question",
+            "agentic.rerank":                "re-ranking the expanded context",
+            "agentic.regenerate":            "refining the final answer",
+            "agentic.cap_reached":           "wrapping up"
+        };
+        var THINK_DEFAULT = [
+            "reading your question",
+            "searching the specification",
+            "gathering relevant sections",
+            "reasoning over the spec"
+        ];
+        var _thinkPool = [], _thinkIdx = 0, _thinkTimer = null;
+
+        function _showThink(phrase) {
+            var t = document.getElementById("loading-ticker");
+            if (!t || !phrase) return;
+            t.textContent = phrase;
+            t.classList.remove("ticker-in");
+            void t.offsetWidth;            // reflow so the animation restarts
+            t.classList.add("ticker-in");
+        }
+
+        function _thinkPhrase(stage) {
+            var name = String(stage || "")
+                .replace(/_q\\d+(?=(?:\\.iter\\d+)?$)/, "")
+                .replace(/\\.iter\\d+$/, "");
+            return THINK_MAP[name] || null;
+        }
+
+        function _startThinking() {
+            _thinkPool = THINK_DEFAULT.slice();
+            _thinkIdx = 0;
+            _showThink(_thinkPool[0]);
+            if (_thinkTimer) clearInterval(_thinkTimer);
+            _thinkTimer = setInterval(function () {
+                if (!_thinkPool.length) return;
+                _thinkIdx = (_thinkIdx + 1) % _thinkPool.length;
+                _showThink(_thinkPool[_thinkIdx]);
+            }, 2400);
+        }
+
+        function _stopThinking() {
+            if (_thinkTimer) { clearInterval(_thinkTimer); _thinkTimer = null; }
+        }
+
+        // A real stage completed: surface its phrase now and keep it in rotation.
+        function _onThinkStage(stage) {
+            var phrase = _thinkPhrase(stage);
+            if (!phrase) return;
+            var at = _thinkPool.indexOf(phrase);
+            if (at === -1) { _thinkPool.push(phrase); at = _thinkPool.length - 1; }
+            _thinkIdx = at;
+            _showThink(phrase);
+        }
+
+        // POST to an NDJSON streaming endpoint. Calls onProgress(evt) for each
+        // {"type":"progress"} line; resolves with the {"type":"done"} data or
+        // rejects on {"type":"error"} / HTTP error. Falls back gracefully if
+        // the body can't be streamed (parses whatever arrived at the end).
+        async function _streamPipeline(url, body, signal, onProgress) {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                signal: signal,
+            });
+            if (response.status === 401) {
+                window.location.href = "/login?next=" + encodeURIComponent(window.location.pathname);
+                return null;
+            }
+            if (!response.ok) {
+                let detail;
+                try { detail = (await response.json()).detail; } catch (e) { detail = null; }
+                const message = typeof detail === "string" ? detail
+                    : (detail && typeof detail.message === "string" ? detail.message : "Request failed");
+                const httpErr = new Error(message);
+                httpErr.status = response.status;  // let callers branch (e.g. 404 → re-run)
+                throw httpErr;
+            }
+
+            const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+            const decoder = new TextDecoder();
+            let buf = "", done = null, errored = null;
+
+            function handleLine(line) {
+                line = line.trim();
+                if (!line) return;
+                let evt;
+                try { evt = JSON.parse(line); } catch (e) { return; }
+                if (evt.type === "progress") { if (onProgress) onProgress(evt); }
+                else if (evt.type === "done") { done = evt.data; }
+                else if (evt.type === "error") { errored = evt.detail; }
+            }
+
+            if (reader) {
+                for (;;) {
+                    const { value, done: rdDone } = await reader.read();
+                    if (rdDone) break;
+                    buf += decoder.decode(value, { stream: true });
+                    let nl;
+                    while ((nl = buf.indexOf("\\n")) !== -1) {
+                        handleLine(buf.slice(0, nl));
+                        buf = buf.slice(nl + 1);
+                    }
+                }
+            } else {
+                // No streaming reader: take the whole body, parse line-by-line.
+                buf = await response.text();
+            }
+            buf.split("\\n").forEach(handleLine);
+
+            if (errored) {
+                const msg = typeof errored === "string" ? errored
+                    : (errored && errored.message) ? errored.message : "Pipeline error";
+                throw new Error(msg);
+            }
+            return done;
         }
 
         // Cancel button: aborts the in-flight fetch. Hook it up once on load.
@@ -4158,39 +3422,18 @@ FRONTEND_HTML = """<!DOCTYPE html>
             answerSection.classList.add("hidden");
 
             const agentic = agenticToggle.checked;
-            const title = agentic
-                ? "Running agentic pipeline (this can take 30-60s)"
-                : "Running pipeline";
+            const title = agentic ? "Thinking deeply…" : "Thinking…";
             _startLoading(title);
 
             _activeAbort = new AbortController();
             try {
-                const response = await fetch("/api/query", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query, config, debug: true, agentic }),
-                    signal: _activeAbort.signal,
-                });
-
-                if (response.status === 401) {
-                    // Session expired mid-flight; bounce to login.
-                    window.location.href = "/login?next=" + encodeURIComponent(window.location.pathname);
-                    return;
-                }
-                if (!response.ok) {
-                    const err = await response.json();
-                    const detail = err && err.detail;
-                    const message =
-                        typeof detail === "string"
-                            ? detail
-                            : (detail && typeof detail.message === "string"
-                                ? detail.message
-                                : "Request failed");
-                    throw new Error(message);
-                }
-
-                const data = await response.json();
-                displayResults(data);
+                const data = await _streamPipeline(
+                    "/api/query/stream",
+                    { query, config, debug: true, agentic },
+                    _activeAbort.signal,
+                    (evt) => _onThinkStage(evt.stage)
+                );
+                if (data) displayResults(data);
             } catch (err) {
                 if (err.name === "AbortError") {
                     // User cancelled: leave the previous answer (if any) visible
@@ -4219,11 +3462,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
         let _cancelAnswerStream = null;
 
         // Progressively reveal `fullText` into `el`. Re-renders markdown each
-        // tick so partial syntax doesn't show through. Fast by default — the
+        // tick so partial syntax doesn't show through. Fast by default - the
         // intent is "chatbot rollout", not a leisurely typewriter.
         function streamAnswerInto(el, fullText, opts = {}) {
             const charsPerTick = opts.charsPerTick ?? 6;
             const tickMs       = opts.tickMs       ?? 20;
+            const onDone       = typeof opts.onDone === "function" ? opts.onDone : null;
             const useMd = (typeof marked !== "undefined" && typeof DOMPurify !== "undefined");
             let i = 0;
             let cancelled = false;
@@ -4242,6 +3486,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     timer = setTimeout(step, tickMs);
                 } else {
                     el.classList.remove("streaming");
+                    if (onDone) onDone();
                 }
             }
             step();
@@ -4274,7 +3519,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
             }
             document.getElementById("latency").textContent = `${data.latency_ms.toFixed(0)}ms`;
 
-            // Citations — escape attacker-controlled fields (section_id /
+            // Citations - escape attacker-controlled fields (section_id /
             // section_title flow back from PDF text) before HTML interpolation.
             const citationsList = document.getElementById("citations-list");
             const citationsBox = document.getElementById("citations-box");
@@ -4294,11 +3539,11 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 citationsBox.classList.add("hidden");
             }
 
-            // Pipeline visualization (Mermaid DAG) — rendered first so the
+            // Pipeline visualization (Mermaid DAG) - rendered first so the
             // flowchart appears above the collapsed trace accordion.
             renderPipelineViz(data.pipeline_trace, data.query);
 
-            // Pipeline trace — rendered into the collapsed <details> accordion
+            // Pipeline trace - rendered into the collapsed <details> accordion
             // below the flowchart. Each card shows title + subtitle + chips +
             // key/value rows; raw JSON is behind a "Show raw JSON" toggle.
             const stagesDiv = document.getElementById("pipeline-stages");
@@ -4313,12 +3558,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 if (stageCount) stageCount.textContent = '';
             }
 
-            // Model panel — update active row + cost
+            // Model panel - update active row + cost
             const isAgentic = !!data.agentic;
             renderModelTable(isAgentic);
             renderModelCost(data.tokens_used, isAgentic);
 
-            // Sidebar — surface gap_hint / agentic state.
+            // Sidebar - surface gap_hint / agentic state.
             renderSidebar(data);
 
             answerSection.classList.remove("hidden");
@@ -4569,7 +3814,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             const label = `<span class="agent-strip-label">Agent</span>`;
 
-            // No query yet — keep the empty hint.
+            // No query yet - keep the empty hint.
             if (!data) {
                 strip.innerHTML = label + `<span class="agent-strip-empty">Run a query to see gap hints and one-click follow-ups here.</span>`;
                 return;
@@ -4577,7 +3822,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             const latency = `<span class="strip-latency">${data.latency_ms.toFixed(0)}ms</span>`;
 
-            // Agentic mode: the loop already fetched gaps — just confirm.
+            // Agentic mode: the loop already fetched gaps - just confirm.
             if (data.agentic) {
                 strip.innerHTML = label + `
                     <span class="agent-strip-state state-agent"><span class="dot"></span><b>Agentic refinement ran</b></span>
@@ -4606,7 +3851,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
                 return;
             }
 
-            // Has gaps — render the full offer with chips and button.
+            // Has gaps - render the full offer with chips and button.
             const req = gh.requested_resources || {};
             const figs = (req.figures  || []).slice(0, 6);
             const flds = (req.fields   || []).slice(0, 6);
@@ -4677,21 +3922,20 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
             errorDiv.classList.add("hidden");
             answerSection.classList.add("hidden");
-            _startLoading("Refining answer (agentic Opus regen, 20-60s)");
+            _startLoading("Refining the answer…");
 
             _activeAbort = new AbortController();
             try {
-                const response = await fetch("/api/refine", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ request_id: requestId, config, debug: true }),
-                    signal: _activeAbort.signal,
-                });
-                if (response.status === 401) {
-                    window.location.href = "/login?next=" + encodeURIComponent(window.location.pathname);
-                    return;
-                }
-                if (response.status === 404) {
+                const data = await _streamPipeline(
+                    "/api/refine/stream",
+                    { request_id: requestId, config, debug: true },
+                    _activeAbort.signal,
+                    (evt) => _onThinkStage(evt.stage)
+                );
+                if (data) displayResults(data);
+            } catch (err) {
+                if (err.name === "AbortError") return;
+                if (err.status === 404) {
                     // Cache evicted (older session or restart). Fall back to a
                     // full re-run so the user always has a working path. Hand
                     // off to runQuery which manages its own loading lifecycle.
@@ -4699,21 +3943,6 @@ FRONTEND_HTML = """<!DOCTYPE html>
                     runQuery();
                     return;
                 }
-                if (!response.ok) {
-                    const err = await response.json();
-                    const detail = err && err.detail;
-                    const message =
-                        typeof detail === "string"
-                            ? detail
-                            : (detail && typeof detail.message === "string"
-                                ? detail.message
-                                : "Refine failed");
-                    throw new Error(message);
-                }
-                const data = await response.json();
-                displayResults(data);
-            } catch (err) {
-                if (err.name === "AbortError") return;
                 errorDiv.textContent = `Error: ${err.message}`;
                 errorDiv.classList.remove("hidden");
             } finally {
@@ -4721,6 +3950,378 @@ FRONTEND_HTML = """<!DOCTYPE html>
             }
         }
     </script>
+    <script>
+        /* ───────────────────────────────────────────────────────────────────
+           Redesign glue: new two-column layout, sources sidebar, citation
+           chips, gap-hint card, pipeline disclosure, tweaks, and the
+           edit-config-before-refine flow. Reuses the engine defined above.
+           ─────────────────────────────────────────────────────────────────── */
+
+        var I_check = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg>';
+        var I_warn  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>';
+        var I_info  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4m0-4h.01"/></svg>';
+        var I_robot = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="3" x2="12" y2="6"/><circle cx="12" cy="2.6" r="1" fill="currentColor" stroke="none"/><rect x="4" y="7" width="16" height="12" rx="3"/><circle cx="9" cy="13" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.3" fill="currentColor" stroke="none"/><line x1="10" y1="16.5" x2="14" y2="16.5"/></svg>';
+        var I_arrow = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+
+        /* ── citation cross-highlighting ─────────────────────────────────── */
+        function setActiveSec(sec) {
+            document.querySelectorAll(".cite-chip").forEach(function (c) {
+                c.classList.toggle("hot", !!sec && c.getAttribute("data-sec") === sec);
+            });
+            document.querySelectorAll(".src").forEach(function (s) {
+                s.classList.toggle("hot", !!sec && s.getAttribute("data-sec") === sec);
+            });
+        }
+
+        /* Replace the model's bracketed citation tags ([§5.2.1] or
+           [§5.2.1, §5.3]) in the rendered answer with clean citation chips.
+           Walks text nodes only (skips code/pre/anchors). A bracket is only
+           treated as a citation when every token inside it is a section id
+           that the backend actually returned, so stray "[...]" is left alone.
+           Regex-free to avoid backslash/unicode escaping inside this template. */
+        function linkifyCitations(root, citations) {
+            if (!root || !citations || !citations.length) return;
+            var idset = {};
+            citations.forEach(function (c) {
+                var id = String(c.section_id || "");
+                if (id) idset[id] = 1;
+            });
+
+            // Strip a leading § (U+00A7 = 167) and surrounding spaces.
+            function cleanTok(t) {
+                var a = 0, b = t.length;
+                while (a < b && (t.charCodeAt(a) === 32 || t.charCodeAt(a) === 167)) a++;
+                while (b > a && t.charCodeAt(b - 1) === 32) b--;
+                return t.slice(a, b);
+            }
+
+            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            var nodes = [], n;
+            while ((n = walker.nextNode())) {
+                if (n.parentNode && n.parentNode.closest && n.parentNode.closest(".cite-chip, code, pre, a")) continue;
+                nodes.push(n);
+            }
+
+            nodes.forEach(function (node) {
+                var text = node.nodeValue;
+                if (text.indexOf("[") === -1) return;
+                var frag = document.createDocumentFragment();
+                var pos = 0, i = 0, changed = false;
+                while (i < text.length) {
+                    if (text.charAt(i) !== "[") { i++; continue; }
+                    var close = text.indexOf("]", i + 1);
+                    if (close === -1) break;
+                    var parts = text.slice(i + 1, close).split(",");
+                    var ids = [], ok = true;
+                    for (var p = 0; p < parts.length; p++) {
+                        var tok = cleanTok(parts[p]);
+                        if (tok && idset[tok]) ids.push(tok);
+                        else { ok = false; break; }
+                    }
+                    if (ok && ids.length) {
+                        if (i > pos) frag.appendChild(document.createTextNode(text.slice(pos, i)));
+                        ids.forEach(function (id, k) {
+                            if (k > 0) frag.appendChild(document.createTextNode(" "));
+                            var span = document.createElement("span");
+                            span.className = "cite-chip mono";
+                            span.setAttribute("data-sec", id);
+                            span.setAttribute("tabindex", "0");
+                            span.textContent = id;
+                            frag.appendChild(span);
+                        });
+                        pos = close + 1;
+                        changed = true;
+                    }
+                    i = close + 1;
+                }
+                if (!changed) return;
+                if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+                node.parentNode.replaceChild(frag, node);
+            });
+
+            root.querySelectorAll(".cite-chip").forEach(function (c) {
+                c.addEventListener("mouseenter", function () { setActiveSec(c.getAttribute("data-sec")); });
+                c.addEventListener("mouseleave", function () { setActiveSec(null); });
+            });
+        }
+
+        /* ── sources sidebar ─────────────────────────────────────────────── */
+        function renderSourcesSidebar(citations) {
+            var list = document.getElementById("citations-list");
+            var box = document.getElementById("citations-box");
+            var count = document.getElementById("sources-count");
+            if (!list || !box) return;
+            if (!citations || !citations.length) { box.classList.add("hidden"); return; }
+            list.innerHTML = citations.map(function (c) {
+                var sid = escapeHtml(String(c.section_id || ""));
+                var title = escapeHtml(String(c.section_title || ""));
+                var type = c.content_type || c.type || "";
+                var typeHtml = type ? '<span class="src-type">' + escapeHtml(String(type)) + "</span>" : "";
+                var grounded = !c.hallucinated;
+                var dotTitle = grounded ? "Verified in retrieved context" : "Referenced but not in retrieved context";
+                var dot = '<span class="src-dot ' + (grounded ? "ok" : "warn") + '" title="' + dotTitle + '"></span>';
+                return '<button class="src" type="button" data-sec="' + sid + '">'
+                     + '<div class="src-top"><span class="src-sec">&#167;' + sid + "</span>" + typeHtml + dot + "</div>"
+                     + '<div class="src-title">' + title + "</div></button>";
+            }).join("");
+            if (count) count.textContent = String(citations.length);
+            box.classList.remove("hidden");
+            list.querySelectorAll(".src").forEach(function (s) {
+                s.addEventListener("mouseenter", function () { setActiveSec(s.getAttribute("data-sec")); });
+                s.addEventListener("mouseleave", function () { setActiveSec(null); });
+            });
+        }
+
+        /* ── answer meta row + pipeline summary ──────────────────────────── */
+        function _tokensTotal(t) {
+            if (!t) return 0;
+            if (Array.isArray(t.calls) && t.calls.length) {
+                return t.calls.reduce(function (s, c) { return s + (c.prompt || 0) + (c.completion || 0); }, 0);
+            }
+            return (t.prompt || 0) + (t.completion || 0);
+        }
+        function _totalCostFromTokens(t) {
+            if (!t || !Array.isArray(t.calls) || !t.calls.length) return null;
+            return t.calls.reduce(function (s, c) {
+                var p = (typeof MODEL_PRICING !== "undefined" && MODEL_PRICING[c.model]) || { in: 0, out: 0 };
+                return s + (c.prompt || 0) / 1e6 * p.in + (c.completion || 0) / 1e6 * p.out;
+            }, 0);
+        }
+        function _isGrounded(data) {
+            var anyHall = (data.citations || []).some(function (c) { return c.hallucinated; });
+            var gapOpen = data.gap_hint && data.gap_hint.needs_followup;
+            return !anyHall && !gapOpen;
+        }
+        function renderAnswerMeta(data) {
+            var el = document.getElementById("answer-meta");
+            if (!el) return;
+            var tok = _tokensTotal(data.tokens_used);
+            var html = '<span class="meta-q" title="' + escapeHtml(String(data.query || "")) + '">' + escapeHtml(String(data.query || "")) + "</span>";
+            html += _isGrounded(data)
+                ? '<span class="badge ok">' + I_check + "grounded</span>"
+                : '<span class="badge warn">' + I_warn + "partial</span>";
+            if (data.agentic) html += '<span class="badge accent">' + I_robot + "agentic</span>";
+            html += '<span class="badge">' + (data.latency_ms / 1000).toFixed(2) + "s</span>";
+            if (tok) html += '<span class="badge">' + tok.toLocaleString() + " tok</span>";
+            el.innerHTML = html;
+        }
+        function renderPipeSummary(data) {
+            var el = document.getElementById("pipe-summary");
+            if (!el) return;
+            var trace = data.pipeline_trace || [];
+            var parts = [];
+            if (trace.length) parts.push("<span><b>" + trace.length + "</b> stages</span>");
+            parts.push("<span><b>" + (data.latency_ms / 1000).toFixed(2) + "</b>s</span>");
+            var cost = _totalCostFromTokens(data.tokens_used);
+            if (cost !== null) parts.push("<span><b>$" + cost.toFixed(4) + "</b></span>");
+            el.innerHTML = parts.join("");
+        }
+
+        /* ── displayResults override (two-column layout) ─────────────────── */
+        window.displayResults = function (data) {
+            var empty = document.getElementById("empty-state");
+            if (empty) empty.classList.add("hidden");
+
+            var answerEl = document.getElementById("answer-text");
+            if (_cancelAnswerStream) { _cancelAnswerStream(); _cancelAnswerStream = null; }
+            var answerText = data.answer || "";
+
+            renderAnswerMeta(data);
+            renderSourcesSidebar(data.citations);
+            var lat = document.getElementById("latency"); if (lat) lat.textContent = "";
+
+            if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+                _cancelAnswerStream = streamAnswerInto(answerEl, answerText, {
+                    onDone: function () { linkifyCitations(answerEl, data.citations); }
+                });
+            } else {
+                answerEl.textContent = answerText;
+            }
+
+            // Stash for a re-render when the (collapsed) disclosure opens, so
+            // Mermaid measures against a visible container.
+            window._pipeTrace = data.pipeline_trace;
+            window._pipeQuery = data.query;
+            renderPipelineViz(data.pipeline_trace, data.query);
+
+            var stagesDiv = document.getElementById("pipeline-stages");
+            var stageCount = document.getElementById("trace-stage-count");
+            if (data.pipeline_trace) {
+                stagesDiv.innerHTML = data.pipeline_trace.map(function (stage, idx) { return renderStageCard(stage, idx); }).join("");
+                if (stageCount) stageCount.textContent = "(" + data.pipeline_trace.length + " stage" + (data.pipeline_trace.length === 1 ? "" : "s") + ")";
+            } else {
+                stagesDiv.innerHTML = "";
+                if (stageCount) stageCount.textContent = "";
+            }
+
+            var isAgentic = !!data.agentic;
+            renderModelTable(isAgentic);
+            renderModelCost(data.tokens_used, isAgentic);
+            renderPipeSummary(data);
+            renderSidebar(data);
+
+            document.getElementById("answer-section").classList.remove("hidden");
+        };
+
+        /* ── renderSidebar override (gap-hint card) ──────────────────────── */
+        window.renderSidebar = function (data) {
+            var strip = document.getElementById("agent-strip");
+            if (!strip) return;
+            if (!data) { strip.className = "agent-strip"; strip.innerHTML = ""; return; }
+            strip.classList.add("has-content");
+            var latency = '<span class="gap-latency">' + data.latency_ms.toFixed(0) + "ms</span>";
+
+            if (data.agentic) {
+                strip.innerHTML = '<div class="gap-card accent"><div class="gap-ico">' + I_robot + "</div>"
+                    + '<div class="gap-body"><div class="gap-title">Agentic refinement ran ' + latency + "</div>"
+                    + '<div class="gap-note">Gap filling, follow-up retrieval, and regeneration ran automatically.</div></div></div>';
+                return;
+            }
+            var gh = data.gap_hint;
+            if (!gh) {
+                strip.innerHTML = '<div class="gap-card muted"><div class="gap-ico">' + I_info + "</div>"
+                    + '<div class="gap-body"><div class="gap-title">Gap check disabled ' + latency + "</div>"
+                    + '<div class="gap-note">Enable Auto Gap Check in config to get refinement suggestions.</div></div></div>';
+                return;
+            }
+            if (!gh.needs_followup) {
+                strip.innerHTML = '<div class="gap-card ok"><div class="gap-ico">' + I_check + "</div>"
+                    + '<div class="gap-body"><div class="gap-title">Answer looks complete ' + latency + "</div>"
+                    + '<div class="gap-note">' + escapeHtml(gh.reason || "The model did not request any additional context.") + "</div></div></div>";
+                return;
+            }
+            var req = gh.requested_resources || {};
+            var figs = (req.figures || []).slice(0, 6);
+            var flds = (req.fields || []).slice(0, 6);
+            var secs = (req.sections || []).slice(0, 4);
+            var qs = (gh.queries || []).slice(0, 3);
+            function grp(label, items, isSec) {
+                if (!items.length) return "";
+                return '<div class="detail-group"><span class="detail-label">' + label + '</span><span class="gap-chips">'
+                    + items.map(function (x) {
+                        return '<span class="gap-chip' + (isSec ? " chip-section" : "") + '">' + (isSec ? "&#167;" : "") + escapeHtml(String(x)) + "</span>";
+                    }).join("") + "</span></div>";
+            }
+            var details = grp("Figures", figs, false) + grp("Fields", flds, false) + grp("Sections", secs, true) + grp("Queries", qs, false);
+            strip.innerHTML = '<div class="gap-card warn"><div class="gap-ico">' + I_warn + "</div>"
+                + '<div class="gap-body"><div class="gap-title">Model wants more context ' + latency + "</div>"
+                + '<div class="gap-note">' + escapeHtml(gh.reason || "The model identified gaps in the retrieved context.") + "</div>"
+                + (details ? '<div class="gap-details">' + details + "</div>" : "")
+                + '</div><button class="gap-act" id="run-agentic-btn" type="button">Run agentic refinement ' + I_arrow + "</button></div>";
+
+            var btn = document.getElementById("run-agentic-btn");
+            if (btn) {
+                btn.addEventListener("click", function () {
+                    // Enable agentic first so the overlay opens already-enabled,
+                    // then open the editable agentic-config overlay BEFORE refining
+                    // so the user can dial settings in. "Run" fires this callback.
+                    if (!agenticToggle.checked) {
+                        agenticToggle.checked = true;
+                        agenticToggle.dispatchEvent(new Event("change"));
+                    }
+                    _agConfirmCallback = function () {
+                        btn.disabled = true;
+                        btn.textContent = "Running...";
+                        runRefine(data.request_id);
+                    };
+                    openAgenticConfigPopup();
+                });
+            }
+        };
+
+        /* ── empty-state examples ────────────────────────────────────────── */
+        (function () {
+            var EXAMPLES = [
+                "What does CIRN indicate?",
+                "What does CIU indicate?",
+                "Which Identify Controller fields relate to RTD3?",
+                "What is the role of the ANARS bit in CMIC?"
+            ];
+            var box = document.getElementById("examples");
+            if (!box) return;
+            box.innerHTML = EXAMPLES.map(function (ex) {
+                return '<button class="ex-chip" type="button">' + escapeHtml(ex) + "</button>";
+            }).join("");
+            box.querySelectorAll(".ex-chip").forEach(function (b) {
+                b.addEventListener("click", function () {
+                    var qi = document.getElementById("query-input");
+                    qi.value = b.textContent;
+                    hideEmpty();
+                    runQuery();
+                });
+            });
+        })();
+
+        function hideEmpty() {
+            var e = document.getElementById("empty-state");
+            if (e) e.classList.add("hidden");
+        }
+
+        /* ── composer focus ring + start-of-query empty hide ─────────────── */
+        (function () {
+            var c = document.getElementById("composer");
+            var i = document.getElementById("query-input");
+            if (c && i) {
+                i.addEventListener("focus", function () { c.classList.add("focus"); });
+                i.addEventListener("blur", function () { c.classList.remove("focus"); });
+            }
+            var sb = document.getElementById("search-btn");
+            if (sb) sb.addEventListener("click", hideEmpty);
+            if (i) i.addEventListener("keypress", function (e) { if (e.key === "Enter") hideEmpty(); });
+        })();
+
+        /* ── pipeline disclosure toggle ──────────────────────────────────── */
+        (function () {
+            var head = document.getElementById("pipe-head");
+            var disc = document.getElementById("pipeline-disclosure");
+            if (head && disc) head.addEventListener("click", function () {
+                var opened = disc.classList.toggle("open");
+                if (opened && window._pipeTrace && typeof renderPipelineViz === "function") {
+                    // Re-render now that the container is visible and measurable.
+                    try { renderPipelineViz(window._pipeTrace, window._pipeQuery); } catch (e) {}
+                }
+            });
+        })();
+
+        /* ── agentic pill toggle ─────────────────────────────────────────── */
+        (function () {
+            var pill = document.getElementById("agentic-pill");
+            var lbl = document.getElementById("agentic-pill-label");
+            function sync() {
+                var on = agenticToggle.checked;
+                if (pill) pill.classList.toggle("on", on);
+                if (lbl) lbl.textContent = on ? "Agentic on" : "Agentic";
+            }
+            if (pill) pill.addEventListener("click", function () {
+                agenticToggle.checked = !agenticToggle.checked;
+                agenticToggle.dispatchEvent(new Event("change"));
+            });
+            agenticToggle.addEventListener("change", sync);
+            sync();
+        })();
+
+        /* ── close popovers on outside click ─────────────────────────────── */
+        (function () {
+            document.addEventListener("mousedown", function (e) {
+                var panel = document.getElementById("config-panel");
+                var toggle = document.getElementById("config-toggle");
+                if (panel && panel.classList.contains("open")) {
+                    if (!panel.contains(e.target) && toggle && !toggle.contains(e.target)) panel.classList.remove("open");
+                }
+                var cost = document.getElementById("cost-estimator");
+                if (cost && cost.classList.contains("open") && !cost.contains(e.target)) {
+                    cost.classList.remove("open");
+                    cost.setAttribute("aria-expanded", "false");
+                    var t = document.getElementById("cost-toggle");
+                    if (t) t.innerHTML = "&#9662;";
+                }
+            });
+        })();
+
+        /* Kick the cost estimate once now that everything is wired. */
+        if (typeof renderCostEstimate === "function") { try { renderCostEstimate(); } catch (e) {} }
+    </script>
+
 </body>
 </html>
 """

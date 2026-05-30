@@ -36,6 +36,7 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 
 from src.pipeline import query_processor, retriever, search, reranker, generator, table_serializer
 from src.pipeline.query_processor import QueryDecomposition
@@ -133,6 +134,45 @@ class PipelineStage:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class _ProgressTrace(list):
+    """A trace list that notifies a callback as each stage completes.
+
+    The orchestrator appends a ``PipelineStage`` at every checkpoint. Wrapping
+    the trace in this list lets the web layer stream live progress without
+    having to thread a callback through every stage call site — any
+    ``append``/``extend`` (including the ones inside the agentic loop, which
+    share this same object) fires ``on_stage`` with a lightweight
+    ``{"stage", "took_ms"}`` dict. The callback is best-effort and must never
+    break the pipeline, so its exceptions are swallowed.
+    """
+
+    __slots__ = ("_on_stage",)
+
+    def __init__(self, on_stage: Callable[[dict], None] | None = None):
+        super().__init__()
+        self._on_stage = on_stage
+
+    def _emit(self, stage: object) -> None:
+        cb = self._on_stage
+        if cb is None:
+            return
+        name = getattr(stage, "stage", None)
+        if name is None:
+            return
+        try:
+            cb({"stage": name, "took_ms": float(getattr(stage, "took_ms", 0.0) or 0.0)})
+        except Exception:
+            pass  # progress is best-effort; never let it break orchestration
+
+    def append(self, stage: object) -> None:
+        super().append(stage)
+        self._emit(stage)
+
+    def extend(self, stages) -> None:
+        for s in stages:
+            self.append(s)
 
 
 def _entity_list_to_dict(entities: list) -> list[dict]:
@@ -927,6 +967,7 @@ def orchestrate(
     debug: bool = True,
     agentic: bool = False,
     refine_seed: dict | None = None,
+    on_progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """
     Execute the full retrieval + generation pipeline.
@@ -943,6 +984,10 @@ def orchestrate(
                  "context_chunks": [...],
                  "tokens_used": dict | None}
             Forces ``agentic=True`` regardless of the flag.
+        on_progress: optional callback invoked as each pipeline stage completes,
+            receiving ``{"stage": str, "took_ms": float}``. Best-effort (its
+            exceptions are swallowed); used by the streaming endpoint to push
+            live progress. May be called from any thread.
 
     Returns:
         {
@@ -960,7 +1005,9 @@ def orchestrate(
     if config is None:
         config = PipelineConfig()
 
-    trace: list[PipelineStage] = []
+    # _ProgressTrace behaves exactly like a list but fires `on_progress` as each
+    # stage is appended, so the web layer can stream live pipeline progress.
+    trace: list[PipelineStage] = _ProgressTrace(on_progress)
     tokens_used: dict | None = None
     # Per-LLM-call breakdown. Every stage that talks to an LLM (query
     # processor, gap analysis, follow-up decomp, generation, agentic regen)
@@ -1029,11 +1076,22 @@ def orchestrate(
     )
 
     # -------------------------------------------------------------------------
-    # Stage 2a: Structured Lookup (always attempt if lookup query)
+    # Stage 2a: Structured Lookup (always attempt when an entity can drive it)
     # -------------------------------------------------------------------------
+    # Structured lookup is deterministic and essentially free (in-memory JSON
+    # dict lookups, no LLM, no network) and returns found=False gracefully when
+    # nothing matches. So we do NOT gate it on the LLM's query type — any query
+    # carrying a field or figure entity (e.g. a spec acronym like HMPRE that is
+    # a known field) gets the exact structured path attempted, even when the
+    # query was classified structural/relational/procedural. Gating on
+    # type=="lookup" previously starved most acronym queries of structured hits.
     structured_chunks: list[dict] = []
 
-    if (decomp.type or "").lower() == "lookup" and decomp.entities:
+    _lookup_entities = [
+        e for e in (decomp.entities or [])
+        if getattr(e, "kind", None) in ("field", "figure")
+    ]
+    if _lookup_entities:
         start = time.time()
         struct_result = retriever.structured_lookup(
             decomp,
@@ -1074,7 +1132,7 @@ def orchestrate(
                 output={
                     "found": False,
                     "skipped": True,
-                    "reason": "not a lookup query or no entities extracted",
+                    "reason": "no field or figure entity extracted to drive a structured lookup",
                 },
                 took_ms=0.0,
             )

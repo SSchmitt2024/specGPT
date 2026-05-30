@@ -54,7 +54,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 
-FIELD_INDEX_PATH = Path("data/field_index.json")
+DATA_DIR = Path("data")
+# Base spec lives at data/field_index.json; other specs (e.g. PCIe) live under
+# data/<spec>/field_index.json — mirroring retriever._spec_data_dir().
+FIELD_INDEX_PATH = DATA_DIR / "field_index.json"
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +126,29 @@ _RE_FIELD_CANDIDATE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}(?:\.[A-Z][A-Z0-9]{1,9})
 
 @lru_cache(maxsize=1)
 def _load_field_index() -> set[str]:
-    """Lazy-load the field-name set from data/field_index.json. Cached for process lifetime."""
-    if not FIELD_INDEX_PATH.exists():
-        return set()
-    with open(FIELD_INDEX_PATH, encoding="utf-8") as f:
-        idx = json.load(f)
-    return set(idx.keys())
+    """Lazy-load the union of every spec's field-name set. Cached for process lifetime.
+
+    Entity extraction is spec-agnostic on purpose: we want to recognize an
+    acronym as a candidate field if it is a known field in *any* ingested spec
+    (Base, PCIe, ...). The downstream retriever is spec-scoped, so an acronym
+    that belongs to a different spec than the active one harmlessly resolves to
+    no structured record. Loading only the Base index here used to make every
+    PCIe-only acronym invisible to the extractor.
+    """
+    paths = [FIELD_INDEX_PATH]
+    if DATA_DIR.exists():
+        paths.extend(sorted(DATA_DIR.glob("*/field_index.json")))
+
+    keys: set[str] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                keys.update(json.load(f).keys())
+        except (json.JSONDecodeError, OSError):
+            continue
+    return keys
 
 
 def _dedup_keep_order(items: list[Entity]) -> list[Entity]:
