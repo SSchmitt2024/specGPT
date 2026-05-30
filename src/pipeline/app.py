@@ -1732,14 +1732,20 @@ a { color: var(--accent); text-decoration: none; }
          LLM output is partially user-influenced via prompt injection, so we
          MUST sanitise the marked-generated HTML before injecting it into the
          DOM. Pinned to specific versions so the URL is effectively immutable. -->
-    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.5/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+            integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.5/dist/purify.min.js"
+            integrity="sha384-nszIONF2FGC59kn+pPFaRa6WUNGwsZgXZiJxJwQbym+TzcH7smolUviLgpPbNx7V"
+            crossorigin="anonymous"></script>
 
     <!-- Mermaid: renders the pipeline_trace as a downward-facing DAG.
          securityLevel:'strict' so any text we interpolate into node labels
          is encoded; click events disabled. Mermaid's own renderer never
          executes user-supplied HTML. -->
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"
+            integrity="sha384-Wm9qzEgq4j1jEnuFK2FxKTlwuhbV2QqtGhcchvjDoKxeJ7WWAW7fysBq+1s6myfX"
+            crossorigin="anonymous"></script>
 
     <script>
         // GitHub-flavored markdown (tables, fenced code, autolinks).
@@ -3503,72 +3509,6 @@ a { color: var(--accent); text-decoration: none; }
             };
         }
 
-        function displayResults(data) {
-            // Render the answer through marked → DOMPurify so markdown tables,
-            // headers, code blocks, and lists display the way Claude.ai does.
-            // textContent fallback if either lib failed to load (network issue,
-            // CDN block, offline) so the user still sees the raw answer.
-            const answerEl = document.getElementById("answer-text");
-            // Cancel any prior in-flight roll-out before starting a new one.
-            if (_cancelAnswerStream) { _cancelAnswerStream(); _cancelAnswerStream = null; }
-            const answerText = data.answer || "";
-            if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
-                _cancelAnswerStream = streamAnswerInto(answerEl, answerText);
-            } else {
-                answerEl.textContent = answerText;
-            }
-            document.getElementById("latency").textContent = `${data.latency_ms.toFixed(0)}ms`;
-
-            // Citations - escape attacker-controlled fields (section_id /
-            // section_title flow back from PDF text) before HTML interpolation.
-            const citationsList = document.getElementById("citations-list");
-            const citationsBox = document.getElementById("citations-box");
-            if (data.citations && data.citations.length > 0) {
-                citationsList.innerHTML = data.citations
-                    .map(c => {
-                        const sid = escapeHtml(c.section_id);
-                        const title = escapeHtml(c.section_title);
-                        const flag = c.hallucinated
-                            ? ' <span class="citation-section" title="Cited section not found in retrieved context">(not in context)</span>'
-                            : "";
-                        return `<div class="citation-item"><span class="citation-section">[§${sid}]</span> ${title}${flag}</div>`;
-                    })
-                    .join("");
-                citationsBox.classList.remove("hidden");
-            } else {
-                citationsBox.classList.add("hidden");
-            }
-
-            // Pipeline visualization (Mermaid DAG) - rendered first so the
-            // flowchart appears above the collapsed trace accordion.
-            renderPipelineViz(data.pipeline_trace, data.query);
-
-            // Pipeline trace - rendered into the collapsed <details> accordion
-            // below the flowchart. Each card shows title + subtitle + chips +
-            // key/value rows; raw JSON is behind a "Show raw JSON" toggle.
-            const stagesDiv = document.getElementById("pipeline-stages");
-            const stageCount = document.getElementById("trace-stage-count");
-            if (data.pipeline_trace) {
-                stagesDiv.innerHTML = data.pipeline_trace
-                    .map((stage, idx) => renderStageCard(stage, idx))
-                    .join("");
-                if (stageCount) stageCount.textContent = `(${data.pipeline_trace.length} stage${data.pipeline_trace.length === 1 ? "" : "s"})`;
-            } else {
-                stagesDiv.innerHTML = '';
-                if (stageCount) stageCount.textContent = '';
-            }
-
-            // Model panel - update active row + cost
-            const isAgentic = !!data.agentic;
-            renderModelTable(isAgentic);
-            renderModelCost(data.tokens_used, isAgentic);
-
-            // Sidebar - surface gap_hint / agentic state.
-            renderSidebar(data);
-
-            answerSection.classList.remove("hidden");
-        }
-
         // ─── Stage name → human-friendly display ──────────────────────────
         // Maps the internal stage identifier to {title, subtitle, group}. Sub-
         // query and iteration suffixes are stripped before lookup so e.g.
@@ -3808,91 +3748,6 @@ a { color: var(--accent); text-decoration: none; }
         }
 
         // ─── Agent strip (in-banner): render gap-hint from last response ─
-        function renderSidebar(data) {
-            const strip = document.getElementById("agent-strip");
-            if (!strip) return;
-
-            const label = `<span class="agent-strip-label">Agent</span>`;
-
-            // No query yet - keep the empty hint.
-            if (!data) {
-                strip.innerHTML = label + `<span class="agent-strip-empty">Run a query to see gap hints and one-click follow-ups here.</span>`;
-                return;
-            }
-
-            const latency = `<span class="strip-latency">${data.latency_ms.toFixed(0)}ms</span>`;
-
-            // Agentic mode: the loop already fetched gaps - just confirm.
-            if (data.agentic) {
-                strip.innerHTML = label + `
-                    <span class="agent-strip-state state-agent"><span class="dot"></span><b>Agentic refinement ran</b></span>
-                    <span class="agent-strip-reason">Gap-filling, follow-up retrieval, and Opus regeneration ran automatically.</span>
-                    ${latency}
-                `;
-                return;
-            }
-
-            const gh = data.gap_hint;
-            if (!gh) {
-                strip.innerHTML = label + `
-                    <span class="strip-status">Gap check disabled</span>
-                    <span class="agent-strip-reason">Enable Auto Gap Check in config to get suggestions.</span>
-                    ${latency}
-                `;
-                return;
-            }
-
-            if (!gh.needs_followup) {
-                strip.innerHTML = label + `
-                    <span class="agent-strip-state state-ok"><span class="dot"></span><b>Answer looks complete</b></span>
-                    <span class="agent-strip-reason">${escapeHtml(gh.reason || "The model didn't request any additional context.")}</span>
-                    ${latency}
-                `;
-                return;
-            }
-
-            // Has gaps - render the full offer with chips and button.
-            const req = gh.requested_resources || {};
-            const figs = (req.figures  || []).slice(0, 6);
-            const flds = (req.fields   || []).slice(0, 6);
-            const secs = (req.sections || []).slice(0, 4);
-            const qs   = (gh.queries   || []).slice(0, 3);
-
-            const detailParts = [];
-            if (figs.length) detailParts.push(`<span class="detail-group"><span class="detail-label">Figures</span><span class="agent-strip-chips">${figs.map(f => `<span class="agent-strip-chip">${escapeHtml(f)}</span>`).join("")}</span></span>`);
-            if (flds.length) detailParts.push(`<span class="detail-group"><span class="detail-label">Fields</span><span class="agent-strip-chips">${flds.map(f => `<span class="agent-strip-chip">${escapeHtml(f)}</span>`).join("")}</span></span>`);
-            if (secs.length) detailParts.push(`<span class="detail-group"><span class="detail-label">Sections</span><span class="agent-strip-chips">${secs.map(s => `<span class="agent-strip-chip chip-section">§${escapeHtml(s)}</span>`).join("")}</span></span>`);
-            if (qs.length)   detailParts.push(`<span class="detail-group"><span class="detail-label">Queries</span><span class="agent-strip-chips">${qs.map(q => `<span class="agent-strip-chip">${escapeHtml(q)}</span>`).join("")}</span></span>`);
-            const details = detailParts.length
-                ? `<div class="agent-strip-details">${detailParts.join("")}</div>`
-                : "";
-
-            strip.innerHTML = label + `
-                <span class="agent-strip-state state-warn"><span class="dot"></span><b>Model wants more context</b></span>
-                <span class="agent-strip-reason">${escapeHtml(gh.reason || "The model identified gaps in the retrieved context.")}</span>
-                ${latency}
-                <span class="agent-strip-actions">
-                    <button class="run-agentic-btn" id="run-agentic-btn">Run agentic refinement</button>
-                </span>
-                ${details}
-            `;
-
-            const btn = document.getElementById("run-agentic-btn");
-            if (btn) {
-                btn.addEventListener("click", () => {
-                    showAgenticConfirm(() => {
-                        btn.disabled = true;
-                        btn.textContent = "Running…";
-                        if (!agenticToggle.checked) {
-                            agenticToggle.checked = true;
-                            agenticToggle.dispatchEvent(new Event("change"));
-                        }
-                        runRefine(data.request_id);
-                    });
-                });
-            }
-        }
-
         async function runRefine(requestId) {
             if (!requestId) {
                 errorDiv.textContent = "Error: no request_id available for refine";
