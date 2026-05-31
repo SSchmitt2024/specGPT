@@ -178,3 +178,26 @@ CREATE TABLE IF NOT EXISTS spec_tables (
     table_json    JSONB,
     data          JSONB NOT NULL
 );
+
+-- One row per enumeration ENTRY (an individual FID / LID / CNS / opcode /
+-- status value), from enum_index.json. Mirrors spec_field_index's
+-- one-row-per-entry shape so a single value is DB-queryable
+-- (WHERE spec='base' AND concept='fid' AND "value"=34). `value` is the integer
+-- (always hex-derived: 22h → 34); `data` keeps the full entry for forward-compat.
+-- PK includes `name` because a value can legitimately recur across subtypes
+-- (e.g. status code 02h means different things in Generic vs Command-Specific).
+-- Powers retriever.load_enum_index() — the deterministic value→name lookup.
+CREATE TABLE IF NOT EXISTS spec_enum_index (
+    spec      TEXT NOT NULL DEFAULT 'base',
+    concept   TEXT NOT NULL,
+    "value"   INTEGER NOT NULL,
+    value_hex TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    label     TEXT,
+    figures   TEXT[],
+    sections  TEXT[],
+    data      JSONB NOT NULL,
+    PRIMARY KEY (spec, concept, "value", name)
+);
+CREATE INDEX IF NOT EXISTS spec_enum_index_lookup
+    ON spec_enum_index (spec, concept, "value");
