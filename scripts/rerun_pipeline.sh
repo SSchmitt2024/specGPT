@@ -13,10 +13,11 @@
 #   3. Tables                    src.tables                    (tables.json)
 #   4. Prose + definitions       src.prose                     (prose.json, definitions.json)
 #   5. Fields + field index      src.fields                    (fields.json, field_index.json)
-#   6. Relationships (det.)      src.relationships             (relationships.json)
-#   7. LLM relationships         src.llm.extract_relationships (relationships_llm.json, _state.json)
-#   8. Reconcile                 src.llm.reconcile             (relationships_merged.json, entity_registry.json, cards.json refresh)
-#   9. Cards (summaries)         src.llm.generate_cards        (cards.json, cards_state.json)
+#   6. Enum lookup tables        src.enum_tables               (enum_index.json)
+#   7. Relationships (det.)      src.relationships             (relationships.json)
+#   8. LLM relationships         src.llm.extract_relationships (relationships_llm.json, _state.json)
+#   9. Reconcile                 src.llm.reconcile             (relationships_merged.json, entity_registry.json, cards.json refresh)
+#  10. Cards (summaries)         src.llm.generate_cards        (cards.json, cards_state.json)
 #
 # Usage:
 #   ./scripts/rerun_pipeline.sh
@@ -55,13 +56,15 @@ select_spec() {
   if [[ -z "$choice" ]]; then
     echo ""
     echo "Which specification do you want to run the pipeline for?"
-    echo "  1) base  — NVM Express Base Specification     -> data/"
-    echo "  2) pcie  — NVM Express PCIe Transport Spec     -> data/pcie/"
+    echo "  1) base     — NVM Express Base Specification        -> data/"
+    echo "  2) pcie     — NVM Express PCIe Transport Spec        -> data/pcie/"
+    echo "  3) command  — NVM Express NVM Command Set Spec       -> data/command/"
     read -rp "spec> [1] " spec_reply
     case "${spec_reply:-1}" in
-      1|base|Base|BASE)          choice="base" ;;
-      2|pcie|Pcie|PCIE|PCIe)     choice="pcie" ;;
-      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base or 2/pcie)" >&2; exit 1 ;;
+      1|base|Base|BASE)             choice="base" ;;
+      2|pcie|Pcie|PCIE|PCIe)        choice="pcie" ;;
+      3|command|Command|COMMAND)    choice="command" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base, 2/pcie or 3/command)" >&2; exit 1 ;;
     esac
   fi
 
@@ -88,6 +91,21 @@ select_spec() {
       # already set.
       if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
         read -rp "    PCIe PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    command)
+      export NVME_SPEC="command"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/command}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_command_full.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVM Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Verified against NVMe_command_full.pdf (Rev 1.2): printed p.8 == 0-indexed
+      # pdf idx 7, so the baseline (page-iteration) offset is -1 (toc_rebuild
+      # auto-adds its +1 — see src/spec_env.py). Prompt unless already set.
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Command Set PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
         export SPEC_PAGE_OFFSET="${off_reply:--1}"
       fi
       mkdir -p "$SPEC_DATA_DIR"
@@ -162,6 +180,7 @@ STEP_NAME=(
   "Tables"
   "Prose + definitions"
   "Fields + field index"
+  "Enum lookup tables (FID/LID/CNS/opcode/status)"
   "Relationships (deterministic)"
   "Relationships (LLM)"
   "Reconcile relationships"
@@ -173,6 +192,7 @@ STEP_MODULE=(
   "src.tables"
   "src.prose"
   "src.fields"
+  "src.enum_tables"
   "src.relationships"
   "src.llm.extract_relationships"
   "src.llm.reconcile"
@@ -188,6 +208,7 @@ STEP_OUTPUTS=(
   "$DD/tables.json"
   "$DD/prose.json $DD/definitions.json"
   "$DD/fields.json $DD/field_index.json"
+  "$DD/enum_index.json"
   "$DD/relationships.json"
   "$DD/relationships_llm.json $DD/relationships_llm_state.json"
   "$DD/relationships_merged.json $DD/entity_registry.json $DD/cards.json"
@@ -199,13 +220,14 @@ STEP_INPUTS=(
   ""
   "$DD/toc.json"
   "$DD/tables.json"
+  "$DD/tables.json"
   "$DD/toc.json $DD/tables.json"
   "$DD/prose.json $DD/toc.json $DD/fields.json"
   "$DD/relationships.json $DD/relationships_llm.json $DD/toc.json $DD/fields.json $DD/cards.json"
   "$DD/toc.json $DD/prose.json $DD/tables.json $DD/relationships.json"
 )
 STEP_LLM=(
-  "no" "no" "no" "no" "no" "no" "yes" "yes" "yes"
+  "no" "no" "no" "no" "no" "no" "no" "yes" "yes" "yes"
 )
 
 NUM_STEPS=${#STEP_NAME[@]}

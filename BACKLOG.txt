@@ -1,0 +1,32 @@
+[DONE] Need tables for FID, LID ect
+  Added a deterministic keyed enum index (FID/LID/CNS/opcode/status) built from
+  tables.json by src/enum_tables.py -> enum_index.json. retriever.structured_lookup
+  resolves value->name (and the canonical name is now available up front) via the
+  index, falling back to the live table scan, then to Supabase spec_enum_index in
+  prod. Always hex: "FID 22" and "FID 22h" both resolve to 0x22 (Configurable
+  Device Personality). Added lid entity extraction. Wired into rerun_pipeline.sh
+  (step 6), load_lookup_data.py, supabase_schema.sql (spec_enum_index). Tested.
+
+Structured lookup needs to happen first so when questions about specific features occur, the actual feature name is immediately available even before query decomp
+  (partially addressed by the FID/LID index above — name/value is now resolvable
+  deterministically; remaining work: feed the resolved name back into decomposition)
+
+Configuration presets
+
+Agentic should just go until gap analysis reveals no more data needed
+
+RAG is good about answering questions about information, not great about commands
+
+The understanding query decomp should be using structured lookup a lot more
+
+In recursed cycle, structure lookup should happen as well
+
+Targeted fetch is failing sometimes (this is due to the fact that th only thing it looks up is field names, adding additional keyed tables will massively help with this)
+  (enum_index.json now provides the keyed FID/LID/CNS/opcode/status tables; next
+  step is to let _resolve_requested_resources in orchestrator.py consult the enum
+  index for value/name requests, not just figures/fields/sections)
+
+Sometimes sources cited cites but says not in context
+
+Look into having a different type of pipeline if the query is asking about a command
+

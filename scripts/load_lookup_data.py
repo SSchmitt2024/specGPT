@@ -1,10 +1,11 @@
 """
 Load Phase 1 lookup data into Supabase.
 
-Populates three tables used by retriever.py's structured lookup path:
+Populates the tables used by retriever.py's structured lookup path:
   spec_fields       — one row per field/register (from fields.json)
   spec_field_index  — one row per field-name/location pair (from field_index.json)
   spec_tables       — one row per spec table (from tables.json)
+  spec_enum_index   — one row per enum entry (from enum_index.json)
 
 Run the DDL in scripts/supabase_schema.sql first (once), then run this script
 whenever the Phase 1 data changes.
@@ -37,7 +38,7 @@ except ImportError:
 
 BATCH_SIZE = 200
 
-ALL_TABLES = ("fields", "field_index", "tables")
+ALL_TABLES = ("fields", "field_index", "tables", "enum_index")
 
 
 def _spec() -> str:
@@ -179,6 +180,39 @@ def load_tables(client, data_dir: Path, spec: str) -> None:
     print(f"  done — {n} rows")
 
 
+def _enum_index_rows(index: dict, spec: str) -> list[dict]:
+    """Flatten enum_index.json (concept → block of entries) into one row per
+    entry, matching spec_field_index's one-row-per-record shape."""
+    rows: list[dict] = []
+    for concept, block in index.items():
+        label = block.get("label")
+        for entry in block.get("entries") or []:
+            rows.append({
+                "spec":      spec,
+                "concept":   concept,
+                "value":     entry.get("value"),
+                "value_hex": entry.get("value_hex"),
+                "name":      entry.get("name"),
+                "label":     label,
+                "figures":   entry.get("figures") or [],
+                "sections":  entry.get("sections") or [],
+                "data":      entry,
+            })
+    return rows
+
+
+def load_enum_index(client, data_dir: Path, spec: str) -> None:
+    """One row per enum entry (individual FID/LID/CNS/opcode/status value)."""
+    path = data_dir / "enum_index.json"
+    index = json.loads(path.read_text(encoding="utf-8"))
+    rows = _enum_index_rows(index, spec)
+    print(f"spec_enum_index: replacing {len(rows)} rows (spec={spec})...")
+    # Replace this spec's entries so removed/renamed values can't linger.
+    client.table("spec_enum_index").delete().eq("spec", spec).execute()
+    n = _upsert_batched(client, "spec_enum_index", rows, conflict_col="spec,concept,value,name")
+    print(f"  done — {n} rows")
+
+
 # ---------------------------------------------------------------------------
 # Main
 
@@ -190,6 +224,7 @@ def run(data_dir: Path, tables: list[str]) -> None:
         "fields":      load_fields,
         "field_index": load_field_index,
         "tables":      load_tables,
+        "enum_index":  load_enum_index,
     }
 
     for name in tables:
@@ -197,6 +232,7 @@ def run(data_dir: Path, tables: list[str]) -> None:
             "fields":      data_dir / "fields.json",
             "field_index": data_dir / "field_index.json",
             "tables":      data_dir / "tables.json",
+            "enum_index":  data_dir / "enum_index.json",
         }
         if not path_map[name].exists():
             print(f"ERROR: {path_map[name]} not found — skipping {name}")

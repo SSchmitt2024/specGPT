@@ -188,11 +188,52 @@ def load_tables_by_figure(spec: str = DEFAULT_SPEC) -> dict[str, dict]:
     return {str(t.get("figure_number")): t for t in tables if t.get("figure_number") is not None}
 
 
+@lru_cache(maxsize=None)
+def load_enum_index(spec: str = DEFAULT_SPEC) -> dict[str, dict]:
+    """Map concept (`fid`/`lid`/`cns`/`opcode`/`status`) → index block, scoped to `spec`.
+
+    Each block is ``{"concept", "label", "entries": [...]}`` as produced by
+    ``src.enum_tables``. Prefers Supabase ``spec_enum_index`` (one row per
+    concept), falling back to the spec's local ``enum_index.json`` snapshot.
+    Returns ``{}`` when neither source has data — callers then fall back to the
+    live table scan (``_enum_value_matches``), so a missing index never breaks
+    value lookups. Cached per spec.
+    """
+    spec = _norm_spec(spec)
+    if _supabase_available():
+        try:
+            # One row per entry; regroup into {concept: {concept,label,entries}}
+            # so the in-memory shape matches the local-JSON snapshot exactly.
+            rows = _paginate("spec_enum_index", "concept, label, data", order_col="concept", spec=spec)
+            result: dict[str, dict] = {}
+            for row in rows:
+                concept = row.get("concept")
+                if not concept:
+                    continue
+                block = result.setdefault(
+                    concept, {"concept": concept, "label": row.get("label"), "entries": []}
+                )
+                block["entries"].append(row["data"])
+            if result:
+                return result
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Supabase enum-index load failed (%s); falling back to local JSON snapshot", e)
+    path = _spec_data_dir(spec) / "enum_index.json"
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:  # noqa: BLE001
+            logger.warning("local enum_index.json load failed (%s)", e)
+    return {}
+
+
 def reload_lookup_caches() -> None:
     """Drop cached field/table loaders. Call after a re-ingest run to pick up new data."""
     load_field_index.cache_clear()
     load_fields.cache_clear()
     load_tables_by_figure.cache_clear()
+    load_enum_index.cache_clear()
 
 
 def _entity_to_dict(entity: Entity | dict) -> dict:
@@ -418,6 +459,248 @@ def _confidence(field_count: int, table_count: int, bit_ranges: list[tuple[int, 
     return "LOW"
 
 
+# ---------------------------------------------------------------------------
+# Value-keyed enumeration lookup
+#
+# Some questions key off a *value* inside an enumeration table rather than a
+# field name or figure number — e.g. "which feature corresponds to FID 17h?"
+# (Feature Identifiers), "what command is opcode 0Dh?" (Opcodes), "what log
+# page is LID 02h?" (Log Page Identifiers), CNS values, status codes. The
+# field-name / figure paths never reach those rows, so without this the query
+# falls through to fuzzy hybrid retrieval and returns a partial answer. Here we
+# map a value entity + a concept (entity kind or query keyword) to the relevant
+# enumeration table(s) and pull the exact matching row. Each hit becomes a
+# synthetic field record whose name lets the normal _table_summary /
+# _source_from_table machinery below trim the table down to just that row.
+# ---------------------------------------------------------------------------
+
+# (concept id, entity kinds that imply this concept, query-keyword regex,
+#  table-caption regex). The concept id keys the pre-computed enum index
+# (src.enum_tables); the caption regex drives the live-scan fallback. Keep the
+# caption patterns in sync with src.enum_tables.CONCEPTS.
+_ENUM_CONCEPT_DEFS: list[tuple[str, set[str], "re.Pattern[str]", "re.Pattern[str]"]] = [
+    ("fid",    {"fid"}, re.compile(r"\bfeature(?:s)?\b|\bFID\b", re.I),
+                        re.compile(r"feature identifiers", re.I)),
+    ("opcode", set(),   re.compile(r"\bopcodes?\b|\bcommand\b", re.I),
+                        re.compile(r"opcodes for", re.I)),
+    ("lid",    {"lid"}, re.compile(r"\blog\s+page\b|\blog\s+identifier|\bLID\b", re.I),
+                        re.compile(r"log page identifiers", re.I)),
+    ("cns",    set(),   re.compile(r"\bCNS\b", re.I),
+                        re.compile(r"CNS values", re.I)),
+    ("status", set(),   re.compile(r"\bstatus\s+(?:code|value)", re.I),
+                        re.compile(r"status code", re.I)),
+]
+
+# Scan-path view: (trigger_kinds, kw_re, caption_re) — unchanged shape.
+_ENUM_CONCEPTS: list[tuple[set[str], "re.Pattern[str]", "re.Pattern[str]"]] = [
+    (kinds, kw, cap) for (_c, kinds, kw, cap) in _ENUM_CONCEPT_DEFS
+]
+# Index-path view: concept id → (trigger_kinds, kw_re).
+_ENUM_CONCEPT_GATES: dict[str, tuple[set[str], "re.Pattern[str]"]] = {
+    c: (kinds, kw) for (c, kinds, kw, _cap) in _ENUM_CONCEPT_DEFS
+}
+
+# A bare hex token used as an enumeration value: "17h", "0x17" (1–4 hex digits).
+_RE_HEX_CELL = re.compile(r"^(?:0[xX][0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}h)$")
+
+
+def _hex_value(token: str) -> int | None:
+    """Parse "17h" / "0x17" / "17" → int. Returns None for non-hex tokens."""
+    t = str(token).strip().lower()
+    if t.startswith("0x"):
+        t = t[2:]
+    if t.endswith("h"):
+        t = t[:-1]
+    if t and re.fullmatch(r"[0-9a-f]+", t):
+        try:
+            return int(t, 16)
+        except ValueError:
+            return None
+    return None
+
+
+def _value_tokens(entities: list[Entity | dict]) -> set[int]:
+    """Integer values requested by `fid` / `lid` / `hex` entities.
+
+    Always hex: "FID 17h", "FID 17", "LID 22", and "0x17" all parse to their
+    hexadecimal value (FID 22 → 0x22 → 34), never decimal.
+    """
+    vals: set[int] = set()
+    for raw in entities:
+        ent = _entity_to_dict(raw)
+        if ent["kind"] == "fid":
+            m = re.search(
+                r"(?:FID|Feature\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)",
+                ent["text"], re.I,
+            )
+            v = _hex_value(m.group(1)) if m else None
+        elif ent["kind"] == "lid":
+            m = re.search(
+                r"(?:LID|Log\s+Page\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)",
+                ent["text"], re.I,
+            )
+            v = _hex_value(m.group(1)) if m else None
+        elif ent["kind"] == "hex":
+            v = _hex_value(ent["text"])
+        else:
+            continue
+        if v is not None:
+            vals.add(v)
+    return vals
+
+
+def _cell_value(cell: Any) -> int | None:
+    """Parse a table cell to an int only if it is a bare hex token like '17h'."""
+    text = str(cell).strip()
+    return _hex_value(text) if _RE_HEX_CELL.match(text) else None
+
+
+def _row_label(row: list[Any]) -> str:
+    """The most name-like cell of a row (the one with the most letters)."""
+    best, best_letters = "", 0
+    for cell in row:
+        s = str(cell).strip()
+        letters = sum(c.isalpha() for c in s)
+        if letters > best_letters:
+            best, best_letters = s, letters
+    return best
+
+
+def _enum_value_matches(
+    entities: list[Entity | dict],
+    query: str,
+    tables_by_figure: dict[str, dict],
+) -> list[dict]:
+    """Synthetic field records for value-in-enumeration-table hits (see above)."""
+    values = _value_tokens(entities)
+    if not values:
+        return []
+
+    kinds = {_entity_to_dict(e)["kind"] for e in entities}
+    caption_res = [
+        cap_re for trigger_kinds, kw_re, cap_re in _ENUM_CONCEPTS
+        if (kinds & trigger_kinds) or kw_re.search(query)
+    ]
+    if not caption_res:
+        return []
+
+    matches: list[dict] = []
+    for fig, table in tables_by_figure.items():
+        caption = str(table.get("caption") or "")
+        if not any(cap_re.search(caption) for cap_re in caption_res):
+            continue
+        for row in (table.get("rows") or []):
+            if not isinstance(row, (list, tuple)):
+                continue
+            row_vals = {v for v in (_cell_value(c) for c in row) if v is not None}
+            hit = values & row_vals
+            if not hit:
+                continue
+            label = _row_label(list(row))
+            if not label:
+                continue
+            value_hex = f"{min(hit):02X}h"
+            matches.append({
+                "field_name": label,
+                "full_name": label,
+                "parent_figure": str(fig),
+                "offset": value_hex,
+                "offset_type": "value",
+                "value": value_hex,
+                "description": f"{label} ({caption}, value {value_hex})",
+                "source": "enum_lookup",
+            })
+    return matches
+
+
+def _enum_index_hits(
+    entities: list[Entity | dict],
+    query: str,
+    enum_index: dict[str, dict],
+) -> list[dict]:
+    """Deterministic value→name hits from the pre-computed enum index.
+
+    For each requested value (always hex — "FID 22" and "FID 22h" both → 0x22),
+    return the matching entries from every concept the query/entities trigger
+    (e.g. a `fid` entity or the word "feature" → the `fid` concept). Each hit is
+    the raw index entry plus its `concept`/`label`. Returns ``[]`` when the index
+    is empty or nothing matches, so the caller falls back to the live scan.
+    """
+    if not enum_index:
+        return []
+    values = _value_tokens(entities)
+    if not values:
+        return []
+
+    kinds = {_entity_to_dict(e)["kind"] for e in entities}
+    triggered = {
+        concept
+        for concept, (trigger_kinds, kw_re) in _ENUM_CONCEPT_GATES.items()
+        if (kinds & trigger_kinds) or kw_re.search(query)
+    }
+    if not triggered:
+        return []
+
+    hits: list[dict] = []
+    for concept in triggered:
+        block = enum_index.get(concept)
+        if not block:
+            continue
+        label = block.get("label") or concept.upper()
+        for entry in block.get("entries") or []:
+            if entry.get("value") in values:
+                hits.append({**entry, "concept": concept, "label": label})
+    return hits
+
+
+def _enum_hit_to_field(hit: dict, figure: str) -> dict:
+    """Synthetic field record (one per parent figure) so the hit flows through
+    the normal _table_summary / _source_from_table row-trimming machinery."""
+    value_hex = hit.get("value_hex") or ""
+    name = hit.get("name") or ""
+    label = hit.get("label") or ""
+    return {
+        "field_name": name,
+        "full_name": name,
+        "parent_figure": str(figure),
+        "offset": value_hex,
+        "offset_type": "value",
+        "value": value_hex,
+        "description": f"{name} ({label} {value_hex})",
+        "source": "enum_index",
+    }
+
+
+def _enum_hit_to_source(hit: dict) -> dict:
+    """Self-contained source chunk for an enum hit — carries the value→name
+    answer directly, so it surfaces even when the parent figure table isn't
+    loaded into the retriever (the guaranteed-hit path)."""
+    value_hex = hit.get("value_hex") or ""
+    name = hit.get("name") or ""
+    label = hit.get("label") or ""
+    figures = hit.get("figures") or []
+    sections = hit.get("sections") or []
+    parts = [f"{label} {value_hex}: {name}."]
+    if sections:
+        parts.append(f"Defined in section {', '.join(sections)}.")
+    if figures:
+        parts.append(f"Listed in Figure {', '.join(figures)}.")
+    text = " ".join(parts)
+    section_id = sections[0] if sections else None
+    return {
+        "chunk_id": f"enum:{hit.get('concept')}:{value_hex}:{name}".replace(" ", "_"),
+        "section_id": section_id,
+        "section_title": f"{label} {value_hex} — {name}",
+        "content_type": "table",
+        "text_raw": text,
+        "pdf_pages": [],
+        "figure_number": figures[0] if figures else None,
+        "has_normative": False,
+        "score": 1.0,
+        "method": "structured_lookup",
+    }
+
+
 def structured_lookup(
     query_or_decomposition: str | QueryDecomposition | dict,
     *,
@@ -467,7 +750,25 @@ def structured_lookup(
             continue
         field_matches.extend(narrowed or records)
 
-    field_matches = _dedupe_fields(field_matches)[:max_fields]
+    # Value-keyed enumeration hits (e.g. FID 22h → "Configurable Device
+    # Personality"). Prefer the deterministic pre-computed enum index; fall back
+    # to a live caption-scan of the raw tables when the index isn't available so
+    # nothing regresses. `enum_sources` are self-contained chunks that carry the
+    # value→name answer directly, guaranteeing it surfaces even if the parent
+    # figure table isn't loaded into the retriever. Prepended so the exact
+    # value→name answer ranks ahead of generic field-name records.
+    enum_index = load_enum_index(spec)
+    enum_hits = _enum_index_hits(entities, query, enum_index)
+    enum_sources: list[dict] = []
+    if enum_hits:
+        enum_matches = []
+        for hit in enum_hits:
+            for fig in (hit.get("figures") or []):
+                enum_matches.append(_enum_hit_to_field(hit, fig))
+            enum_sources.append(_enum_hit_to_source(hit))
+    else:
+        enum_matches = _enum_value_matches(entities, query, tables_by_figure)
+    field_matches = _dedupe_fields(enum_matches + field_matches)[:max_fields]
 
     table_numbers: list[str] = []
     for field_record in field_matches:
@@ -489,7 +790,7 @@ def structured_lookup(
         for fig in table_numbers
         if fig in tables_by_figure
     ]
-    sources = [
+    sources = enum_sources + [
         _source_from_table(tables_by_figure[fig], fields_by_figure.get(fig, []), bit_ranges)
         for fig in table_numbers
         if fig in tables_by_figure
@@ -497,10 +798,10 @@ def structured_lookup(
 
     if figure_keys and not sources and not field_matches:
         notes.append("Figure entity was extracted, but no matching table was found.")
-    if not field_keys and not figure_keys:
+    if not field_keys and not figure_keys and not enum_matches:
         notes.append("No field or figure entity was extracted for structured lookup.")
 
-    found = bool(field_matches or tables)
+    found = bool(field_matches or tables or enum_sources)
     return StructuredLookupResult(
         query=query,
         found=found,

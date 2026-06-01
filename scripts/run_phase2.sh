@@ -11,7 +11,7 @@
 #   3. Embed chunks        scripts/embedder.py            (chunks_embedded.json)
 #   4. Apply schema        scripts/apply_schema.py        (remote DB — DDL)
 #   5. Index to Supabase   scripts/indexer.py             (remote DB — chunks)
-#   6. Load lookup data    scripts/load_lookup_data.py    (remote DB — fields/tables)
+#   6. Load lookup data    scripts/load_lookup_data.py    (remote DB — fields/tables/enum_index)
 #   7. Generate eval set   scripts/eval_gen.py            (eval_set.json)
 #   8. Run eval            scripts/eval_run.py            (eval_results.json)
 #
@@ -48,13 +48,15 @@ select_spec() {
   if [[ -z "$choice" ]]; then
     echo ""
     echo "Which specification do you want to ingest?"
-    echo "  1) base  — NVM Express Base Specification     <- data/"
-    echo "  2) pcie  — NVM Express PCIe Transport Spec     <- data/pcie/"
+    echo "  1) base     — NVM Express Base Specification        <- data/"
+    echo "  2) pcie     — NVM Express PCIe Transport Spec        <- data/pcie/"
+    echo "  3) command  — NVM Express NVM Command Set Spec       <- data/command/"
     read -rp "spec> [1] " spec_reply
     case "${spec_reply:-1}" in
-      1|base|Base|BASE)          choice="base" ;;
-      2|pcie|Pcie|PCIE|PCIe)     choice="pcie" ;;
-      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base or 2/pcie)" >&2; exit 1 ;;
+      1|base|Base|BASE)             choice="base" ;;
+      2|pcie|Pcie|PCIE|PCIe)        choice="pcie" ;;
+      3|command|Command|COMMAND)    choice="command" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base, 2/pcie or 3/command)" >&2; exit 1 ;;
     esac
   fi
 
@@ -70,6 +72,12 @@ select_spec() {
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      ;;
+    command)
+      export NVME_SPEC="command"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/command}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVM Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
       ;;
   esac
 

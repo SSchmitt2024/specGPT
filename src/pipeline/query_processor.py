@@ -6,7 +6,7 @@ Takes a raw user question and produces:
     {
       "query":      "<original>",
       "type":       "lookup" | "structural" | "relational" | "procedural",
-      "entities":   [{"text": "...", "kind": "field"|"figure"|"hex"|"fid"|"cdw"|"section"}],
+      "entities":   [{"text": "...", "kind": "field"|"figure"|"hex"|"fid"|"lid"|"cdw"|"section"}],
       "sub_queries":["...", "..."],     # 1–3 focused queries to feed retrieval
       "rationale":  "<one short sentence from the LLM>"
     }
@@ -69,7 +69,7 @@ VALID_TYPES = ("lookup", "structural", "relational", "procedural")
 @dataclass
 class Entity:
     text: str
-    kind: str  # "field" | "figure" | "hex" | "fid" | "cdw" | "section"
+    kind: str  # "field" | "figure" | "hex" | "fid" | "lid" | "cdw" | "section"
 
 
 @dataclass
@@ -101,9 +101,18 @@ class QueryDecomposition:
 # Require ≥2 hex chars on the trailing-h form to avoid catching plain words.
 _RE_HEX = re.compile(r"\b(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{2,}h)\b")
 
-# Feature Identifier: "FID 0x01", "FID 01h", "Feature Identifier 0x12".
+# Feature Identifier: "FID 0x01", "FID 01h", "FID 22", "Feature Identifier 0x12".
+# The value is always hex (NVMe identifies FIDs by hexadecimal value), so a bare
+# "22" here means 0x22 — the trailing "h" is optional and never changes the value.
 _RE_FID = re.compile(
     r"\b(?:FID|Feature\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)\b",
+    re.IGNORECASE,
+)
+
+# Log Page Identifier: "LID 02h", "LID 22", "Log Page Identifier 0x12". Same
+# always-hex rule as FID above.
+_RE_LID = re.compile(
+    r"\b(?:LID|Log\s+Page\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)\b",
     re.IGNORECASE,
 )
 
@@ -171,6 +180,9 @@ def extract_entities(query: str) -> list[Entity]:
     # eat their substrings (e.g. FID 0x01 should be captured as fid, not as raw hex).
     for m in _RE_FID.finditer(query):
         found.append(Entity(text=m.group(0), kind="fid"))
+
+    for m in _RE_LID.finditer(query):
+        found.append(Entity(text=m.group(0), kind="lid"))
 
     for m in _RE_CDW.finditer(query):
         found.append(Entity(text=m.group(0), kind="cdw"))
