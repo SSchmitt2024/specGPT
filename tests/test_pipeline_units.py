@@ -543,6 +543,77 @@ def test_pipeline_config_has_agentic_targeted_fetch_default():
 
 
 # ---------------------------------------------------------------------------
+# retriever fuzzy full-name fallback (runs *after* the exact lookup tables)
+
+# Synthetic field_index: acronym -> [record]. Two names share words so we can
+# prove acronyms never cross over and a descriptive phrase resolves cleanly.
+_FUZZY_FIELD_INDEX = {
+    "MPTR": [{"field_name": "MPTR", "full_name": "Metadata Pointer", "parent_figure": 22}],
+    "DPTR": [{"field_name": "DPTR", "full_name": "Data Pointer", "parent_figure": 23}],
+    "CRTO": [{"field_name": "CRTO", "full_name": "Controller Ready Timeout", "parent_figure": 30}],
+    # Single-word name: must be excluded from the fuzzy index entirely.
+    "NSID": [{"field_name": "NSID", "full_name": "Namespace", "parent_figure": 40}],
+}
+
+
+def _fuzzy_name_index():
+    from src.pipeline.retriever import _RE_WORD
+    by_name: dict[str, set[str]] = {}
+    for records in _FUZZY_FIELD_INDEX.values():
+        for rec in records:
+            norm = " ".join(_RE_WORD.findall(rec["full_name"].lower()))
+            if " " not in norm:
+                continue
+            by_name.setdefault(norm, set()).add(rec["field_name"])
+    return tuple((n, tuple(sorted(a))) for n, a in by_name.items())
+
+
+def test_fuzzy_full_name_resolves_descriptive_phrase():
+    """A paraphrased multi-word name reaches its field; hits are tagged."""
+    from src.pipeline.retriever import _fuzzy_full_name_matches
+    recs, notes = _fuzzy_full_name_matches(
+        "what is the controller ready timeout",
+        _FUZZY_FIELD_INDEX, _fuzzy_name_index(), cutoff=0.86, max_hits=8,
+    )
+    assert "CRTO" in {r["field_name"] for r in recs}
+    assert all(r["source"] == "fuzzy_full_name" for r in recs)
+    assert all("fuzzy_score" in r for r in recs)
+    assert notes
+
+
+def test_fuzzy_full_name_never_crosses_acronyms():
+    """An acronym near-miss must never resolve to a *different* acronym.
+
+    CRATT is not a known field; it must NOT fuzzily collapse to CRTO (or any
+    acronym). Acronyms stay exact — only descriptive full names are fuzzed.
+    """
+    from src.pipeline.retriever import _fuzzy_full_name_matches
+    for token in ("CRATT", "MPTRR", "DPTRX"):
+        recs, _ = _fuzzy_full_name_matches(
+            token, _FUZZY_FIELD_INDEX, _fuzzy_name_index(), cutoff=0.86, max_hits=8,
+        )
+        assert recs == [], f"{token} must not fuzzy-match any acronym"
+
+
+def test_fuzzy_full_name_excludes_single_word_names():
+    """Single-word names (e.g. 'Namespace') are not eligible for fuzzy matching,
+    so a one-token query can never collapse onto them."""
+    from src.pipeline.retriever import _fuzzy_full_name_matches
+    recs, _ = _fuzzy_full_name_matches(
+        "namespac", _FUZZY_FIELD_INDEX, _fuzzy_name_index(), cutoff=0.86, max_hits=8,
+    )
+    assert "NSID" not in {r["field_name"] for r in recs}
+
+
+def test_fuzzy_full_name_empty_query_is_noop():
+    from src.pipeline.retriever import _fuzzy_full_name_matches
+    recs, notes = _fuzzy_full_name_matches(
+        "what is the of", _FUZZY_FIELD_INDEX, _fuzzy_name_index(), cutoff=0.86, max_hits=8,
+    )
+    assert recs == [] and notes == []
+
+
+# ---------------------------------------------------------------------------
 # Allow `python tests/test_pipeline_units.py` (no pytest) to validate fast.
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 import re
@@ -158,6 +159,32 @@ def load_field_index(spec: str = DEFAULT_SPEC) -> dict[str, list[dict]]:
 
 
 @lru_cache(maxsize=None)
+def _full_name_index(spec: str = DEFAULT_SPEC) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Normalized multi-word ``full_name`` → the field acronyms that carry it.
+
+    Drives the fuzzy full-name fallback in ``structured_lookup``. Single-word
+    names (and acronyms) are deliberately excluded: fuzzy matching is only ever
+    allowed against descriptive multi-word names, so a near-miss can never
+    collapse one acronym into another (CRATT must never resolve to CRAT).
+
+    Returned as a tuple-of-tuples so the cached value is immutable. Cached per
+    spec; cleared by ``reload_lookup_caches()``.
+    """
+    by_name: dict[str, set[str]] = {}
+    for records in load_field_index(spec).values():
+        for rec in records:
+            full = str(rec.get("full_name") or "").strip()
+            fname = str(rec.get("field_name") or "").strip()
+            if not full or not fname:
+                continue
+            norm = " ".join(_RE_WORD.findall(full.lower()))
+            if " " not in norm:  # require >= 2 words; never fuzz single tokens
+                continue
+            by_name.setdefault(norm, set()).add(fname)
+    return tuple((name, tuple(sorted(acrs))) for name, acrs in by_name.items())
+
+
+@lru_cache(maxsize=None)
 def load_fields(spec: str = DEFAULT_SPEC) -> list[dict]:
     spec = _norm_spec(spec)
     if _supabase_available():
@@ -231,6 +258,7 @@ def load_enum_index(spec: str = DEFAULT_SPEC) -> dict[str, dict]:
 def reload_lookup_caches() -> None:
     """Drop cached field/table loaders. Call after a re-ingest run to pick up new data."""
     load_field_index.cache_clear()
+    _full_name_index.cache_clear()
     load_fields.cache_clear()
     load_tables_by_figure.cache_clear()
     load_enum_index.cache_clear()
@@ -701,12 +729,91 @@ def _enum_hit_to_source(hit: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Fuzzy full-name fallback
+#
+# The exact field-index lookup above is the *specific* path: an acronym only
+# ever resolves to its own exact record. This is the *wide* path, tried only
+# after the exact tables come up empty (specific-then-wide). It matches the
+# query's descriptive wording against field *full names* — never acronyms — so
+# a misspelled or paraphrased name ("controller ready timeout") can still reach
+# its field, while an acronym near-miss can never cross over (CRATT ↛ CRAT).
+# ---------------------------------------------------------------------------
+
+# A descriptive word: letters first, then alphanumerics/hyphens. Used to tokenize
+# both the query and full names into a comparable bag of words.
+_RE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+
+# Generic words too common to anchor a full-name match. Kept intentionally small
+# so real name words (e.g. "data", "pointer") survive.
+_FUZZY_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "in", "on", "to", "for", "and", "or", "is", "are",
+    "what", "whats", "which", "how", "does", "do", "mean", "means", "this",
+    "that", "with", "when", "value", "field", "register", "offset", "bit",
+    "bits", "byte", "bytes",
+})
+
+
+def _fuzzy_full_name_matches(
+    query: str,
+    field_index: dict[str, list[dict]],
+    name_index: tuple[tuple[str, tuple[str, ...]], ...],
+    *,
+    cutoff: float,
+    max_hits: int,
+) -> tuple[list[dict], list[str]]:
+    """Fuzzy-match the query's wording against field full names. See section note.
+
+    For each candidate full name, slide a word-window of *that name's own length*
+    across the query tokens and keep the best ``SequenceMatcher`` ratio; a name
+    scores a hit only at/above ``cutoff``. Pinning the window to the name's word
+    count means a short query token can never fuzzily match a long name, and the
+    name_index already excludes single-word names — together these guarantee
+    acronyms are never fuzzed into one another. Returns (records, notes); each
+    record is tagged ``source="fuzzy_full_name"`` with its ``fuzzy_score``.
+    """
+    tokens = [t for t in _RE_WORD.findall(query.lower()) if t not in _FUZZY_STOPWORDS]
+    if not tokens or not name_index:
+        return [], []
+
+    sm = difflib.SequenceMatcher()
+    scored: list[tuple[float, str, tuple[str, ...]]] = []
+    for norm_name, acronyms in name_index:
+        n_words = norm_name.count(" ") + 1
+        if n_words > len(tokens):
+            continue
+        sm.set_seq2(norm_name)
+        best = 0.0
+        for i in range(len(tokens) - n_words + 1):
+            sm.set_seq1(" ".join(tokens[i:i + n_words]))
+            if sm.quick_ratio() < cutoff:  # cheap upper bound — skip the real ratio
+                continue
+            best = max(best, sm.ratio())
+        if best >= cutoff:
+            scored.append((best, norm_name, acronyms))
+
+    if not scored:
+        return [], []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    records: list[dict] = []
+    notes: list[str] = []
+    for score, norm_name, acronyms in scored[:max_hits]:
+        for acr in acronyms:
+            for rec in field_index.get(acr, []):
+                records.append({**rec, "source": "fuzzy_full_name", "fuzzy_score": round(score, 3)})
+        notes.append(f"Fuzzy full-name match: {norm_name!r} → {'/'.join(acronyms)} (score {score:.2f}).")
+    return records, notes
+
+
 def structured_lookup(
     query_or_decomposition: str | QueryDecomposition | dict,
     *,
     use_llm: bool = False,
     max_fields: int = 8,
     spec: str = DEFAULT_SPEC,
+    enable_fuzzy: bool = True,
+    fuzzy_cutoff: float = 0.86,
 ) -> StructuredLookupResult:
     """
     Return exact field/table evidence for lookup-style queries, scoped to `spec`.
@@ -749,6 +856,21 @@ def structured_lookup(
             notes.append(f"{key} matched, but no record overlapped requested bit/byte range.")
             continue
         field_matches.extend(narrowed or records)
+
+    # Wide-net fallback (runs *after* the exact lookup tables above). Only when
+    # no acronym resolved exactly do we fuzzy-match the query's descriptive
+    # wording against field full names — acronyms always stay exact, so this can
+    # never cross one acronym to another. See _fuzzy_full_name_matches.
+    if enable_fuzzy and not field_matches:
+        fuzzy_records, fuzzy_notes = _fuzzy_full_name_matches(
+            query,
+            field_index,
+            _full_name_index(spec),
+            cutoff=fuzzy_cutoff,
+            max_hits=max_fields,
+        )
+        field_matches.extend(fuzzy_records)
+        notes.extend(fuzzy_notes)
 
     # Value-keyed enumeration hits (e.g. FID 22h → "Configurable Device
     # Personality"). Prefer the deterministic pre-computed enum index; fall back
