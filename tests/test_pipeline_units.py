@@ -289,6 +289,183 @@ def test_rrf_merge_tags_missing_method_loudly():
 
 
 # ---------------------------------------------------------------------------
+# retriever value-keyed enumeration lookup (FID/opcode/log-page/CNS/status)
+
+def test_value_tokens_parses_fid_and_hex_entities():
+    from src.pipeline.retriever import _value_tokens
+    ents = [{"text": "FID 17h", "kind": "fid"}, {"text": "0x0D", "kind": "hex"}]
+    assert _value_tokens(ents) == {0x17, 0x0D}
+
+
+def test_cell_value_only_parses_bare_hex_tokens():
+    from src.pipeline.retriever import _cell_value
+    assert _cell_value("17h") == 0x17
+    assert _cell_value("0x17") == 0x17
+    assert _cell_value("5.2.26.1.15") is None  # section ref, not a value
+    assert _cell_value("Sanitize Config") is None
+
+
+def test_enum_value_match_resolves_fid_to_feature_name():
+    """FID 17h must resolve to its Feature Identifiers row without an LLM."""
+    from src.pipeline.retriever import _enum_value_matches
+    tables = {
+        "198": {
+            "figure_number": "198",
+            "caption": "Get Features – Feature Identifiers",
+            "rows": [
+                ["Power Management", "02h", "5.2.26.1.2"],
+                ["Sanitize Config", "17h", "5.2.26.1.15"],
+            ],
+        },
+        # Same value lives in an unrelated table; the concept gate must exclude it.
+        "206": {
+            "figure_number": "206",
+            "caption": "Get Log Page – Log Page Identifiers",
+            "rows": [["17h", "N", "Controller", "Some Log", "5.x"]],
+        },
+    }
+    ents = [{"text": "FID 17h", "kind": "fid"}]
+    matches = _enum_value_matches(ents, "Which feature corresponds to FID 17h?", tables)
+    figs = {m["parent_figure"] for m in matches}
+    names = {m["field_name"] for m in matches}
+    assert figs == {"198"}                 # log-page table excluded by concept gate
+    assert "Sanitize Config" in names
+
+
+def test_enum_value_match_noop_without_value_entity():
+    from src.pipeline.retriever import _enum_value_matches
+    tables = {"198": {"figure_number": "198",
+                      "caption": "Get Features – Feature Identifiers",
+                      "rows": [["Sanitize Config", "17h", "5.2.26.1.15"]]}}
+    # bit-range style query carries no fid/hex entity → must not match.
+    assert _enum_value_matches([], "What are bits 7:4 of CDW10?", tables) == []
+
+
+# ---------------------------------------------------------------------------
+# enum_tables extractor + deterministic keyed enum index
+
+_FID_TABLES_FIXTURE = [
+    {
+        "figure_number": 198,
+        "caption": "Get Features – Feature Identifiers",
+        "rows": [
+            ["Arbitration", "01h", "5.2.26.1.1"],
+            ["Configurable Device Personality", "22h", "5.2.26.1.24"],
+            ["Attributes Returned"],  # broken PDF row, no value → skipped
+        ],
+    },
+    {
+        "figure_number": 403,
+        "caption": "Set Features – Feature Identifiers",
+        "rows": [
+            ["01h", "No", "No", "Arbitration", "Controller"],
+            ["22h", "Yes", "Yes", "Configurable Device Personality", "NVM subsystem"],
+        ],
+    },
+    {
+        "figure_number": 206,
+        "caption": "Get Log Page – Log Page Identifiers",
+        "rows": [["22h", "N", "Controller", "Endurance Group", "5.2.12.1.31"]],
+    },
+    # Near-miss caption must be excluded by the concept's exclude_re.
+    {"figure_number": 999, "caption": "Feature Identifiers Effects Log Page",
+     "rows": [["22h", "Bogus Feature"]]},
+]
+
+
+def test_enum_tables_extracts_fid_and_merges_figures():
+    from src.enum_tables import build_enum_index
+    index = build_enum_index(_FID_TABLES_FIXTURE)
+    fid_entries = {e["value"]: e for e in index["fid"]["entries"]}
+    cdp = fid_entries[0x22]
+    assert cdp["name"] == "Configurable Device Personality"
+    assert cdp["value_hex"] == "22h"
+    # Same FID listed in both Get and Set tables → figures merged, not duplicated.
+    assert set(cdp["figures"]) == {"198", "403"}
+    assert cdp["sections"] == ["5.2.26.1.24"]
+    # The "Effects Log Page" near-miss must not pollute the fid concept.
+    assert all("Bogus" not in e["name"] for e in index["fid"]["entries"])
+
+
+def test_enum_tables_extracts_lid_separately():
+    from src.enum_tables import build_enum_index
+    index = build_enum_index(_FID_TABLES_FIXTURE)
+    lid_entries = {e["value"]: e for e in index["lid"]["entries"]}
+    assert lid_entries[0x22]["name"] == "Endurance Group"
+
+
+def test_enum_index_hits_fid_22_always_hex():
+    """'FID 22' and 'FID 22h' must BOTH resolve to 0x22 (always hex)."""
+    from src.enum_tables import build_enum_index
+    from src.pipeline.retriever import _enum_index_hits
+    from src.pipeline.query_processor import extract_entities
+
+    index = build_enum_index(_FID_TABLES_FIXTURE)
+    for query in ["what is FID 22", "what is FID 22h", "what feature is FID 0x22"]:
+        ents = [{"text": e.text, "kind": e.kind} for e in extract_entities(query)]
+        hits = _enum_index_hits(ents, query, index)
+        names = {h["name"] for h in hits if h["concept"] == "fid"}
+        assert "Configurable Device Personality" in names, query
+        # Must be the hex 0x22 entry, never decimal 22 (= 0x16).
+        assert all(h["value"] == 0x22 for h in hits if h["concept"] == "fid"), query
+
+
+def test_enum_index_hits_decimal_is_hex_not_literal():
+    """'FID 22' resolves to 0x22, distinct from the entry at decimal-looking 16h."""
+    from src.enum_tables import build_enum_index
+    from src.pipeline.retriever import _enum_index_hits
+    tables = [{
+        "figure_number": 198,
+        "caption": "Get Features – Feature Identifiers",
+        "rows": [["Host Behavior Support", "16h", "5.2.26.1.22"],
+                 ["Configurable Device Personality", "22h", "5.2.26.1.24"]],
+    }]
+    index = build_enum_index(tables)
+    hits = _enum_index_hits([{"text": "FID 22", "kind": "fid"}], "FID 22", index)
+    names = {h["name"] for h in hits}
+    assert names == {"Configurable Device Personality"}  # 0x22, not "the 22nd / 16h"
+
+
+def test_enum_index_lid_value_resolves():
+    from src.enum_tables import build_enum_index
+    from src.pipeline.retriever import _enum_index_hits
+    index = build_enum_index(_FID_TABLES_FIXTURE)
+    hits = _enum_index_hits([{"text": "LID 22h", "kind": "lid"}],
+                            "what log page is LID 22h", index)
+    names = {h["name"] for h in hits if h["concept"] == "lid"}
+    assert "Endurance Group" in names
+
+
+def test_enum_index_hits_empty_without_index():
+    from src.pipeline.retriever import _enum_index_hits
+    assert _enum_index_hits([{"text": "FID 22", "kind": "fid"}], "FID 22", {}) == []
+
+
+def test_lid_entity_extracted_with_and_without_h():
+    from src.pipeline.query_processor import extract_entities
+    for q in ["what is LID 22", "what is LID 22h", "Log Page Identifier 0x02"]:
+        kinds = {e.kind for e in extract_entities(q)}
+        assert "lid" in kinds, q
+
+
+def test_value_tokens_parses_lid_entity_as_hex():
+    from src.pipeline.retriever import _value_tokens
+    assert _value_tokens([{"text": "LID 22", "kind": "lid"}]) == {0x22}
+    assert _value_tokens([{"text": "LID 22h", "kind": "lid"}]) == {0x22}
+
+
+def test_enum_hit_to_source_is_self_contained():
+    from src.pipeline.retriever import _enum_hit_to_source
+    hit = {"concept": "fid", "label": "Feature Identifier", "value": 0x22,
+           "value_hex": "22h", "name": "Configurable Device Personality",
+           "figures": ["198", "403"], "sections": ["5.2.26.1.24"]}
+    src = _enum_hit_to_source(hit)
+    assert "Configurable Device Personality" in src["text_raw"]
+    assert "22h" in src["text_raw"]
+    assert src["method"] == "structured_lookup"
+
+
+# ---------------------------------------------------------------------------
 # reranker shape stability
 
 def test_rerank_empty_query_preserves_shape():

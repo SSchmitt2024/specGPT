@@ -63,9 +63,10 @@ class GenerationError(RuntimeError):
 @dataclass
 class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
-    # Which specification corpus to search: "base" | "pcie". Scopes every
-    # retrieval (vector / tsvector / BM25 / structured lookup) to rows tagged
-    # with this spec, so Base and PCIe results never co-mingle.
+    # Which specification corpus to search: "base" | "pcie" | "command" (see
+    # AVAILABLE_SPECS in app.py). Scopes every retrieval (vector / tsvector /
+    # BM25 / structured lookup) to rows tagged with this spec, so different
+    # specs' results never co-mingle.
     spec: str = "base"
 
     # Search parameters
@@ -104,11 +105,16 @@ class PipelineConfig:
     # Supabase lookup per requested artifact.
     agentic_targeted_fetch: bool = True
 
-    # Recursive agentic mode: when True, re-run gap-analysis on each newly
-    # regenerated answer and loop until the model stops requesting more
-    # context (or `agentic_max_iterations` is hit). When False (default),
-    # behavior is the original single-pass refinement.
-    agentic_recursive: bool = False
+    # Recursive agentic mode: when True (default), re-run gap-analysis on each
+    # newly regenerated answer and keep looping until the gap analyser stops
+    # requesting more data — i.e. "go until there are no more gaps". The loop
+    # always terminates: it stops on convergence (no gaps), when a refinement
+    # adds no new evidence, or when the iteration cap below is reached. Set
+    # False for the original single-pass refinement.
+    agentic_recursive: bool = True
+    # Safety cap on agentic iterations. The loop can never exceed this (and is
+    # further bounded by the absolute ceiling _AGENTIC_HARD_CAP), so a gap
+    # analyser that keeps asking for unavailable data cannot loop forever.
     agentic_max_iterations: int = 5
 
     # When True and agentic mode is OFF, still run a one-shot gap analysis
@@ -303,6 +309,67 @@ def hybrid_search(
     # on the merged pool (structured + hybrid), not here.
     return merged, sub_trace
 
+
+# Absolute upper bound on agentic refinement iterations, independent of config.
+# Even if a caller sets agentic_max_iterations very high, the loop can never run
+# more times than this — a hard guarantee that the agentic loop cannot run
+# forever (e.g. if gap analysis keeps requesting data that can't be retrieved).
+_AGENTIC_HARD_CAP = 10
+
+
+# Named configuration presets — bundles of PipelineConfig overrides plus the
+# agentic flag, surfaced in the UI as a dropdown so users can pick a
+# speed/depth trade-off without tuning individual knobs. This is the single
+# source of truth; the web layer serves it via /api/presets and the frontend
+# resolves the chosen preset into the request's `config` + `agentic`.
+#
+# `config` only ever holds a subset of PipelineConfig fields; `spec` is
+# deliberately excluded (it's chosen independently via the spec control) and is
+# merged in on top of the preset by the caller.
+PRESETS: dict[str, dict] = {
+    "fast": {
+        "label": "Fast",
+        "agentic": False,
+        "config": {
+            "vector_topk": 6,
+            "tsvector_topk": 6,
+            "bm25_topk": 6,
+            "final_rerank_topk": 5,
+            "auto_gap_check": False,
+        },
+    },
+    "balanced": {
+        "label": "Balanced",
+        "agentic": False,
+        "config": {},  # server defaults — current behavior
+    },
+    "thorough": {
+        "label": "Thorough",
+        "agentic": True,
+        "config": {
+            "vector_topk": 14,
+            "tsvector_topk": 14,
+            "bm25_topk": 14,
+            "final_rerank_topk": 10,
+            "agentic_recursive": True,
+            "agentic_targeted_fetch": True,
+            "agentic_max_iterations": 6,
+        },
+    },
+}
+
+DEFAULT_PRESET = "balanced"
+
+
+def resolve_preset(name: str | None) -> tuple[dict, bool]:
+    """Resolve a preset name → (config_overrides, agentic).
+
+    Unknown / missing names fall back to DEFAULT_PRESET. The returned config
+    dict is a fresh copy (safe for the caller to mutate / merge `spec` into)
+    and contains only valid PipelineConfig field names.
+    """
+    preset = PRESETS.get(name or DEFAULT_PRESET) or PRESETS[DEFAULT_PRESET]
+    return dict(preset.get("config", {})), bool(preset.get("agentic", False))
 
 _AGENTIC_GAP_SYSTEM = """You are a quality reviewer for an NVMe specification Q&A system.
 
@@ -664,7 +731,11 @@ def _run_stage5_and_finalize(
         # mode is iter 0 only (original behavior). When non-recursive, stage
         # names omit the `.iterN` suffix so existing trace consumers see no
         # diff.
+        # Gap-driven loop, but always bounded: by config when recursive, and by
+        # the absolute hard cap regardless — the loop can never run forever
+        # (the `converged` flag / `agentic.cap_reached` stage record why it ended).
         max_iters = max(1, config.agentic_max_iterations) if config.agentic_recursive else 1
+        max_iters = min(max_iters, _AGENTIC_HARD_CAP)
         # Pool accumulates across iterations so we never lose chunks already
         # retrieved (each rerank sees everything fetched so far).
         expanded_pool: list[dict] = list(deduplicated)
@@ -1085,11 +1156,17 @@ def orchestrate(
     # a known field) gets the exact structured path attempted, even when the
     # query was classified structural/relational/procedural. Gating on
     # type=="lookup" previously starved most acronym queries of structured hits.
+    #
+    # `fid`/`hex` value entities also drive structured lookup: they feed the
+    # value-keyed enumeration path (e.g. "opcode 0Dh", "status code 06h" → the
+    # matching Opcodes / Status Code table row). Without them in this gate, a
+    # pure-value question that extracts no field/figure entity would skip the
+    # structured path entirely and fall through to fuzzy hybrid retrieval.
     structured_chunks: list[dict] = []
 
     _lookup_entities = [
         e for e in (decomp.entities or [])
-        if getattr(e, "kind", None) in ("field", "figure")
+        if getattr(e, "kind", None) in ("field", "figure", "fid", "lid", "hex")
     ]
     if _lookup_entities:
         start = time.time()

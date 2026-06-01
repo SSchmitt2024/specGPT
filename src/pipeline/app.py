@@ -92,7 +92,7 @@ from src.pipeline.auth import (
     verify_session_token,
 )
 from src.pipeline.generator import DeepThoughtUnreachableError
-from src.pipeline.orchestrator import GenerationError, orchestrate, PipelineConfig
+from src.pipeline.orchestrator import GenerationError, orchestrate, PipelineConfig, PRESETS, DEFAULT_PRESET
 
 
 def _generation_error_detail(e: GenerationError, request_id: str, *, include_trace: bool) -> dict:
@@ -249,6 +249,7 @@ _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "y
 AVAILABLE_SPECS = [
     {"id": "base", "label": "Base Specification", "version": "2.3"},
     {"id": "pcie", "label": "PCIe Transport", "version": "1.3"},
+    {"id": "command", "label": "NVM Command Set", "version": "1.2"},
 ]
 _VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
 
@@ -801,6 +802,16 @@ async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_a
 async def config_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Return default PipelineConfig."""
     return PipelineConfig().to_dict()
+
+
+@app.get("/api/presets")
+async def presets_endpoint(_: bool = Depends(require_auth)) -> dict:
+    """Named config presets for the UI dropdown, plus the default selection.
+
+    Each preset bundles a subset of PipelineConfig overrides + the agentic
+    flag; the frontend applies the chosen preset to its config inputs.
+    """
+    return {"presets": PRESETS, "default": DEFAULT_PRESET}
 
 
 @app.get("/api/specs")
@@ -1519,7 +1530,7 @@ a { color: var(--accent); text-decoration: none; }
                                         <label><input type="checkbox" id="config-agentic_targeted_fetch" checked> Targeted Fetch</label>
                                     </div>
                                     <div class="config-item">
-                                        <label><input type="checkbox" id="config-agentic_recursive"> Recursive</label>
+                                        <label><input type="checkbox" id="config-agentic_recursive" checked> Recursive</label>
                                     </div>
                                     <div class="config-item">
                                         <label>Max Iterations</label>
@@ -1529,6 +1540,61 @@ a { color: var(--accent); text-decoration: none; }
                             </div>
                         </div>
                     </div>
+
+                    <label class="pill preset-pill" title="Speed vs. depth preset — applies a bundle of pipeline settings">
+                        <span style="font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--t-faint);font-weight:600;">Preset</span>
+                        <select id="preset-select" style="border:0;background:transparent;color:inherit;font:inherit;font-weight:500;outline:none;cursor:pointer;"></select>
+                    </label>
+                    <script>
+                    (function () {
+                        // Config presets (#3): a dropdown that applies a bundle of
+                        // pipeline settings to the existing config inputs. The server
+                        // (/api/presets) is the source of truth; this fallback keeps
+                        // the selector working if that fetch fails.
+                        var FALLBACK = {
+                            fast:     { label: "Fast",     agentic: false, config: { vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, final_rerank_topk: 5, auto_gap_check: false } },
+                            balanced: { label: "Balanced", agentic: false, config: {} },
+                            thorough: { label: "Thorough", agentic: true,  config: { vector_topk: 14, tsvector_topk: 14, bm25_topk: 14, final_rerank_topk: 10, agentic_recursive: true, agentic_targeted_fetch: true, agentic_max_iterations: 6 } }
+                        };
+                        var PRESETS = FALLBACK, DEFAULT = "balanced";
+                        function setInput(key, val) {
+                            var el = document.getElementById("config-" + key);
+                            if (!el) return;
+                            if (el.type === "checkbox") el.checked = !!val; else el.value = val;
+                            el.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                        function apply(name) {
+                            var p = PRESETS[name] || PRESETS[DEFAULT];
+                            if (!p) return;
+                            var cfg = p.config || {};
+                            for (var k in cfg) if (Object.prototype.hasOwnProperty.call(cfg, k)) setInput(k, cfg[k]);
+                            var tog = document.getElementById("agentic-toggle");
+                            if (tog && tog.checked !== !!p.agentic) {
+                                tog.checked = !!p.agentic;
+                                tog.dispatchEvent(new Event("change", { bubbles: true }));
+                            }
+                            try { localStorage.setItem("specgpt_preset", name); } catch (e) {}
+                        }
+                        function render(sel, cur) {
+                            sel.innerHTML = Object.keys(PRESETS).map(function (k) {
+                                return '<option value="' + k + '">' + (PRESETS[k].label || k) + "</option>";
+                            }).join("");
+                            sel.value = PRESETS[cur] ? cur : DEFAULT;
+                        }
+                        document.addEventListener("DOMContentLoaded", function () {
+                            var sel = document.getElementById("preset-select");
+                            if (!sel) return;
+                            var cur = "balanced";
+                            try { cur = localStorage.getItem("specgpt_preset") || "balanced"; } catch (e) {}
+                            render(sel, cur);
+                            apply(sel.value);
+                            sel.addEventListener("change", function () { apply(sel.value); });
+                            fetch("/api/presets").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+                                if (d && d.presets) { PRESETS = d.presets; DEFAULT = d.default || "balanced"; render(sel, sel.value); }
+                            }).catch(function () {});
+                        });
+                    })();
+                    </script>
 
                     <button id="agentic-pill" class="pill" type="button"
                             title="Toggle agentic refinement for the next query">
@@ -4087,12 +4153,7 @@ a { color: var(--accent); text-decoration: none; }
 
         /* ── empty-state examples ────────────────────────────────────────── */
         (function () {
-            var EXAMPLES = [
-                "Which command's Dword tells you whether a feature is saveable?",
-                "Which bit in OACS indicates whether directives are supported?",
-                "How do you unfreeze a personality using PCAS?",
-                "Which feature corresponds to FID 17h?"
-            ];
+            var EXAMPLES = [];
             var box = document.getElementById("examples");
             if (!box) return;
             box.innerHTML = EXAMPLES.map(function (ex) {

@@ -84,7 +84,10 @@ RULES:
    facts under a single tag instead of repeating it.
 4. For bit/field definitions, include the exact offset and size if available.
 5. If the context does not contain the answer, explicitly state what information is missing.
-6. Never speculate, infer beyond the spec, or hallucinate details. Only tag sections that actually appear in the provided context.
+6. Never speculate, infer beyond the spec, or hallucinate details. Only tag a
+   section number that appears verbatim in a [Section ...] header above — copy
+   the id exactly. Never cite a section you did not receive; if the supporting
+   section isn't in the context, state the gap in prose instead of inventing a tag.
 7. If multiple sections address the question, synthesize them clearly and tag all relevant sections.
 8. Keep answers concise but complete.
 9. FORMATTING: respond in GitHub-flavored markdown. Use:
@@ -258,9 +261,14 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     The older inline-prose form ("per Section 5.2.1") is still recognised so
     off-format or legacy answers continue to populate the sidebar.
 
-    Citations are matched against context_chunks to find source sections;
-    citations that don't appear in the supplied context are flagged with
-    ``hallucinated=True`` so callers can surface or filter them.
+    Citations are matched against context_chunks to find source sections.
+    Matching is hierarchy-aware: a cited sub-section (``5.2.1.3``) resolves to
+    its nearest parent in context (``5.2.1``), and a cited parent (``5.2``)
+    resolves to the most specific descendant in context (``5.2.1``). This
+    avoids spuriously flagging a citation as ``hallucinated`` just because the
+    model cited at a slightly different granularity than the chunk header.
+    Only ids with no exact / parent / child match in the supplied context are
+    flagged with ``hallucinated=True`` so callers can surface or filter them.
     """
     citations: list[dict] = []
     seen_sections: set = set()
@@ -301,17 +309,48 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     for sm in section_pattern.finditer(answer):
         ordered_ids.append(sm.group(1).rstrip("."))
 
-    chunk_sections = {c.get("section_id"): c for c in context_chunks}
+    chunk_sections = {c.get("section_id"): c for c in context_chunks if c.get("section_id")}
+    context_ids = list(chunk_sections.keys())
+
+    def _resolve(cited: str) -> tuple[dict | None, str]:
+        """Map a cited id to a context chunk via exact → parent → child match.
+
+        Returns (chunk, resolved_id). The resolved id is the *context*
+        section the citation actually points at, so two near-miss citations
+        that land on the same section (e.g. ``5.2`` and ``5.2.1.3`` when only
+        ``5.2.1`` is present) dedupe to a single chip.
+        """
+        # Exact.
+        if cited in chunk_sections:
+            return chunk_sections[cited], cited
+        # Parent: walk up the cited id's dotted prefixes (5.2.1.3 → 5.2.1 → 5.2).
+        parts = cited.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            parent = ".".join(parts[:i])
+            if parent in chunk_sections:
+                return chunk_sections[parent], parent
+        # Child: the model cited a parent but only a descendant is in context.
+        # Prefer the shallowest, then lexicographically smallest, descendant.
+        children = sorted(
+            (cid for cid in context_ids if cid.startswith(cited + ".")),
+            key=lambda s: (s.count("."), s),
+        )
+        if children:
+            return chunk_sections[children[0]], children[0]
+        return None, cited
 
     for section_id in ordered_ids:
-        if not section_id or section_id in seen_sections:
+        if not section_id:
             continue
-        seen_sections.add(section_id)
+        chunk, resolved_id = _resolve(section_id)
+        key = resolved_id if chunk is not None else section_id
+        if key in seen_sections:
+            continue
+        seen_sections.add(key)
 
-        chunk = chunk_sections.get(section_id)
         if chunk is not None:
             citations.append({
-                "section_id": section_id,
+                "section_id": resolved_id,
                 "section_title": chunk.get("section_title", ""),
                 "content_type": chunk.get("content_type", "prose"),
                 # Provenance: which spec/document + page this citation came from,
