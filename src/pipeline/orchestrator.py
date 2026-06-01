@@ -82,6 +82,16 @@ class PipelineConfig:
     final_rerank_topk: int = 7
     cross_encoder_model: str = "rerank-2-lite"
 
+    # Structured-lookup fuzzy fallback — runs *after* the exact lookup tables.
+    # When an acronym query finds no exact field record, the query's descriptive
+    # wording is fuzzy-matched against field *full names* (>= 2 words) via
+    # difflib. Acronyms themselves are ALWAYS matched exactly; this never fuzzes
+    # acronym→acronym, so e.g. CRATT can never resolve to CRAT. Specific-then-
+    # wide: it only fires when the exact path returned no field. Disable with
+    # enable_fuzzy_lookup=False; raise fuzzy_lookup_cutoff toward 1.0 to tighten.
+    enable_fuzzy_lookup: bool = True
+    fuzzy_lookup_cutoff: float = 0.86
+
     # Query decomposition parameters
     max_subqueries: int = 3
 
@@ -1175,6 +1185,8 @@ def orchestrate(
             use_llm=False,  # already did LLM in query_processor
             max_fields=8,
             spec=config.spec,
+            enable_fuzzy=config.enable_fuzzy_lookup,
+            fuzzy_cutoff=config.fuzzy_lookup_cutoff,
         )
         took_struct = time.time() - start
 
