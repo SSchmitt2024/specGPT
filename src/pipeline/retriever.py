@@ -547,11 +547,24 @@ def _hex_value(token: str) -> int | None:
     return None
 
 
-# A bare enumeration value embedded in an entity's text, e.g. the "2" in
-# "FID 2", the "0Dh" in "opcode 0Dh". Always hex (see _hex_value). The leading-
-# digit / 0x / trailing-h shape mirrors query_processor._ENUM_VALUE so any value
-# the extractor accepted is parseable back out here, whichever keyword carried it.
-_RE_EMBEDDED_VALUE = re.compile(r"0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]+h|\d[0-9A-Fa-f]*")
+# Re-derive the value from an already-extracted enum entity by consuming its
+# keyword and capturing the value that follows. One pattern per kind, mirroring
+# the extractor in query_processor. We anchor on the keyword (rather than just
+# grabbing the trailing hex run) for two reasons:
+#   * a keyword whose final letter is itself a hex digit must not bleed into a
+#     no-space value — "FID2" is FID 2, never "D2" (0xD2); and
+#   * the value can lead with a hex letter ("FID c0", "LID ff"), so it can't be
+#     required to start with a digit / 0x / trailing-h.
+# Once the keyword has pinned the entity the value is parsed permissively and
+# always as hex (see _hex_value): "2" == "02" == "2h" == "0x2" == 0x02.
+_VALUE = r"((?:0[xX])?[0-9A-Fa-f]+h?)"
+_EMBEDDED_VALUE_RE: dict[str, "re.Pattern[str]"] = {
+    "fid":    re.compile(rf"(?:FID|Feature\s+Identifier)\s*[:=]?\s*{_VALUE}", re.I),
+    "lid":    re.compile(rf"(?:LID|Log\s+Page\s+Identifier)\s*[:=]?\s*{_VALUE}", re.I),
+    "opcode": re.compile(rf"(?:opcode|op\s*code)\s*[:=]?\s*{_VALUE}", re.I),
+    "cns":    re.compile(rf"CNS(?:\s+values?)?\s*[:=]?\s*{_VALUE}", re.I),
+    "status": re.compile(rf"status(?:\s+(?:code|value)s?)?\s*[:=]?\s*{_VALUE}", re.I),
+}
 
 
 def _value_tokens(entities: list[Entity | dict]) -> set[int]:
@@ -559,7 +572,8 @@ def _value_tokens(entities: list[Entity | dict]) -> set[int]:
     `opcode`/`cns`/`status`/`hex`).
 
     Always hex: "FID 17h", "FID 17", "LID 22", "opcode 2", and "0x17" all parse
-    to their hexadecimal value (FID 22 → 0x22 → 34), never decimal.
+    to their hexadecimal value (FID 22 → 0x22 → 34), never decimal. Independent
+    of spelling: "FID c0" / "FID 0xc0" / "FID c0h" all resolve to 0xC0.
     """
     vals: set[int] = set()
     for raw in entities:
@@ -567,12 +581,12 @@ def _value_tokens(entities: list[Entity | dict]) -> set[int]:
         kind = ent["kind"]
         if kind == "hex":
             v = _hex_value(ent["text"])
-        elif kind in ("fid", "lid", "opcode", "cns", "status"):
-            # The value is the last hex-shaped token in the entity text (the
-            # keyword itself — FID / LID / opcode / CNS / status — never matches
-            # the leading-digit/0x/trailing-h shape, so the value is unambiguous).
-            tokens = _RE_EMBEDDED_VALUE.findall(ent["text"])
-            v = _hex_value(tokens[-1]) if tokens else None
+        elif kind in _EMBEDDED_VALUE_RE:
+            m = _EMBEDDED_VALUE_RE[kind].search(ent["text"])
+            # Keyword-anchored capture covers the normal "FID c0" / "opcode 0Dh"
+            # entities; the fallback parses a bare value should an entity ever
+            # arrive without its keyword (e.g. constructed directly).
+            v = _hex_value(m.group(1)) if m else _hex_value(ent["text"])
         else:
             continue
         if v is not None:

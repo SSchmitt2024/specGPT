@@ -475,6 +475,30 @@ def test_value_tokens_single_digit_fid_is_hex():
     assert _value_tokens([{"text": "FID 2h", "kind": "fid"}]) == {0x02}
 
 
+def test_value_tokens_letter_leading_fid_lid_resolve_by_hex():
+    """A FID/LID whose value leads with a hex letter (a-f), e.g. the vendor-
+    specific 0xC0 range or 0x0B, must resolve regardless of spelling — not be
+    dropped or truncated to a digit suffix."""
+    from src.pipeline.retriever import _value_tokens
+    for text, value in [
+        ("FID b", 0x0B), ("FID 0b", 0x0B), ("FID 0Bh", 0x0B),
+        ("FID c0", 0xC0), ("FID C0", 0xC0), ("FID c0h", 0xC0), ("FID 0xc0", 0xC0),
+        ("FID ff", 0xFF),
+    ]:
+        assert _value_tokens([{"text": text, "kind": "fid"}]) == {value}, text
+    for text, value in [("LID a", 0x0A), ("LID d0", 0xD0), ("LID 0xd0", 0xD0)]:
+        assert _value_tokens([{"text": text, "kind": "lid"}]) == {value}, text
+
+
+def test_value_tokens_no_space_keyword_does_not_bleed_into_value():
+    """A keyword whose final letter is a hex digit (FID→D, LID→D) must not merge
+    into a no-space value: "FID2" is 0x02, never "D2" (0xD2)."""
+    from src.pipeline.retriever import _value_tokens
+    assert _value_tokens([{"text": "FID2", "kind": "fid"}]) == {0x02}
+    assert _value_tokens([{"text": "FIDc0", "kind": "fid"}]) == {0xC0}
+    assert _value_tokens([{"text": "LIDd", "kind": "lid"}]) == {0x0D}
+
+
 def test_opcode_cns_status_bare_values_extracted_as_hex():
     """opcode / CNS / status code values must resolve from a bare number, not
     only the 0x-prefixed or ..h spellings the generic hex pattern caught."""
