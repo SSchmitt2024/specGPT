@@ -507,16 +507,16 @@ def _confidence(field_count: int, table_count: int, bit_ranges: list[tuple[int, 
 # (src.enum_tables); the caption regex drives the live-scan fallback. Keep the
 # caption patterns in sync with src.enum_tables.CONCEPTS.
 _ENUM_CONCEPT_DEFS: list[tuple[str, set[str], "re.Pattern[str]", "re.Pattern[str]"]] = [
-    ("fid",    {"fid"}, re.compile(r"\bfeature(?:s)?\b|\bFID\b", re.I),
-                        re.compile(r"feature identifiers", re.I)),
-    ("opcode", set(),   re.compile(r"\bopcodes?\b|\bcommand\b", re.I),
-                        re.compile(r"opcodes for", re.I)),
-    ("lid",    {"lid"}, re.compile(r"\blog\s+page\b|\blog\s+identifier|\bLID\b", re.I),
-                        re.compile(r"log page identifiers", re.I)),
-    ("cns",    set(),   re.compile(r"\bCNS\b", re.I),
-                        re.compile(r"CNS values", re.I)),
-    ("status", set(),   re.compile(r"\bstatus\s+(?:code|value)", re.I),
-                        re.compile(r"status code", re.I)),
+    ("fid",    {"fid"},    re.compile(r"\bfeature(?:s)?\b|\bFID\b", re.I),
+                           re.compile(r"feature identifiers", re.I)),
+    ("opcode", {"opcode"}, re.compile(r"\bopcodes?\b|\bcommand\b", re.I),
+                           re.compile(r"opcodes for", re.I)),
+    ("lid",    {"lid"},    re.compile(r"\blog\s+page\b|\blog\s+identifier|\bLID\b", re.I),
+                           re.compile(r"log page identifiers", re.I)),
+    ("cns",    {"cns"},    re.compile(r"\bCNS\b", re.I),
+                           re.compile(r"CNS values", re.I)),
+    ("status", {"status"}, re.compile(r"\bstatus\s+(?:code|value)", re.I),
+                           re.compile(r"status code", re.I)),
 ]
 
 # Scan-path view: (trigger_kinds, kw_re, caption_re) — unchanged shape.
@@ -547,29 +547,32 @@ def _hex_value(token: str) -> int | None:
     return None
 
 
-def _value_tokens(entities: list[Entity | dict]) -> set[int]:
-    """Integer values requested by `fid` / `lid` / `hex` entities.
+# A bare enumeration value embedded in an entity's text, e.g. the "2" in
+# "FID 2", the "0Dh" in "opcode 0Dh". Always hex (see _hex_value). The leading-
+# digit / 0x / trailing-h shape mirrors query_processor._ENUM_VALUE so any value
+# the extractor accepted is parseable back out here, whichever keyword carried it.
+_RE_EMBEDDED_VALUE = re.compile(r"0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]+h|\d[0-9A-Fa-f]*")
 
-    Always hex: "FID 17h", "FID 17", "LID 22", and "0x17" all parse to their
-    hexadecimal value (FID 22 → 0x22 → 34), never decimal.
+
+def _value_tokens(entities: list[Entity | dict]) -> set[int]:
+    """Integer values requested by value-keyed enum entities (`fid`/`lid`/
+    `opcode`/`cns`/`status`/`hex`).
+
+    Always hex: "FID 17h", "FID 17", "LID 22", "opcode 2", and "0x17" all parse
+    to their hexadecimal value (FID 22 → 0x22 → 34), never decimal.
     """
     vals: set[int] = set()
     for raw in entities:
         ent = _entity_to_dict(raw)
-        if ent["kind"] == "fid":
-            m = re.search(
-                r"(?:FID|Feature\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)",
-                ent["text"], re.I,
-            )
-            v = _hex_value(m.group(1)) if m else None
-        elif ent["kind"] == "lid":
-            m = re.search(
-                r"(?:LID|Log\s+Page\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)",
-                ent["text"], re.I,
-            )
-            v = _hex_value(m.group(1)) if m else None
-        elif ent["kind"] == "hex":
+        kind = ent["kind"]
+        if kind == "hex":
             v = _hex_value(ent["text"])
+        elif kind in ("fid", "lid", "opcode", "cns", "status"):
+            # The value is the last hex-shaped token in the entity text (the
+            # keyword itself — FID / LID / opcode / CNS / status — never matches
+            # the leading-digit/0x/trailing-h shape, so the value is unambiguous).
+            tokens = _RE_EMBEDDED_VALUE.findall(ent["text"])
+            v = _hex_value(tokens[-1]) if tokens else None
         else:
             continue
         if v is not None:

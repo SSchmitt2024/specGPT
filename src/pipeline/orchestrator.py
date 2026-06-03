@@ -1167,16 +1167,19 @@ def orchestrate(
     # query was classified structural/relational/procedural. Gating on
     # type=="lookup" previously starved most acronym queries of structured hits.
     #
-    # `fid`/`hex` value entities also drive structured lookup: they feed the
-    # value-keyed enumeration path (e.g. "opcode 0Dh", "status code 06h" → the
-    # matching Opcodes / Status Code table row). Without them in this gate, a
-    # pure-value question that extracts no field/figure entity would skip the
-    # structured path entirely and fall through to fuzzy hybrid retrieval.
+    # Value-keyed enum entities (`fid`/`lid`/`opcode`/`cns`/`status`/`hex`) also
+    # drive structured lookup: they feed the value-keyed enumeration path (e.g.
+    # "opcode 2", "status code 06h" → the matching Opcodes / Status Code table
+    # row). The value is always interpreted as hex regardless of how it is typed
+    # ("opcode 2" == "opcode 02" == "opcode 2h" == "0x2"). Without these kinds in
+    # the gate, a pure-value question that extracts no field/figure entity would
+    # skip the structured path entirely and fall through to fuzzy hybrid retrieval.
     structured_chunks: list[dict] = []
 
     _lookup_entities = [
         e for e in (decomp.entities or [])
-        if getattr(e, "kind", None) in ("field", "figure", "fid", "lid", "hex")
+        if getattr(e, "kind", None)
+        in ("field", "figure", "fid", "lid", "opcode", "cns", "status", "hex")
     ]
     if _lookup_entities:
         start = time.time()
