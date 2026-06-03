@@ -576,6 +576,63 @@ def test_rerank_empty_results_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# Structured-lookup pinning survives reranking (regression: "what feature is
+# fid 2" → Power Management got dropped at the top_k cut)
+
+def test_pin_structured_hits_keeps_low_scoring_structured_hit():
+    from src.pipeline.orchestrator import _pin_structured_hits
+    # Pre-rerank pool: one authoritative structured hit + three hybrid hits.
+    pre = [
+        {"chunk_id": "enum:fid:02h:Power_Management", "method": "structured_lookup"},
+        {"chunk_id": "fig266", "method": "rrf"},
+        {"chunk_id": "fig267", "method": "rrf"},
+        {"chunk_id": "fig401", "method": "rrf"},
+    ]
+    # Reranker scored the structured hit LOWEST and ordered it last.
+    ranked = [
+        {"chunk_id": "fig266", "prior_method": "rrf", "rerank_score": 0.62},
+        {"chunk_id": "fig267", "prior_method": "rrf", "rerank_score": 0.60},
+        {"chunk_id": "fig401", "prior_method": "rrf", "rerank_score": 0.55},
+        {"chunk_id": "enum:fid:02h:Power_Management",
+         "prior_method": "structured_lookup", "rerank_score": 0.10},
+    ]
+    out = _pin_structured_hits(ranked, pre, budget=2)
+    # Structured hit is pinned first and never truncated, even with budget=2.
+    assert out[0]["chunk_id"] == "enum:fid:02h:Power_Management"
+    assert len(out) == 2  # pinned + top-1 semantic
+    assert out[1]["chunk_id"] == "fig266"
+
+
+def test_pin_structured_hits_preserves_structured_order():
+    from src.pipeline.orchestrator import _pin_structured_hits
+    pre = [
+        {"chunk_id": "s1", "method": "structured_lookup"},
+        {"chunk_id": "s2", "method": "structured_lookup"},
+        {"chunk_id": "h1", "method": "rrf"},
+    ]
+    # Reranker shuffled the two structured hits (s2 above s1).
+    ranked = [
+        {"chunk_id": "h1", "prior_method": "rrf", "rerank_score": 0.9},
+        {"chunk_id": "s2", "prior_method": "structured_lookup", "rerank_score": 0.4},
+        {"chunk_id": "s1", "prior_method": "structured_lookup", "rerank_score": 0.2},
+    ]
+    out = _pin_structured_hits(ranked, pre, budget=5)
+    # Original structured order (s1 before s2) is restored ahead of hybrid.
+    assert [c["chunk_id"] for c in out] == ["s1", "s2", "h1"]
+
+
+def test_pin_structured_hits_noop_without_structured():
+    from src.pipeline.orchestrator import _pin_structured_hits
+    pre = [{"chunk_id": "h1", "method": "rrf"}, {"chunk_id": "h2", "method": "rrf"}]
+    ranked = [
+        {"chunk_id": "h1", "prior_method": "rrf", "rerank_score": 0.9},
+        {"chunk_id": "h2", "prior_method": "rrf", "rerank_score": 0.5},
+    ]
+    out = _pin_structured_hits(ranked, pre, budget=1)
+    assert [c["chunk_id"] for c in out] == ["h1"]
+
+
+# ---------------------------------------------------------------------------
 # search guards
 
 def test_is_empty_query_catches_punctuation_and_whitespace():

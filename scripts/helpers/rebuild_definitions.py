@@ -10,7 +10,7 @@ Format` (§1.6.5) were silently missing. The fix lives in
 re-applies that builder against the prose JSON we already have on disk.
 
 Usage:
-    python scripts/scrip_helpers/rebuild_definitions.py
+    python scripts/helpers/rebuild_definitions.py
 """
 
 from __future__ import annotations

@@ -201,6 +201,43 @@ def _entity_list_to_dict(entities: list) -> list[dict]:
     ]
 
 
+def _pin_structured_hits(
+    ranked: list[dict],
+    pre_rerank_pool: list[dict],
+    *,
+    budget: int,
+) -> list[dict]:
+    """Pin structured-lookup hits ahead of the semantic ranking.
+
+    Structured lookup is deterministic and authoritative — e.g. "FID 2" →
+    "Feature Identifier 02h — Power Management". The cross-encoder reranker,
+    however, scores every chunk purely on how well its body resembles the
+    query wording, so a terse value query ("what feature is fid 2") scores the
+    matched section LOW and the exact answer gets truncated away at the top_k
+    cut. Generation then hallucinates "the context does not contain ...".
+
+    This keeps every structured hit (identified by ``prior_method``), placed
+    first in their original pre-rerank order (structured_lookup already ranks
+    its own fields/tables by relevance), then fills the remaining budget with
+    the top semantic hits. Pinned hits are never truncated, and the budget is
+    floored at ``budget`` so pinning never shrinks the context below the
+    configured size.
+    """
+    def _key(c: dict):
+        return c.get("chunk_id") or c.get("id")
+
+    order = {
+        _key(c): i
+        for i, c in enumerate(pre_rerank_pool)
+        if c.get("method") == "structured_lookup"
+    }
+    pinned = [c for c in ranked if c.get("prior_method") == "structured_lookup"]
+    pinned.sort(key=lambda c: order.get(_key(c), 1_000_000))
+    rest = [c for c in ranked if c.get("prior_method") != "structured_lookup"]
+    budget = max(budget, len(pinned))
+    return (pinned + rest)[:budget]
+
+
 def _result_summary(results: list[dict], limit: int = 5) -> list[dict]:
     """Summarize results for tracing (full text_raw for display, not in trace)."""
     return [
@@ -902,11 +939,14 @@ def _run_stage5_and_finalize(
             took_merge = time.time() - start
 
             start = time.time()
-            reranked2 = reranker.rerank(
+            ranked2 = reranker.rerank(
                 query, expanded_pool,
-                top_k=config.agentic_rerank_topk,
+                top_k=None,  # budget applied after pinning structured hits
                 model_name=config.cross_encoder_model,
                 text_field="text_raw",
+            )
+            reranked2 = _pin_structured_hits(
+                ranked2, expanded_pool, budget=config.agentic_rerank_topk
             )
             took_rr2 = time.time() - start
             trace.append(
@@ -917,6 +957,10 @@ def _run_stage5_and_finalize(
                            "added_by_followups": len(extra_chunks)},
                     output={"results": _result_summary(reranked2),
                             "count": len(reranked2),
+                            "pinned_structured": sum(
+                                1 for c in reranked2
+                                if c.get("prior_method") == "structured_lookup"
+                            ),
                             "merge_ms": took_merge * 1000},
                     took_ms=took_rr2 * 1000,
                 )
@@ -1312,13 +1356,19 @@ def orchestrate(
     # Stage 3: Rerank merged results (cross-encoder on combined pool)
     # -------------------------------------------------------------------------
     start = time.time()
-    retrieved_chunks = reranker.rerank(
+    # Score the whole pool (top_k=None), then apply the budget AFTER pinning so
+    # authoritative structured-lookup hits can't be dropped by the cross-encoder.
+    ranked = reranker.rerank(
         query,
         deduplicated,
-        top_k=config.final_rerank_topk,
+        top_k=None,
         model_name=config.cross_encoder_model,
         text_field="text_raw",
     )
+    retrieved_chunks = _pin_structured_hits(
+        ranked, deduplicated, budget=config.final_rerank_topk
+    )
+    pinned_count = sum(1 for c in retrieved_chunks if c.get("prior_method") == "structured_lookup")
     took_rerank = time.time() - start
 
     trace.append(
@@ -1328,6 +1378,7 @@ def orchestrate(
             output={
                 "results": _result_summary(retrieved_chunks),
                 "count": len(retrieved_chunks),
+                "pinned_structured": pinned_count,
             },
             took_ms=took_rerank * 1000,
         )

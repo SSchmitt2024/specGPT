@@ -11,7 +11,7 @@ New TOC sections are added as stubs (empty summary/keywords) so a later
 LLM run can fill them.
 
 Usage:
-    python scripts/scrip_helpers/refresh_cards_structural.py
+    python scripts/helpers/refresh_cards_structural.py
 """
 
 from __future__ import annotations
