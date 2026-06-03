@@ -454,6 +454,76 @@ def test_value_tokens_parses_lid_entity_as_hex():
     assert _value_tokens([{"text": "LID 22h", "kind": "lid"}]) == {0x22}
 
 
+# --- value-keyed lookup must depend on the hex value, not how it is typed -----
+# Regression for: "FID 2" / "opcode 2" / "status code 6" silently failing while
+# the "0x.." / "..h" / leading-zero spellings worked. Every form of a value must
+# resolve to the same hexadecimal magnitude across all enum concepts.
+
+def test_fid_extracted_for_every_value_spelling():
+    from src.pipeline.query_processor import extract_entities
+    for q in ["what is FID 2", "what is FID 02", "what is FID 2h", "what is FID 0x2"]:
+        kinds = {e.kind for e in extract_entities(q)}
+        assert "fid" in kinds, q
+
+
+def test_value_tokens_single_digit_fid_is_hex():
+    from src.pipeline.retriever import _value_tokens
+    # "FID 2", "FID 02", "FID 2h" must all be the same value (0x02) — not decimal,
+    # not dependent on padding or the trailing 'h'.
+    assert _value_tokens([{"text": "FID 2", "kind": "fid"}]) == {0x02}
+    assert _value_tokens([{"text": "FID 02", "kind": "fid"}]) == {0x02}
+    assert _value_tokens([{"text": "FID 2h", "kind": "fid"}]) == {0x02}
+
+
+def test_opcode_cns_status_bare_values_extracted_as_hex():
+    """opcode / CNS / status code values must resolve from a bare number, not
+    only the 0x-prefixed or ..h spellings the generic hex pattern caught."""
+    from src.pipeline.query_processor import extract_entities
+    from src.pipeline.retriever import _value_tokens
+    cases = [
+        ("what is opcode 2", "opcode", 0x02),
+        ("what is opcode 02", "opcode", 0x02),
+        ("what is opcode 2h", "opcode", 0x02),
+        ("what command is opcode 0Dh", "opcode", 0x0D),
+        ("what is CNS 1", "cns", 0x01),
+        ("what is status code 6", "status", 0x06),
+        ("what is status 6", "status", 0x06),
+    ]
+    for query, kind, value in cases:
+        ents = [{"text": e.text, "kind": e.kind} for e in extract_entities(query)]
+        assert any(e["kind"] == kind for e in ents), query
+        assert _value_tokens(ents) == {value}, query
+
+
+def test_enum_concept_keywords_do_not_false_match_english():
+    """The opcode/CNS/status keywords are ordinary words; a value entity must
+    not be invented when no actual value follows them."""
+    from src.pipeline.query_processor import extract_entities
+    from src.pipeline.retriever import _value_tokens
+    for q in ["status of the controller", "opcode for the read command",
+              "what does the status field mean"]:
+        ents = [{"text": e.text, "kind": e.kind} for e in extract_entities(q)]
+        assert _value_tokens(ents) == set(), q
+
+
+def test_enum_index_hits_opcode_bare_value_resolves():
+    from src.enum_tables import build_enum_index
+    from src.pipeline.retriever import _enum_index_hits
+    from src.pipeline.query_processor import extract_entities
+    tables = [{
+        "figure_number": 140,
+        "caption": "Opcodes for Admin Commands",
+        "rows": [["02h", "Get Log Page", "5.x"], ["09h", "Set Features", "5.y"]],
+    }]
+    index = build_enum_index(tables)
+    for query in ["what is opcode 2", "what is opcode 02", "what is opcode 2h"]:
+        ents = [{"text": e.text, "kind": e.kind} for e in extract_entities(query)]
+        hits = _enum_index_hits(ents, query, index)
+        names = {h["name"] for h in hits if h["concept"] == "opcode"}
+        assert "Get Log Page" in names, query
+        assert all(h["value"] == 0x02 for h in hits if h["concept"] == "opcode"), query
+
+
 def test_enum_hit_to_source_is_self_contained():
     from src.pipeline.retriever import _enum_hit_to_source
     hit = {"concept": "fid", "label": "Feature Identifier", "value": 0x22,

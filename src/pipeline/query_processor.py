@@ -6,7 +6,7 @@ Takes a raw user question and produces:
     {
       "query":      "<original>",
       "type":       "lookup" | "structural" | "relational" | "procedural",
-      "entities":   [{"text": "...", "kind": "field"|"figure"|"hex"|"fid"|"lid"|"cdw"|"section"}],
+      "entities":   [{"text": "...", "kind": "field"|"figure"|"hex"|"fid"|"lid"|"opcode"|"cns"|"status"|"cdw"|"section"}],
       "sub_queries":["...", "..."],     # 1–3 focused queries to feed retrieval
       "rationale":  "<one short sentence from the LLM>"
     }
@@ -69,7 +69,7 @@ VALID_TYPES = ("lookup", "structural", "relational", "procedural")
 @dataclass
 class Entity:
     text: str
-    kind: str  # "field" | "figure" | "hex" | "fid" | "lid" | "cdw" | "section"
+    kind: str  # "field" | "figure" | "hex" | "fid" | "lid" | "opcode" | "cns" | "status" | "cdw" | "section"
 
 
 @dataclass
@@ -114,6 +114,29 @@ _RE_FID = re.compile(
 _RE_LID = re.compile(
     r"\b(?:LID|Log\s+Page\s+Identifier)\s*[:=]?\s*((?:0[xX])?[0-9A-Fa-f]+h?)\b",
     re.IGNORECASE,
+)
+
+# An enumeration value as written in a query, always interpreted as hex: "0x1A",
+# "1Ah", "02", "2". Unlike the FID/LID patterns (which always follow their own
+# unambiguous keyword), the opcode/CNS/status keywords below are also ordinary
+# English words, so this pattern requires a 0x prefix, a trailing h, OR at least
+# one digit — that way "status be ..." / "opcode for ..." can't be misread as a
+# value while every numeric form the user might type ("2", "02", "2h", "0x2",
+# "0Dh") still resolves by its hexadecimal value.
+_ENUM_VALUE = r"(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]+h|\d[0-9A-Fa-f]*)"
+
+# Command Opcode: "opcode 08h", "opcode 0x8", "opcode 2", "command opcode 0Dh".
+# CNS Value: "CNS 02h", "CNS 2", "CNS value 0x1". Status Code: "status code 06h",
+# "status 2", "status value 0x6". All always-hex, mirroring FID/LID above so a
+# bare "2" resolves to 0x02 regardless of how it is typed.
+_RE_OPCODE = re.compile(
+    rf"\b(?:opcode|op\s*code)\s*[:=]?\s*({_ENUM_VALUE})\b", re.IGNORECASE,
+)
+_RE_CNS = re.compile(
+    rf"\bCNS(?:\s+values?)?\s*[:=]?\s*({_ENUM_VALUE})\b", re.IGNORECASE,
+)
+_RE_STATUS = re.compile(
+    rf"\bstatus(?:\s+(?:code|value)s?)?\s*[:=]?\s*({_ENUM_VALUE})\b", re.IGNORECASE,
 )
 
 # Command Dword: CDW10, CDW0[7:4], CDW 10.
@@ -183,6 +206,19 @@ def extract_entities(query: str) -> list[Entity]:
 
     for m in _RE_LID.finditer(query):
         found.append(Entity(text=m.group(0), kind="lid"))
+
+    # Other value-keyed enumerations (opcode / CNS / status). Like FID/LID, the
+    # value is always hex; extracting them here (before the generic _RE_HEX pass)
+    # means a bare "opcode 2" / "status code 6" resolves by value, not only the
+    # "0x.." / "..h" spellings the generic hex pattern happens to catch.
+    for m in _RE_OPCODE.finditer(query):
+        found.append(Entity(text=m.group(0), kind="opcode"))
+
+    for m in _RE_CNS.finditer(query):
+        found.append(Entity(text=m.group(0), kind="cns"))
+
+    for m in _RE_STATUS.finditer(query):
+        found.append(Entity(text=m.group(0), kind="status"))
 
     for m in _RE_CDW.finditer(query):
         found.append(Entity(text=m.group(0), kind="cdw"))
