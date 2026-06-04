@@ -201,3 +201,46 @@ CREATE TABLE IF NOT EXISTS spec_enum_index (
 );
 CREATE INDEX IF NOT EXISTS spec_enum_index_lookup
     ON spec_enum_index (spec, concept, "value");
+
+-- ── Flagged answers (user-reported answer quality issues) ───────────────────
+-- One row per flag: snapshots the full QueryResponse the user was looking at
+-- (query, answer, config, pipeline_trace, citations, timing/tokens) plus an
+-- optional free-text reason, so a reviewer can reproduce and triage the issue.
+CREATE TABLE IF NOT EXISTS flagged_answers (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+
+    -- What the user asked and what we answered
+    query         text  NOT NULL,
+    answer        text  NOT NULL,
+
+    -- Full reproduction context
+    config         jsonb NOT NULL,          -- PipelineConfig as sent/used
+    pipeline_trace jsonb,                    -- the "critical steps" (stage list)
+    citations      jsonb,                    -- sources shown to the user
+    spec           text,                     -- convenience: config->>'spec'
+    llm_model      text,                     -- convenience: config->>'llm_model'
+    agentic        boolean NOT NULL DEFAULT false,
+
+    -- Timing / cost
+    latency_ms     double precision,
+    tokens_used    jsonb,
+
+    -- User-supplied
+    reason         text,                     -- optional free-text explanation
+
+    -- Triage workflow
+    status         text NOT NULL DEFAULT 'open',   -- open | reviewing | resolved | wontfix
+    flagged_by     text                            -- session id / email if available
+);
+
+CREATE INDEX IF NOT EXISTS flagged_answers_created_idx ON flagged_answers (created_at DESC);
+CREATE INDEX IF NOT EXISTS flagged_answers_status_idx  ON flagged_answers (status);
+
+-- ── Dev notes (free-form scratchpad shown in the in-app dev panel) ──────────
+CREATE TABLE IF NOT EXISTS dev_notes (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    body       text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dev_notes_created_idx ON dev_notes (created_at DESC);
