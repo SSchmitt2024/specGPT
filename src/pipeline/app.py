@@ -189,6 +189,29 @@ class QueryResponse(BaseModel):
     request_id: str | None = None
 
 
+class FlagAnswerRequest(BaseModel):
+    """Request body for /api/flag-answer.
+
+    A snapshot of the last QueryResponse the user was viewing plus an optional
+    free-text reason. Nothing is re-run server-side; the UI just POSTs what it
+    already holds so a reviewer can reproduce and triage the flagged answer.
+    """
+    query: str
+    answer: str
+    config: dict
+    pipeline_trace: list[dict] | None = None
+    citations: list[dict] | None = None
+    latency_ms: float | None = None
+    tokens_used: dict | None = None
+    agentic: bool = False
+    reason: str | None = None          # optional user explanation
+
+
+class DevNoteRequest(BaseModel):
+    """Request body for POST /api/dev-notes (free-form dev scratchpad)."""
+    body: str
+
+
 class RefineRequest(BaseModel):
     """Request body for /api/refine - resumes the prior /api/query call by
     request_id, runs only Stage 5 (gap analysis + targeted fetch + follow-up
@@ -856,6 +879,140 @@ async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
     }
 
 
+@app.post("/api/flag-answer")
+async def flag_answer_endpoint(
+    req: FlagAnswerRequest,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Persist a user-reported answer-quality flag.
+
+    Writes one row to flagged_answers snapshotting the response the user was
+    viewing plus an optional reason. Fire-and-forget from the UI's view: a DB
+    error returns 502 so the modal can surface it, but normal Q&A is unaffected.
+    """
+    from src.pipeline.search import supabase_client
+
+    config = req.config or {}
+    row = {
+        "query": req.query,
+        "answer": req.answer,
+        "config": config,
+        "pipeline_trace": req.pipeline_trace,
+        "citations": req.citations,
+        "spec": config.get("spec"),
+        "llm_model": config.get("llm_model"),
+        "agentic": req.agentic,
+        "latency_ms": req.latency_ms,
+        "tokens_used": req.tokens_used,
+        "reason": (req.reason or "").strip() or None,
+    }
+    try:
+        supabase_client().table("flagged_answers").insert(row).execute()
+    except Exception as exc:  # don't 500 the UI over a logging-style write
+        logger.exception("flag insert failed")
+        raise HTTPException(status_code=502, detail={"error": "flag_failed"}) from exc
+    return {"ok": True}
+
+
+@app.get("/api/flags")
+async def list_flags_endpoint(
+    limit: int = 100,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Return recent flagged answers for the in-app dev panel, newest first."""
+    from src.pipeline.search import supabase_client
+
+    limit = max(1, min(limit, 500))
+    try:
+        res = (
+            supabase_client()
+            .table("flagged_answers")
+            .select(
+                "id, created_at, query, answer, reason, status, spec, llm_model, "
+                "agentic, latency_ms, tokens_used, citations, config, pipeline_trace"
+            )
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("flags list failed")
+        raise HTTPException(status_code=502, detail={"error": "flags_list_failed"}) from exc
+    return {"flags": res.data or []}
+
+
+@app.delete("/api/flags/{flag_id}")
+async def delete_flag_endpoint(
+    flag_id: int,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Delete one flagged answer."""
+    from src.pipeline.search import supabase_client
+
+    try:
+        supabase_client().table("flagged_answers").delete().eq("id", flag_id).execute()
+    except Exception as exc:
+        logger.exception("flag delete failed")
+        raise HTTPException(status_code=502, detail={"error": "flag_delete_failed"}) from exc
+    return {"ok": True}
+
+
+@app.get("/api/dev-notes")
+async def list_dev_notes_endpoint(_: bool = Depends(require_auth)) -> dict:
+    """Return dev scratchpad notes, newest first."""
+    from src.pipeline.search import supabase_client
+
+    try:
+        res = (
+            supabase_client()
+            .table("dev_notes")
+            .select("id, created_at, body")
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("dev notes list failed")
+        raise HTTPException(status_code=502, detail={"error": "notes_list_failed"}) from exc
+    return {"notes": res.data or []}
+
+
+@app.post("/api/dev-notes")
+async def create_dev_note_endpoint(
+    req: DevNoteRequest,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Append one note to the dev scratchpad."""
+    from src.pipeline.search import supabase_client
+
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail={"error": "empty_note"})
+    try:
+        res = supabase_client().table("dev_notes").insert({"body": body}).execute()
+    except Exception as exc:
+        logger.exception("dev note insert failed")
+        raise HTTPException(status_code=502, detail={"error": "note_failed"}) from exc
+    note = (res.data or [None])[0]
+    return {"ok": True, "note": note}
+
+
+@app.delete("/api/dev-notes/{note_id}")
+async def delete_dev_note_endpoint(
+    note_id: int,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Delete one note from the dev scratchpad."""
+    from src.pipeline.search import supabase_client
+
+    try:
+        supabase_client().table("dev_notes").delete().eq("id", note_id).execute()
+    except Exception as exc:
+        logger.exception("dev note delete failed")
+        raise HTTPException(status_code=502, detail={"error": "note_delete_failed"}) from exc
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def frontend(
     specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
@@ -1180,6 +1337,12 @@ a { color: var(--accent); text-decoration: none; }
 .cite-chip::before { content:"\\00a7"; opacity:.6; margin-right:1px; }
 .cite-chip:hover, .cite-chip.hot { background:var(--accent); color:#fff; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
 
+/* "Source: [§…]" attribution line under a table or code block (rule 2b) —
+   reads as a quiet caption tied to the block directly above it. */
+.answer-text .block-attrib { font-size:.82em; color:var(--t-faint); margin:-8px 0 14px; }
+.answer-text .block-attrib::before { content:"\\21B3"; margin-right:5px; opacity:.6; }
+.answer-text table.has-attrib, .answer-text pre.has-attrib { margin-bottom:4px; }
+
 /* latency tag in answer meta (legacy id #latency reused) */
 #latency { display:none; }
 
@@ -1370,13 +1533,29 @@ a { color: var(--accent); text-decoration: none; }
 /* error */
 .error { background:var(--danger-soft); color:var(--danger); border:1px solid color-mix(in srgb, var(--danger) 30%, transparent); border-radius:var(--radius-sm); padding:12px 15px; font-size:13px; }
 
-/* stage popup */
-.stage-popup { position:fixed; z-index:2000; top:80px; left:50%; transform:translateX(-50%); width:min(560px,92vw); max-height:78vh;
+/* stage popup (multiple open at once, draggable, FIFO-capped) */
+.stage-popup { position:fixed; z-index:2600; width:min(560px,92vw); max-height:78vh;
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius); box-shadow:var(--shadow-pop); display:flex; flex-direction:column; }
-.stage-popup-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); cursor:move; font-weight:600; font-size:13px; color:var(--ink); }
-.stage-popup-close { width:26px; height:26px; border:0; background:transparent; color:var(--t-faint); border-radius:6px; font-size:14px; }
+.stage-popup-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 16px; border-bottom:1px solid var(--border); cursor:move; font-weight:600; font-size:13px; color:var(--ink); }
+.stage-popup-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.stage-popup-actions { display:flex; align-items:center; gap:2px; flex:none; }
+.stage-popup-close { width:26px; height:26px; border:0; background:transparent; color:var(--t-faint);
+  border-radius:6px; font-size:14px; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1; }
 .stage-popup-close:hover { background:var(--surface-2); color:var(--ink); }
+/* "close all" is a small TEXT button to the LEFT of the per-popup close, only
+   shown when 2+ popups are open — text vs icon reads clearer than two X's. */
+.stage-popup-close-all { display:none; align-items:center; height:24px; padding:0 9px; border:0; background:transparent;
+  color:var(--t-faint); border-radius:6px; font-size:11px; font-weight:500; cursor:pointer; white-space:nowrap; line-height:1; }
+.stage-popup-close-all:hover { background:var(--warn-soft); color:var(--warn); }
+.stage-popup.multi .stage-popup-close-all { display:inline-flex; }
+/* hairline divider so the text button and the close icon read as separate */
+.stage-popup.multi .stage-popup-close { margin-left:4px; border-left:1px solid var(--border); border-radius:0 6px 6px 0; padding-left:2px; width:28px; }
 .stage-popup-body { padding:14px 16px; overflow:auto; }
+/* instant, brief hover hint for the close buttons (native title is too slow) */
+.popup-tip { position:fixed; z-index:3000; pointer-events:none; background:var(--ink); color:var(--surface);
+  font-size:11px; font-weight:500; padding:3px 7px; border-radius:5px; white-space:nowrap;
+  opacity:0; transform:translateY(2px); transition:opacity .08s ease, transform .08s ease; box-shadow:var(--shadow-pop); }
+.popup-tip.show { opacity:1; transform:translateY(0); }
 
 /* overlays (agentic confirm + config) */
 .ag-confirm-overlay, .ag-config-overlay { position:fixed; inset:0; z-index:2100; background:color-mix(in srgb, var(--ink) 38%, transparent);
@@ -1399,6 +1578,105 @@ a { color: var(--accent); text-decoration: none; }
 .ag-config-body .agentic-config,
 .ag-config-body .agentic-config.hidden { display:block !important; }
 .ag-config-body .config-grid { grid-template-columns:1fr 1fr 1fr; }
+
+/* ── Flag answer: sticky FAB + modal ─────────────────────────────────────── */
+.flag-fab { position:fixed; right:20px; bottom:20px; z-index:1500; width:44px; height:44px;
+  display:inline-flex; align-items:center; justify-content:center; border-radius:999px;
+  background:var(--surface); color:var(--text); border:1px solid var(--border);
+  box-shadow:0 2px 10px rgba(0,0,0,.18); cursor:pointer;
+  transition:transform .12s ease, color .12s ease, border-color .12s ease; }
+.flag-fab:hover { transform:translateY(-1px); color:var(--accent); border-color:var(--accent); }
+.flag-fab.flagged { color:var(--danger); border-color:var(--danger); cursor:default; }
+.flag-fab[hidden] { display:none; }
+.flag-modal-overlay { position:fixed; inset:0; z-index:2200; background:color-mix(in srgb, var(--ink) 38%, transparent);
+  display:flex; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(2px); animation:fadeUp .14s ease; }
+.flag-modal-overlay[hidden] { display:none; }
+.flag-modal { width:min(460px,94vw); background:var(--surface); border:1px solid var(--border-2);
+  border-radius:var(--radius); box-shadow:var(--shadow-pop); padding:22px; }
+.flag-modal-title { font-size:16px; font-weight:600; letter-spacing:-0.02em; color:var(--ink); }
+.flag-modal-sub { font-size:12.5px; color:var(--t-subtle); margin-top:4px; }
+.flag-modal textarea { width:100%; margin-top:14px; min-height:84px; resize:vertical; padding:10px 12px;
+  font:inherit; font-size:13px; color:var(--ink); background:var(--surface-2);
+  border:1px solid var(--border); border-radius:var(--radius-sm); box-sizing:border-box; }
+.flag-modal textarea:focus { outline:none; border-color:var(--accent); }
+.flag-modal-err { font-size:12px; color:var(--danger); margin-top:10px; min-height:14px; }
+.flag-modal-actions { display:flex; gap:9px; justify-content:flex-end; margin-top:14px; }
+.flag-toast { position:fixed; right:20px; bottom:74px; z-index:2300; padding:9px 14px; border-radius:8px;
+  background:var(--surface); border:1px solid var(--border-2); box-shadow:var(--shadow-pop);
+  font-size:12.5px; color:var(--ink); animation:fadeUp .14s ease; }
+.flag-toast[hidden] { display:none; }
+
+/* ── Dev panel: bottom-left FAB + flags/notes drawer ─────────────────────── */
+.dev-fab { position:fixed; left:20px; bottom:20px; z-index:1500; width:40px; height:40px;
+  display:inline-flex; align-items:center; justify-content:center; border-radius:10px;
+  background:var(--surface); color:var(--t-subtle); border:1px solid var(--border);
+  box-shadow:0 2px 10px rgba(0,0,0,.14); cursor:pointer; opacity:.7;
+  transition:transform .12s ease, color .12s ease, border-color .12s ease, opacity .12s ease; }
+.dev-fab:hover { transform:translateY(-1px); color:var(--accent); border-color:var(--accent); opacity:1; }
+.dev-overlay { position:fixed; inset:0; z-index:2400; background:color-mix(in srgb, var(--ink) 38%, transparent);
+  display:flex; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(2px); animation:fadeUp .14s ease; }
+.dev-overlay[hidden] { display:none; }
+.dev-panel { width:min(940px,96vw); max-height:90vh; display:flex; flex-direction:column;
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius); box-shadow:var(--shadow-pop); overflow:hidden; }
+.dev-head { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--border); }
+.dev-tabs { display:flex; gap:4px; }
+.dev-tab { height:30px; padding:0 13px; border:1px solid transparent; border-radius:7px; background:transparent;
+  font-size:12.5px; font-weight:600; color:var(--t-subtle); cursor:pointer; }
+.dev-tab:hover { color:var(--ink); background:var(--surface-2); }
+.dev-tab.active { color:var(--accent-ink); background:var(--accent-soft); border-color:var(--accent-bd); }
+.dev-head-title { font-size:13px; font-weight:600; color:var(--ink); }
+.dev-close { margin-left:auto; width:28px; height:28px; border:0; background:transparent; color:var(--t-faint); border-radius:6px; font-size:15px; cursor:pointer; }
+.dev-close:hover { background:var(--surface-2); color:var(--ink); }
+.dev-body { padding:14px 16px; overflow:auto; }
+.dev-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.dev-btn { height:30px; padding:0 12px; border:1px solid var(--border); border-radius:7px; background:var(--surface);
+  color:var(--t-muted); font-size:12px; font-weight:600; cursor:pointer; }
+.dev-btn:hover { border-color:var(--border-2); color:var(--ink); background:var(--surface-2); }
+.dev-btn-primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.dev-btn-primary:hover { filter:brightness(1.08); background:var(--accent); color:#fff; }
+.dev-btn-danger { color:var(--danger); border-color:color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.dev-btn-danger:hover { color:#fff; background:var(--danger); border-color:var(--danger); }
+.dev-count { font-size:12px; color:var(--t-subtle); font-family:var(--mono); }
+.dev-empty { font-size:12.5px; color:var(--t-subtle); padding:18px 4px; }
+/* flag rows */
+.dev-row { border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:8px; background:var(--surface); overflow:hidden; }
+.dev-row-head { display:flex; align-items:flex-start; gap:10px; width:100%; text-align:left; padding:10px 12px; background:transparent; border:0; cursor:pointer; }
+.dev-row-head:hover { background:var(--surface-2); }
+.dev-row-main { flex:1; min-width:0; }
+.dev-row-q { font-size:13px; font-weight:600; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dev-row-sub { font-size:11.5px; color:var(--t-subtle); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dev-row-meta { display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex:none; }
+.dev-chip { font-family:var(--mono); font-size:10px; padding:1px 7px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); color:var(--t-muted); }
+.dev-chip.agentic { color:var(--accent-ink); }
+.dev-row-date { font-size:10.5px; color:var(--t-faint); font-family:var(--mono); }
+.dev-row-body { display:none; padding:0 12px 14px; border-top:1px solid var(--border); }
+.dev-row.open .dev-row-body { display:block; }
+.dev-field { margin-top:12px; }
+.dev-field-label { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--t-faint); margin-bottom:5px; }
+.dev-field-val { font-size:12.5px; color:var(--ink); white-space:pre-wrap; word-break:break-word; }
+.dev-answer { font-size:12.5px; color:var(--text); background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-xs); padding:10px 12px; max-height:280px; overflow:auto; line-height:1.5; }
+.dev-kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
+.dev-kv dt { color:var(--t-subtle); font-family:var(--mono); }
+.dev-kv dd { margin:0; color:var(--ink); font-family:var(--mono); word-break:break-word; }
+.dev-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:4px; }
+.dev-list li { font-size:11.5px; color:var(--t-muted); font-family:var(--mono); }
+.dev-stage-num { color:var(--t-faint); margin-right:6px; }
+/* notes */
+.dev-note-input { width:100%; min-height:74px; resize:vertical; padding:10px 12px; font:inherit; font-size:13px;
+  color:var(--ink); background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm); box-sizing:border-box; }
+.dev-note-input:focus { outline:none; border-color:var(--accent); }
+.dev-note-bar { display:flex; justify-content:flex-end; gap:9px; margin:10px 0 16px; align-items:center; }
+.dev-note-err { font-size:12px; color:var(--danger); margin-right:auto; }
+.dev-note { border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; margin-bottom:8px; background:var(--surface); }
+.dev-note-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:5px; }
+.dev-note-date { font-size:10.5px; color:var(--t-faint); font-family:var(--mono); }
+.dev-note-del { width:22px; height:22px; flex:none; border:0; background:transparent; color:var(--t-faint); border-radius:6px; cursor:pointer; font-size:12px; line-height:1; }
+.dev-note-del:hover { background:var(--surface-2); color:var(--danger); }
+.dev-note-body { font-size:12.5px; color:var(--ink); white-space:pre-wrap; word-break:break-word; }
+/* dev flow chart (reconstructed from stored pipeline_trace) */
+.dev-flow-host { position:relative; margin-top:8px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:12px; overflow:auto; }
+.dev-flow-host:empty { display:none; }
+.dev-flow-host svg { max-width:100%; height:auto; }
     </style>
     <script>
         // Apply the saved (or system-preferred) theme before first paint to
@@ -1758,13 +2036,8 @@ a { color: var(--accent); text-decoration: none; }
         </div>
     </main>
 
-    <div id="stage-popup" class="stage-popup" style="display:none" role="dialog" aria-modal="true">
-        <div class="stage-popup-header" id="stage-popup-drag-handle">
-            <span id="stage-popup-title"></span>
-            <button class="stage-popup-close" onclick="closeStagePopup()" title="Close">&#x2715;</button>
-        </div>
-        <div class="stage-popup-body" id="stage-popup-body"></div>
-    </div>
+    <!-- Stage-detail popups are created dynamically (up to 4, draggable, FIFO);
+         see showStagePopup() / the stage-popup manager in the script below. -->
 
     <div id="ag-confirm-overlay" class="ag-confirm-overlay hidden" role="dialog" aria-modal="true">
         <div class="ag-confirm">
@@ -1794,6 +2067,69 @@ a { color: var(--accent); text-decoration: none; }
         </div>
     </div>
 </div>
+
+    <!-- Flag answer: sticky FAB, hidden until the first answer renders. -->
+    <button id="flag-fab" class="flag-fab" type="button"
+            aria-label="Flag this answer" hidden>
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M5 3v18M5 4h11l-2 4 2 4H5" fill="none"
+              stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+
+    <div id="flag-modal-overlay" class="flag-modal-overlay" role="dialog" aria-modal="true"
+         aria-labelledby="flag-modal-title" hidden>
+        <div class="flag-modal">
+            <div class="flag-modal-title" id="flag-modal-title">Flag this answer</div>
+            <div class="flag-modal-sub">What was wrong with this answer? (optional)</div>
+            <textarea id="flag-reason" placeholder="Optional. Describe the problem so we can reproduce it."></textarea>
+            <div class="flag-modal-err" id="flag-modal-err"></div>
+            <div class="flag-modal-actions">
+                <button class="ag-confirm-btn ag-confirm-btn-cancel" id="flag-cancel" type="button">Cancel</button>
+                <button class="ag-confirm-btn ag-confirm-btn-run" id="flag-submit" type="button">Submit flag</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="flag-toast" class="flag-toast" hidden>Thanks, flagged</div>
+
+    <!-- Dev panel: bottom-left FAB opens a drawer over flagged_answers + notes. -->
+    <button id="dev-fab" class="dev-fab" type="button" aria-label="Open dev panel">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 6l-2 12"/>
+      </svg>
+    </button>
+
+    <div id="dev-overlay" class="dev-overlay" role="dialog" aria-modal="true" aria-label="Dev panel" hidden>
+        <div class="dev-panel">
+            <div class="dev-head">
+                <div class="dev-tabs">
+                    <button class="dev-tab active" type="button" data-devtab="flags">Flagged answers</button>
+                    <button class="dev-tab" type="button" data-devtab="notes">Notes</button>
+                </div>
+                <button class="dev-close" id="dev-close" type="button" aria-label="Close">&#x2715;</button>
+            </div>
+            <div class="dev-body">
+                <div id="dev-pane-flags" class="dev-pane">
+                    <div class="dev-toolbar">
+                        <button class="dev-btn" id="dev-refresh" type="button">Refresh</button>
+                        <span class="dev-count" id="dev-flags-count"></span>
+                    </div>
+                    <div id="dev-flags-list"></div>
+                </div>
+                <div id="dev-pane-notes" class="dev-pane" hidden>
+                    <textarea class="dev-note-input" id="dev-note-input" placeholder="Write a note..."></textarea>
+                    <div class="dev-note-bar">
+                        <span class="dev-note-err" id="dev-note-err"></span>
+                        <button class="dev-btn dev-btn-primary" id="dev-note-add" type="button">Add note</button>
+                    </div>
+                    <div id="dev-notes-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Markdown rendering: marked (parser) + DOMPurify (XSS sanitiser).
          LLM output is partially user-influenced via prompt injection, so we
@@ -2966,26 +3302,180 @@ a { color: var(--accent); text-decoration: none; }
             await vizGoTo(0);
         }
 
-        // ─── Draggable stage-detail popup ─────────────────────────────────
-        function showStagePopup(stage, clickX, clickY) {
-            const popup = document.getElementById("stage-popup");
-            if (!popup) return;
-            const display = formatStageDisplay(stage.stage);
-            document.getElementById("stage-popup-title").textContent = display.title;
-            document.getElementById("stage-popup-body").innerHTML = renderStageBody(stage);
+        // ─── Draggable stage-detail popups (manager) ──────────────────────
+        // Several popups can be open at once; each is independently draggable.
+        // The set is FIFO-capped at STAGE_POPUP_CAP — opening one past the cap
+        // evicts the oldest. They persist across viz re-renders and pass nav;
+        // the only thing that clears them is running a new query (runQuery).
+        const STAGE_POPUP_CAP = 4;
+        let _stagePopups = [];   // [{el, key}] oldest-first
+        let _popupZ = 2600;      // running z so the last interacted popup is on top
+        let _popupTip = null;    // one shared hover-hint element
 
-            // Position near the click, clamped inside the viewport.
-            popup.style.transform = "none";
-            popup.style.display = "flex";
-            const w = popup.offsetWidth || 480;
-            const h = popup.offsetHeight || 300;
-            popup.style.left = Math.max(8, Math.min(clickX, window.innerWidth  - w - 8)) + "px";
-            popup.style.top  = Math.max(8, Math.min(clickY + 14, window.innerHeight - h - 8)) + "px";
+        function _ensurePopupTip() {
+            if (!_popupTip) {
+                _popupTip = document.createElement("div");
+                _popupTip.className = "popup-tip";
+                document.body.appendChild(_popupTip);
+            }
+            return _popupTip;
+        }
+        // Show the brief hint right away (no native-title delay), above the
+        // button (or below if there's no room).
+        function _showPopupTip(btn) {
+            const tip = _ensurePopupTip();
+            tip.textContent = btn.getAttribute("data-tip") || "";
+            tip.classList.add("show");
+            const r = btn.getBoundingClientRect();
+            const tw = tip.offsetWidth, th = tip.offsetHeight;
+            let left = r.left + r.width / 2 - tw / 2;
+            left = Math.max(6, Math.min(left, window.innerWidth - tw - 6));
+            let top = r.top - th - 6;
+            if (top < 6) top = r.bottom + 6;
+            tip.style.left = left + "px";
+            tip.style.top  = top + "px";
+        }
+        function _hidePopupTip() { if (_popupTip) _popupTip.classList.remove("show"); }
+
+        function _raisePopup(rec) { rec.el.style.zIndex = String(++_popupZ); }
+
+        // The "close all" control only makes sense with 2+ popups open; toggle
+        // the .multi class on every popup so each shows/hides its own button.
+        function _updatePopupMultiState() {
+            const multi = _stagePopups.length > 1;
+            _stagePopups.forEach(p => p.el.classList.toggle("multi", multi));
         }
 
-        function closeStagePopup() {
-            const popup = document.getElementById("stage-popup");
-            if (popup) popup.style.display = "none";
+        function _makePopupDraggable(el, handle) {
+            let ox = 0, oy = 0;
+            function onMove(e) {
+                const cx = e.touches ? e.touches[0].clientX : e.clientX;
+                const cy = e.touches ? e.touches[0].clientY : e.clientY;
+                el.style.left = Math.max(0, cx - ox) + "px";
+                el.style.top  = Math.max(0, cy - oy) + "px";
+            }
+            function onUp() {
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup",   onUp);
+                document.removeEventListener("touchmove", onMove);
+                document.removeEventListener("touchend",  onUp);
+            }
+            handle.addEventListener("mousedown", e => {
+                if (e.target.closest("button")) return;   // let the close buttons work
+                const r = el.getBoundingClientRect();
+                ox = e.clientX - r.left; oy = e.clientY - r.top;
+                document.addEventListener("mousemove", onMove);
+                document.addEventListener("mouseup",   onUp);
+                e.preventDefault();
+            });
+            handle.addEventListener("touchstart", e => {
+                if (e.target.closest("button")) return;
+                const r = el.getBoundingClientRect();
+                ox = e.touches[0].clientX - r.left; oy = e.touches[0].clientY - r.top;
+                document.addEventListener("touchmove", onMove, {passive: false});
+                document.addEventListener("touchend",  onUp);
+                e.preventDefault();
+            }, {passive: false});
+        }
+
+        // Identity for a popup so clicking the same node twice just raises the
+        // existing one instead of stacking a duplicate.
+        function _stageKey(stage) {
+            const s = stage || {};
+            return (s.stage || "") + "#" + (s.took_ms != null ? s.took_ms : "");
+        }
+
+        function showStagePopup(stage, clickX, clickY) {
+            const key = _stageKey(stage);
+            const existing = _stagePopups.find(p => p.key === key);
+            if (existing) { _raisePopup(existing); return; }
+
+            const display = formatStageDisplay(stage.stage);
+
+            const el = document.createElement("div");
+            el.className = "stage-popup";
+            el.setAttribute("role", "dialog");
+
+            const header = document.createElement("div");
+            header.className = "stage-popup-header";
+
+            const titleEl = document.createElement("span");
+            titleEl.className = "stage-popup-title";
+            titleEl.textContent = display.title;
+
+            const actions = document.createElement("div");
+            actions.className = "stage-popup-actions";
+
+            const closeAllBtn = document.createElement("button");
+            closeAllBtn.type = "button";
+            closeAllBtn.className = "stage-popup-close-all";
+            closeAllBtn.textContent = "Close all";   // labeled, so no hover hint needed
+
+            const closeBtn = document.createElement("button");
+            closeBtn.type = "button";
+            closeBtn.className = "stage-popup-close";
+            closeBtn.setAttribute("data-tip", "Close this");
+            closeBtn.innerHTML = "&#x2715;";
+
+            actions.appendChild(closeAllBtn);   // left of the per-popup close
+            actions.appendChild(closeBtn);
+            header.appendChild(titleEl);
+            header.appendChild(actions);
+
+            const body = document.createElement("div");
+            body.className = "stage-popup-body";
+            body.innerHTML = renderStageBody(stage);
+
+            el.appendChild(header);
+            el.appendChild(body);
+            document.body.appendChild(el);
+
+            // Position near the click, clamped to the viewport, cascaded a touch
+            // so a stack opened near one spot doesn't perfectly overlap.
+            const w = el.offsetWidth || 480;
+            const h = el.offsetHeight || 300;
+            const off = _stagePopups.length * 14;
+            const baseX = (clickX == null ? window.innerWidth / 2 - w / 2 : clickX) + off;
+            const baseY = (clickY == null ? 90 : clickY + 14) + off;
+            el.style.left = Math.max(8, Math.min(baseX, window.innerWidth  - w - 8)) + "px";
+            el.style.top  = Math.max(8, Math.min(baseY, window.innerHeight - h - 8)) + "px";
+
+            const rec = {el, key};
+            _stagePopups.push(rec);
+
+            closeBtn.addEventListener("click", ev => { ev.stopPropagation(); closeStagePopup(rec); });
+            closeAllBtn.addEventListener("click", ev => { ev.stopPropagation(); closeAllStagePopups(); });
+            // Only the icon needs a hover hint; the "Close all" button is labeled.
+            closeBtn.addEventListener("mouseenter", () => _showPopupTip(closeBtn));
+            closeBtn.addEventListener("mouseleave", _hidePopupTip);
+            closeBtn.addEventListener("focus", () => _showPopupTip(closeBtn));
+            closeBtn.addEventListener("blur", _hidePopupTip);
+            el.addEventListener("mousedown", () => _raisePopup(rec));
+            _makePopupDraggable(el, header);
+            _raisePopup(rec);
+
+            // FIFO: opening past the cap drops the oldest popup.
+            while (_stagePopups.length > STAGE_POPUP_CAP) {
+                const oldest = _stagePopups.shift();
+                if (oldest.el && oldest.el.parentNode) oldest.el.parentNode.removeChild(oldest.el);
+            }
+            _updatePopupMultiState();
+        }
+
+        function closeStagePopup(rec) {
+            _hidePopupTip();
+            if (!rec) rec = _stagePopups[_stagePopups.length - 1];   // legacy no-arg call
+            if (!rec) return;
+            const i = _stagePopups.indexOf(rec);
+            if (i !== -1) _stagePopups.splice(i, 1);
+            if (rec.el && rec.el.parentNode) rec.el.parentNode.removeChild(rec.el);
+            _updatePopupMultiState();
+        }
+
+        function closeAllStagePopups() {
+            _hidePopupTip();
+            _stagePopups.forEach(p => { if (p.el && p.el.parentNode) p.el.parentNode.removeChild(p.el); });
+            _stagePopups = [];
         }
 
         let _agConfirmCallback = null;
@@ -3182,42 +3672,6 @@ a { color: var(--accent); text-decoration: none; }
                 }
             });
 
-        });
-
-        // Wire up drag on popup header once the DOM is ready.
-        document.addEventListener("DOMContentLoaded", () => {
-            const handle = document.getElementById("stage-popup-drag-handle");
-            const popup  = document.getElementById("stage-popup");
-            if (!handle || !popup) return;
-            let ox = 0, oy = 0;
-            function onMove(e) {
-                const cx = e.touches ? e.touches[0].clientX : e.clientX;
-                const cy = e.touches ? e.touches[0].clientY : e.clientY;
-                popup.style.left = Math.max(0, cx - ox) + "px";
-                popup.style.top  = Math.max(0, cy - oy) + "px";
-            }
-            function onUp() {
-                document.removeEventListener("mousemove", onMove);
-                document.removeEventListener("mouseup",   onUp);
-                document.removeEventListener("touchmove", onMove);
-                document.removeEventListener("touchend",  onUp);
-            }
-            handle.addEventListener("mousedown", e => {
-                const r = popup.getBoundingClientRect();
-                ox = e.clientX - r.left;
-                oy = e.clientY - r.top;
-                document.addEventListener("mousemove", onMove);
-                document.addEventListener("mouseup",   onUp);
-                e.preventDefault();
-            });
-            handle.addEventListener("touchstart", e => {
-                const r = popup.getBoundingClientRect();
-                ox = e.touches[0].clientX - r.left;
-                oy = e.touches[0].clientY - r.top;
-                document.addEventListener("touchmove", onMove, {passive: false});
-                document.addEventListener("touchend",  onUp);
-                e.preventDefault();
-            }, {passive: false});
         });
 
         function renderMarkdown(md) {
@@ -3466,6 +3920,12 @@ a { color: var(--accent); text-decoration: none; }
         async function runQuery() {
             const query = queryInput.value.trim();
             if (!query) return;
+
+            // A new prompt is the only thing that clears open stage popups.
+            closeAllStagePopups();
+
+            // Reset the flag FAB for a fresh answer (hide + clear confirmation).
+            if (typeof resetFlagFab === "function") resetFlagFab();
 
             // Collect config
             const config = {
@@ -3967,6 +4427,31 @@ a { color: var(--accent); text-decoration: none; }
             });
         }
 
+        /* Style the "Source: [§…]" attribution line the model emits under a
+           table or code block (see system-prompt rule 2b). Marks the paragraph
+           so it reads as a subtle caption tied to the block above it, and
+           strips the leading "Source:" label since the chip already says it. */
+        function styleBlockAttributions(root) {
+            if (!root) return;
+            var paras = root.querySelectorAll("p");
+            for (var i = 0; i < paras.length; i++) {
+                var p = paras[i];
+                if (!p.querySelector(".cite-chip")) continue;
+                var first = p.firstChild;
+                if (!first || first.nodeType !== 3) continue;       // must lead with text
+                var lead = first.nodeValue.replace(/^\\s+/, "");
+                if (lead.slice(0, 7).toLowerCase() !== "source:") continue;
+                first.nodeValue = first.nodeValue.replace(/^\\s*[Ss]ource:\\s*/, "");
+                if (!first.nodeValue) p.removeChild(first);
+                p.classList.add("block-attrib");
+                // Tie it visually to the block directly above, if any.
+                var prev = p.previousElementSibling;
+                if (prev && (prev.tagName === "TABLE" || prev.tagName === "PRE")) {
+                    prev.classList.add("has-attrib");
+                }
+            }
+        }
+
         /* ── sources sidebar ─────────────────────────────────────────────── */
         function renderSourcesSidebar(citations) {
             var list = document.getElementById("citations-list");
@@ -4054,7 +4539,10 @@ a { color: var(--accent); text-decoration: none; }
 
             if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
                 _cancelAnswerStream = streamAnswerInto(answerEl, answerText, {
-                    onDone: function () { linkifyCitations(answerEl, data.citations); }
+                    onDone: function () {
+                        linkifyCitations(answerEl, data.citations);
+                        styleBlockAttributions(answerEl);
+                    }
                 });
             } else {
                 answerEl.textContent = answerText;
@@ -4082,8 +4570,421 @@ a { color: var(--accent); text-decoration: none; }
             renderPipeSummary(data);
             renderSidebar(data);
 
+            // Snapshot for the flag button (POSTed verbatim on flag, no re-run).
+            window._lastResponse = data;
+            var flagFab = document.getElementById("flag-fab");
+            if (flagFab) { flagFab.classList.remove("flagged"); flagFab.hidden = false; }
+
             document.getElementById("answer-section").classList.remove("hidden");
         };
+
+        /* ── Flag answer: FAB + modal wiring ─────────────────────────────── */
+        function resetFlagFab() {
+            var fab = document.getElementById("flag-fab");
+            if (fab) { fab.hidden = true; fab.classList.remove("flagged"); }
+            closeFlagModal();
+        }
+        function openFlagModal() {
+            var ov = document.getElementById("flag-modal-overlay");
+            if (!ov || !window._lastResponse) return;
+            document.getElementById("flag-reason").value = "";
+            document.getElementById("flag-modal-err").textContent = "";
+            var submit = document.getElementById("flag-submit");
+            submit.disabled = false; submit.textContent = "Submit flag";
+            ov.hidden = false;
+            document.getElementById("flag-reason").focus();
+        }
+        function closeFlagModal() {
+            var ov = document.getElementById("flag-modal-overlay");
+            if (ov) ov.hidden = true;
+        }
+        function showFlagToast() {
+            var t = document.getElementById("flag-toast");
+            if (!t) return;
+            t.hidden = false;
+            clearTimeout(t._timer);
+            t._timer = setTimeout(function () { t.hidden = true; }, 2400);
+        }
+        async function submitFlag(reason) {
+            var d = window._lastResponse;
+            if (!d) return;
+            var errEl = document.getElementById("flag-modal-err");
+            var submit = document.getElementById("flag-submit");
+            errEl.textContent = "";
+            submit.disabled = true; submit.textContent = "Submitting…";
+            try {
+                var res = await fetch("/api/flag-answer", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    credentials: "same-origin",
+                    body: JSON.stringify({
+                        query: d.query,
+                        answer: d.answer,
+                        config: d.config,
+                        pipeline_trace: d.pipeline_trace || null,
+                        citations: d.citations || null,
+                        latency_ms: d.latency_ms != null ? d.latency_ms : null,
+                        tokens_used: d.tokens_used || null,
+                        agentic: !!d.agentic,
+                        reason: reason || null,
+                    }),
+                });
+                if (res.ok) {
+                    var fab = document.getElementById("flag-fab");
+                    if (fab) fab.classList.add("flagged");
+                    closeFlagModal();
+                    showFlagToast();
+                } else {
+                    errEl.textContent = "Couldn't submit the flag. Please try again.";
+                    submit.disabled = false; submit.textContent = "Submit flag";
+                }
+            } catch (e) {
+                errEl.textContent = "Network error. Couldn't submit the flag.";
+                submit.disabled = false; submit.textContent = "Submit flag";
+            }
+        }
+        (function () {
+            var fab = document.getElementById("flag-fab");
+            if (fab) fab.addEventListener("click", openFlagModal);
+            var cancel = document.getElementById("flag-cancel");
+            if (cancel) cancel.addEventListener("click", closeFlagModal);
+            var submit = document.getElementById("flag-submit");
+            if (submit) submit.addEventListener("click", function () {
+                submitFlag(document.getElementById("flag-reason").value.trim());
+            });
+            var ov = document.getElementById("flag-modal-overlay");
+            if (ov) ov.addEventListener("click", function (e) { if (e.target === ov) closeFlagModal(); });
+            document.addEventListener("keydown", function (e) {
+                if (e.key === "Escape" && ov && !ov.hidden) closeFlagModal();
+            });
+        })();
+
+        /* ── Dev panel: flagged_answers browser + notes scratchpad ───────── */
+        function _devFmtDate(iso) {
+            if (!iso) return "";
+            var d = new Date(iso);
+            if (isNaN(d)) return String(iso);
+            return d.toLocaleString();
+        }
+        function _devRenderMd(text) {
+            if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+                try { return DOMPurify.sanitize(marked.parse(text || "")); } catch (e) {}
+            }
+            return escapeHtml(text || "").replace(/\\n/g, "<br>");
+        }
+        function _devCitationLine(c) {
+            if (!c || typeof c !== "object") return escapeHtml(String(c));
+            var bits = [];
+            if (c.section_id) bits.push("&#167;" + escapeHtml(String(c.section_id)));
+            if (c.section_title) bits.push(escapeHtml(String(c.section_title)));
+            if (c.figure_number) bits.push("[" + escapeHtml(String(c.figure_number)) + "]");
+            var pages = c.pdf_pages || c.pages;
+            if (Array.isArray(pages) && pages.length) bits.push("p." + pages.join(","));
+            return bits.length ? bits.join(" &middot; ") : escapeHtml(JSON.stringify(c));
+        }
+        function _devKv(obj) {
+            if (!obj || typeof obj !== "object") return "";
+            var keys = Object.keys(obj);
+            if (!keys.length) return '<span class="dev-field-val">(none)</span>';
+            return '<dl class="dev-kv">' + keys.map(function (k) {
+                var v = obj[k];
+                if (v && typeof v === "object") v = JSON.stringify(v);
+                return "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(String(v)) + "</dd>";
+            }).join("") + "</dl>";
+        }
+        function _devTokensTotal(t) {
+            if (!t) return null;
+            if (Array.isArray(t.calls) && t.calls.length) {
+                return t.calls.reduce(function (s, c) { return s + (c.prompt || 0) + (c.completion || 0); }, 0);
+            }
+            return (t.prompt || 0) + (t.completion || 0);
+        }
+        function renderFlagRow(f, idx) {
+            var subBits = [];
+            if (f.reason) subBits.push(escapeHtml(String(f.reason)));
+            else subBits.push("(no reason given)");
+            var sub = subBits.join("");
+            var meta = '<div class="dev-row-meta">'
+                + (f.spec ? '<span class="dev-chip">' + escapeHtml(String(f.spec)) + "</span>" : "")
+                + (f.agentic ? '<span class="dev-chip agentic">agentic</span>' : "")
+                + '<span class="dev-row-date">' + escapeHtml(_devFmtDate(f.created_at)) + "</span>"
+                + "</div>";
+
+            var trace = Array.isArray(f.pipeline_trace) ? f.pipeline_trace : [];
+            var traceHtml = trace.length
+                ? '<ul class="dev-list">' + trace.map(function (s, i) {
+                    var name = s.stage || s.name || ("stage " + (i + 1));
+                    var ms = (s.took_ms != null) ? " (" + Math.round(s.took_ms) + "ms)" : "";
+                    return '<li><span class="dev-stage-num">' + (i + 1) + ".</span>" + escapeHtml(String(name)) + ms + "</li>";
+                }).join("") + "</ul>"
+                : '<span class="dev-field-val">(no trace)</span>';
+
+            var cites = Array.isArray(f.citations) ? f.citations : [];
+            var citesHtml = cites.length
+                ? '<ul class="dev-list">' + cites.map(function (c) { return "<li>" + _devCitationLine(c) + "</li>"; }).join("") + "</ul>"
+                : '<span class="dev-field-val">(no citations)</span>';
+
+            var tok = _devTokensTotal(f.tokens_used);
+            var timing = '<dl class="dev-kv">'
+                + "<dt>latency</dt><dd>" + (f.latency_ms != null ? (f.latency_ms / 1000).toFixed(2) + "s" : "-") + "</dd>"
+                + "<dt>tokens</dt><dd>" + (tok != null ? tok.toLocaleString() : "-") + "</dd>"
+                + "<dt>model</dt><dd>" + escapeHtml(String(f.llm_model || "-")) + "</dd>"
+                + "<dt>flag id</dt><dd>" + escapeHtml(String(f.id)) + "</dd>"
+                + "</dl>";
+
+            return '<div class="dev-row" data-row="' + idx + '">'
+                + '<button class="dev-row-head" type="button" data-rowtoggle="' + idx + '">'
+                + '<div class="dev-row-main">'
+                + '<div class="dev-row-q">' + escapeHtml(String(f.query || "(empty query)")) + "</div>"
+                + '<div class="dev-row-sub">' + sub + "</div>"
+                + "</div>" + meta + "</button>"
+                + '<div class="dev-row-body">'
+                + '<div class="dev-field"><div class="dev-field-label">Answer</div><div class="dev-answer">' + _devRenderMd(f.answer) + "</div></div>"
+                + '<div class="dev-field"><div class="dev-field-label">User reason</div><div class="dev-field-val">' + (f.reason ? escapeHtml(String(f.reason)) : "(none)") + "</div></div>"
+                + '<div class="dev-field"><div class="dev-field-label">Timing &amp; cost</div>' + timing + "</div>"
+                + '<div class="dev-field"><div class="dev-field-label">Flow chart</div>'
+                + (trace.length
+                    ? '<button class="dev-btn" type="button" data-flow="' + idx + '">Render flow chart</button>'
+                      + '<div class="dev-flow-host" id="dev-flow-' + idx + '"></div>'
+                    : '<span class="dev-field-val">(no trace to render)</span>')
+                + "</div>"
+                + '<div class="dev-field"><div class="dev-field-label">Pipeline trace</div>' + traceHtml + "</div>"
+                + '<div class="dev-field"><div class="dev-field-label">Citations</div>' + citesHtml + "</div>"
+                + '<div class="dev-field"><div class="dev-field-label">Config</div>' + _devKv(f.config) + "</div>"
+                + '<div class="dev-field"><button class="dev-btn dev-btn-danger" type="button" data-delflag="' + idx + '">Delete flag</button></div>'
+                + "</div></div>";
+        }
+        async function loadFlags() {
+            var list = document.getElementById("dev-flags-list");
+            var count = document.getElementById("dev-flags-count");
+            list.innerHTML = '<div class="dev-empty">Loading…</div>';
+            try {
+                var res = await fetch("/api/flags?limit=200", { credentials: "same-origin" });
+                if (!res.ok) throw new Error("http " + res.status);
+                var data = await res.json();
+                var flags = data.flags || [];
+                window._devFlags = flags;
+                if (count) count.textContent = flags.length + (flags.length === 1 ? " flag" : " flags");
+                if (!flags.length) { list.innerHTML = '<div class="dev-empty">No flagged answers yet.</div>'; return; }
+                list.innerHTML = flags.map(function (f, i) { return renderFlagRow(f, i); }).join("");
+                list.querySelectorAll("[data-rowtoggle]").forEach(function (btn) {
+                    btn.addEventListener("click", function () {
+                        var row = btn.closest(".dev-row");
+                        if (row) row.classList.toggle("open");
+                    });
+                });
+                list.querySelectorAll("[data-flow]").forEach(function (btn) {
+                    btn.addEventListener("click", function () {
+                        var i = parseInt(btn.getAttribute("data-flow"), 10);
+                        var f = (window._devFlags || [])[i];
+                        var host = document.getElementById("dev-flow-" + i);
+                        if (!f || !host) return;
+                        btn.disabled = true; btn.textContent = "Rendering…";
+                        renderDevFlow(f.pipeline_trace, f.query, host).then(function () {
+                            btn.style.display = "none";
+                        }).catch(function () {
+                            btn.disabled = false; btn.textContent = "Render flow chart";
+                        });
+                    });
+                });
+                list.querySelectorAll("[data-delflag]").forEach(function (btn) {
+                    btn.addEventListener("click", function () {
+                        var i = parseInt(btn.getAttribute("data-delflag"), 10);
+                        var f = (window._devFlags || [])[i];
+                        if (!f) return;
+                        deleteFlag(f.id, btn);
+                    });
+                });
+            } catch (e) {
+                list.innerHTML = '<div class="dev-empty">Could not load flags. Is the table created and Supabase reachable?</div>';
+                if (count) count.textContent = "";
+            }
+        }
+        async function deleteFlag(id, btn) {
+            if (!window.confirm("Delete this flag? This cannot be undone.")) return;
+            if (btn) { btn.disabled = true; btn.textContent = "Deleting…"; }
+            try {
+                var res = await fetch("/api/flags/" + encodeURIComponent(id), {
+                    method: "DELETE",
+                    credentials: "same-origin",
+                });
+                if (!res.ok) throw new Error("http " + res.status);
+                await loadFlags();
+            } catch (e) {
+                if (btn) { btn.disabled = false; btn.textContent = "Delete failed, retry"; }
+            }
+        }
+        async function loadDevNotes() {
+            var list = document.getElementById("dev-notes-list");
+            list.innerHTML = '<div class="dev-empty">Loading…</div>';
+            try {
+                var res = await fetch("/api/dev-notes", { credentials: "same-origin" });
+                if (!res.ok) throw new Error("http " + res.status);
+                var data = await res.json();
+                var notes = data.notes || [];
+                if (!notes.length) { list.innerHTML = '<div class="dev-empty">No notes yet.</div>'; return; }
+                list.innerHTML = notes.map(function (n) {
+                    return '<div class="dev-note"><div class="dev-note-head">'
+                        + '<span class="dev-note-date">' + escapeHtml(_devFmtDate(n.created_at)) + "</span>"
+                        + '<button class="dev-note-del" type="button" data-del="' + n.id + '" aria-label="Delete note" title="Delete note">&#x2715;</button>'
+                        + '</div><div class="dev-note-body">' + escapeHtml(String(n.body || "")) + "</div></div>";
+                }).join("");
+                list.querySelectorAll("[data-del]").forEach(function (btn) {
+                    btn.addEventListener("click", function () { deleteDevNote(btn.getAttribute("data-del")); });
+                });
+            } catch (e) {
+                list.innerHTML = '<div class="dev-empty">Could not load notes.</div>';
+            }
+        }
+        async function deleteDevNote(id) {
+            if (!window.confirm("Delete this note?")) return;
+            try {
+                var res = await fetch("/api/dev-notes/" + encodeURIComponent(id), {
+                    method: "DELETE",
+                    credentials: "same-origin",
+                });
+                if (!res.ok) throw new Error("http " + res.status);
+                await loadDevNotes();
+            } catch (e) {
+                var err = document.getElementById("dev-note-err");
+                if (err) err.textContent = "Could not delete the note.";
+            }
+        }
+
+        // Self-contained flow-chart renderer for the dev panel. Reuses the main
+        // engine's pure builders (splitTraceByIteration, buildMermaidFromTrace)
+        // and the global stage popup, but keeps its OWN page state so it can't
+        // corrupt the main answer-section viz (_vizPages/_vizPageIdx).
+        var _devFlow = { pages: [], idx: 0, host: null };
+        async function renderDevFlow(trace, query, host) {
+            _devFlow = { pages: [], idx: 0, host: host };
+            if (!trace || !trace.length) {
+                host.innerHTML = '<div class="viz-empty">No pipeline trace stored for this flag.</div>';
+                return;
+            }
+            if (typeof mermaid === "undefined") {
+                host.innerHTML = '<div class="viz-empty">Mermaid failed to load (CDN blocked?). The stage list above still has every step.</div>';
+                return;
+            }
+            var iters = splitTraceByIteration(trace);
+            if (iters && iters.length > 1) {
+                iters.forEach(function (sub) { _devFlow.pages.push(buildMermaidFromTrace(sub, query || "")); });
+            } else {
+                _devFlow.pages.push(buildMermaidFromTrace(trace, query || ""));
+            }
+            await devFlowGoTo(0);
+        }
+        async function devFlowGoTo(idx) {
+            var f = _devFlow;
+            if (!f.pages.length || !f.host) return;
+            f.idx = Math.max(0, Math.min(idx, f.pages.length - 1));
+            var page = f.pages[f.idx];
+            var id = "devviz-" + (++_vizCounter);
+            try {
+                if (typeof applyMermaidTheme === "function") applyMermaidTheme();
+                var out = await mermaid.render(id, page.def);
+                f.host.innerHTML = out.svg;
+                attachDevNodeClicks(page.nodeMap, f.host);
+                attachDevPassNav(f.host);
+            } catch (err) {
+                f.host.innerHTML = '<div class="viz-empty">Could not render flow: ' + escapeHtml(err.message || String(err)) + "</div>";
+            }
+        }
+        function attachDevNodeClicks(nodeMap, host) {
+            var svg = host.querySelector("svg");
+            if (!svg) return;
+            svg.querySelectorAll("g.node").forEach(function (g) {
+                var nodeId = g.dataset.id || "";
+                if (!nodeId && g.id) nodeId = g.id.replace(/^flowchart-/, "").replace(/-\\d+$/, "");
+                if (!nodeId || !nodeMap[nodeId]) return;
+                var stage = nodeMap[nodeId];
+                g.style.cursor = "pointer";
+                g.addEventListener("click", function (e) {
+                    e.stopPropagation();
+                    showStagePopup(stage, e.clientX, e.clientY);
+                });
+            });
+        }
+        function attachDevPassNav(host) {
+            var f = _devFlow;
+            if (f.pages.length <= 1) return;
+            var nav = document.createElement("div");
+            nav.className = "viz-pass-nav";
+            nav.innerHTML =
+                '<button type="button" data-p="prev" title="Previous pass">\\u2190</button>'
+                + '<span class="viz-pass-label">Pass ' + (f.idx + 1) + ' / ' + f.pages.length + "</span>"
+                + '<button type="button" data-p="next" title="Next pass">\\u2192</button>';
+            var prevB = nav.querySelector('[data-p="prev"]');
+            var nextB = nav.querySelector('[data-p="next"]');
+            if (prevB) prevB.disabled = f.idx === 0;
+            if (nextB) nextB.disabled = f.idx === f.pages.length - 1;
+            nav.addEventListener("click", function (e) {
+                var b = e.target.closest("button");
+                if (!b) return;
+                devFlowGoTo(b.dataset.p === "prev" ? f.idx - 1 : f.idx + 1);
+            });
+            host.appendChild(nav);
+        }
+        async function addDevNote() {
+            var input = document.getElementById("dev-note-input");
+            var err = document.getElementById("dev-note-err");
+            var btn = document.getElementById("dev-note-add");
+            var body = (input.value || "").trim();
+            err.textContent = "";
+            if (!body) { err.textContent = "Note is empty."; return; }
+            btn.disabled = true; btn.textContent = "Saving…";
+            try {
+                var res = await fetch("/api/dev-notes", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    credentials: "same-origin",
+                    body: JSON.stringify({ body: body }),
+                });
+                if (!res.ok) throw new Error("http " + res.status);
+                input.value = "";
+                await loadDevNotes();
+            } catch (e) {
+                err.textContent = "Could not save the note.";
+            } finally {
+                btn.disabled = false; btn.textContent = "Add note";
+            }
+        }
+        function openDevPanel() {
+            var ov = document.getElementById("dev-overlay");
+            if (!ov) return;
+            ov.hidden = false;
+            loadFlags();
+            loadDevNotes();
+        }
+        function closeDevPanel() {
+            var ov = document.getElementById("dev-overlay");
+            if (ov) ov.hidden = true;
+        }
+        function setDevTab(tab) {
+            document.querySelectorAll(".dev-tab").forEach(function (b) {
+                b.classList.toggle("active", b.getAttribute("data-devtab") === tab);
+            });
+            document.getElementById("dev-pane-flags").hidden = (tab !== "flags");
+            document.getElementById("dev-pane-notes").hidden = (tab !== "notes");
+        }
+        (function () {
+            var fab = document.getElementById("dev-fab");
+            if (fab) fab.addEventListener("click", openDevPanel);
+            var close = document.getElementById("dev-close");
+            if (close) close.addEventListener("click", closeDevPanel);
+            var ov = document.getElementById("dev-overlay");
+            if (ov) ov.addEventListener("click", function (e) { if (e.target === ov) closeDevPanel(); });
+            document.addEventListener("keydown", function (e) {
+                if (e.key === "Escape" && ov && !ov.hidden) closeDevPanel();
+            });
+            document.querySelectorAll(".dev-tab").forEach(function (b) {
+                b.addEventListener("click", function () { setDevTab(b.getAttribute("data-devtab")); });
+            });
+            var refresh = document.getElementById("dev-refresh");
+            if (refresh) refresh.addEventListener("click", loadFlags);
+            var addBtn = document.getElementById("dev-note-add");
+            if (addBtn) addBtn.addEventListener("click", addDevNote);
+        })();
 
         /* ── renderSidebar override (gap-hint card) ──────────────────────── */
         window.renderSidebar = function (data) {

@@ -290,18 +290,18 @@ async function submitFlag(reason) {
 
 ## 5. Build checklist (in order)
 
-1. [ ] **Schema** — add `flagged_answers` table + indexes to
-   `scripts/supabase_schema.sql`; run it against Supabase.
-2. [ ] **Backend model** — add `FlagAnswerRequest` to `src/pipeline/app.py`.
-3. [ ] **Backend route** — add `POST /api/flag-answer` (guarded by
+1. [x] **Schema** — added `flagged_answers` table + indexes to
+   `scripts/supabase_schema.sql`. *Still to run against Supabase (SQL editor/psql).*
+2. [x] **Backend model** — added `FlagAnswerRequest` to `src/pipeline/app.py`.
+3. [x] **Backend route** — added `POST /api/flag-answer` (guarded by
    `require_auth`, inserts via `supabase_client()`).
-4. [ ] **Frontend capture** — set `window._lastResponse = data` in
+4. [x] **Frontend capture** — set `window._lastResponse = data` in
    `displayResults`.
-5. [ ] **Frontend FAB** — add the sticky flag button HTML + `.flag-fab` CSS.
-6. [ ] **Frontend modal** — add the optional-explanation modal + open/close
-   wiring.
-7. [ ] **Frontend submit** — add `submitFlag()`, confirmation state, error
-   handling; reset state on new query.
+5. [x] **Frontend FAB** — added the sticky flag button HTML + `.flag-fab` CSS.
+6. [x] **Frontend modal** — added the optional-explanation modal + open/close
+   wiring (overlay click + Esc close).
+7. [x] **Frontend submit** — added `submitFlag()`, confirmation state, toast,
+   error handling; `resetFlagFab()` on new query.
 8. [ ] **Manual test** — run a query, click the flag, submit with and without a
    note, confirm a row lands in `flagged_answers` with `config` +
    `pipeline_trace` populated.

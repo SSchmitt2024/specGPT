@@ -88,6 +88,28 @@ def test_extract_citations_strips_trailing_dot():
     }]
 
 
+def test_extract_citations_picks_up_block_attribution_line():
+    """Tables/code blocks can't carry an end-of-sentence tag, so the model is
+    instructed (rule 2b) to cite them on a trailing `Source: [§…]` line. That
+    line is plain answer text, so the bracket parser must resolve it like any
+    other tag — keeping the block's citation in the sidebar + chips."""
+    from src.pipeline.generator import _extract_citations
+    answer = (
+        "Here is the CDW10 layout:\n\n"
+        "| Bits | Field | Description |\n"
+        "| --- | --- | --- |\n"
+        "| 7:0 | OPC | Opcode |\n\n"
+        "Source: [§5.2.1]\n"
+    )
+    cits = _extract_citations(
+        answer,
+        [{"section_id": "5.2.1", "section_title": "X", "content_type": "table"}],
+    )
+    ids = [c["section_id"] for c in cits]
+    assert ids == ["5.2.1"], ids
+    assert cits[0]["hallucinated"] is False
+
+
 def test_extract_citations_flags_hallucinated_sections():
     from src.pipeline.generator import _extract_citations
     cits = _extract_citations(
