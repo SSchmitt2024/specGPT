@@ -7,3 +7,103 @@ In recursed cycle, structure lookup should happen as well
 
 Look into having a different type of pipeline if the query is asking about a command
 
+
+========================================================================
+PIPELINE INEFFICIENCY AUDIT (ranked most -> least significant)
+========================================================================
+Three layers: live query path, web layer (app.py), offline corpus build.
+
+--- TIER 0: dominant, system-wide ---
+1. Global 6.5s LLM pacing lock serializes every Gemini call process-wide
+   (llm/client.py:48,76). Live: balanced query = 2 paced calls; agentic
+   "thorough" ~25 calls = ~160s of pure sleep. Build: ~1,600 serial calls
+   = ~2.9 HOURS of pure time.sleep() per full rebuild. Concurrency makes it
+   worse (all users serialize 6.5s apart). FIX: per-provider token-bucket
+   rate limiter at real RPM + run independent calls concurrently. This is
+   the only change that materially moves both build time and agentic latency.
+
+--- TIER 1: critical (live latency / event-loop blocking) ---
+2. Retrieval runs fully sequentially inside orchestrate() (orchestrator.py:
+   294-330). Up to 12 serial network round-trips (vector+tsvector+bm25 x
+   sub-queries); structured vs hybrid also serial. FIX: ThreadPoolExecutor
+   over (method x sub-query); run structured + hybrid concurrently.
+3. Voyage embeds one sub-query per API call (search.py:228). FIX: batch all
+   sub-queries into one embed call.
+4. All Supabase admin I/O blocks the event loop (app.py:910,936,953,972,992,
+   1009) - six async endpoints call sync .execute() directly. FIX: wrap in
+   asyncio.to_thread (query endpoints already do this; admin ones don't).
+5. verify_password (scrypt ~100ms) blocks event loop in async login()
+   (app.py:470). FIX: asyncio.to_thread.
+6. Build rewrites entire growing output file + os.fsync after EVERY LLM call
+   (generate_cards.py:475, extract_relationships.py:226) - ~1.6GB rewrites
+   + sync flush stall per call. FIX: checkpoint every N=10-50 calls.
+
+--- TIER 2: high (wasted compute / cost / memory) ---
+7. [MISSING] No result/embedding/rerank caching anywhere - identical queries
+   redo all work. FIX: embedding cache + semantic/exact query->answer cache
+   w/ TTL + memoize structured_lookup.
+8. [MISSING] No confidence short-circuit - HIGH-confidence structured lookups
+   still run full hybrid+rerank+gap-check (orchestrator.py:1221-1471).
+9. auto_gap_check=True adds a paced Gemini call to EVERY default query
+   (orchestrator.py:136,1042). FIX: default off / compute lazily.
+10. BM25 scores entire multi-spec corpus then filters by spec post-hoc
+    (bm25_index.py:169-185). FIX: partition index per spec.
+11. Agentic loop re-reranks the whole growing pool every iteration
+    (orchestrator.py:942-950). FIX: cache rerank scores; score only new chunks.
+12. Refine cache stores full chunk dicts incl. multi-KB text_raw, no TTL
+    (app.py:232-250,546) - up to ~32MB held indefinitely. FIX: store only
+    needed fields + TTLCache.
+13. Duplicate find_tables() over ~760 pages in build (prose.py:201 re-runs
+    tables.py:799) = ~15-38s wasted. FIX: tables.py emits table_bboxes.json
+    sidecar.
+14. Anthropic() re-instantiated per generation (generator.py:760) - loses
+    connection pooling. FIX: module-level singleton.
+15. Per-request rebuilds in web layer: static PipelineConfig() each call
+    (app.py:827,843,847); client always sends debug:true so full trace is
+    built+asdict-serialized every request when DEBUG_PIPELINE=1
+    (app.py:514,3997). FIX: cache static responses; request trace only on
+    panel open.
+16. reconcile.py:97 compiles regex inside _normalize_name() (~30-180k calls/
+    run). FIX: pre-compile suffix patterns at module load.
+
+--- TIER 3: medium ---
+17. Trace objects always built even when debug=False (orchestrator.py:1084).
+18. /api/flags fetches full pipeline_trace JSONB per row on panel open
+    (~20MB/200 rows); flag submit ships whole trace (app.py:932,900).
+19. Frontend re-parses markdown ~333x/answer during typewriter animation
+    (app.py:4046). Animate plain text, render once on done.
+20. Mermaid viz rendered into hidden container then re-rendered on open
+    (twice) (app.py:4591).
+21. tables.py collapses each row twice (~4,500 calls, tables.py:239); ~1,700
+    extra page.get_text() by calling per-table not per-page (tables.py:374,839).
+22. enum_tables.py iterates all 717 tables 5x (once per concept,
+    enum_tables.py:231). Single bucketing pass suffices.
+23. deep_sections._is_known_title O(candidates x TOC) ~720k comparisons
+    (deep_sections.py:257). Use a dict.
+24. relationships.extract_from_table re-scans raw_text (superset of row
+    descriptions already scanned) (relationships.py:366).
+25. prose._extract_normative compiles 3 regexes per sentence (prose.py:613).
+    Use one combined \b(shall|should|may)\b.
+26. sorted(processed) every build iteration - O(N^2 log N)
+    (generate_cards.py:473, extract_relationships.py:223).
+27. prose.py opens the PDF twice (once just for page_count, prose.py:647).
+28. Crude len//4 token estimate wastes context budget (generator.py:139).
+
+--- TIER 4: low ---
+_login_html() regenerated per request + in-body import (app.py:338,340);
+os.getenv("TRUST_PROXY_HEADERS") per request (app.py:300); renderCostEstimate
+fires per keystroke no debounce (app.py:2742); _dump_model reflection per SSE
+close (app.py:569); reconcile/fields multi-pass loops + list.index() header
+lookups (reconcile.py:144, fields.py:293); 250KB FRONTEND_HTML constant blocks
+ETag caching; BM25 cold-start (no warmup); _supabase_available() re-reads .env
+when env var absent (retriever.py:122).
+
+--- MISSING TECHNIQUES (gaps) ---
+- Concurrent retrieval (#2); caching layer (#7); token-bucket rate limiting
+  vs fixed global sleep (#1); confidence-gated early exit (#8); batched
+  embeddings (#3) + incremental rerank scoring (#11); resumable/checkpointed
+  build (#6) + content-hash card caching to skip unchanged sections.
+
+BOTTOM LINE: fixing #1 (rate-limiter+concurrency), #2 (parallel retrieval),
+and #7 (caching) addresses the overwhelming majority of latency and cost.
+

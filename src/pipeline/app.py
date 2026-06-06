@@ -4523,11 +4523,13 @@ a { color: var(--accent); text-decoration: none; }
 
         /* ── sources sidebar ─────────────────────────────────────────────── */
         function renderSourcesSidebar(citations) {
+            console.log("[specGPT] renderSourcesSidebar called, citations:", citations);
             var list = document.getElementById("citations-list");
             var box = document.getElementById("citations-box");
             var count = document.getElementById("sources-count");
-            if (!list || !box) return;
-            if (!citations || !citations.length) { box.classList.add("hidden"); return; }
+            console.log("[specGPT] list:", list, "box:", box);
+            if (!list || !box) { console.log("[specGPT] missing list/box element"); return; }
+            if (!citations || !citations.length) { console.log("[specGPT] citations empty, hiding box"); box.classList.add("hidden"); return; }
             list.innerHTML = citations.map(function (c) {
                 var sid = escapeHtml(String(c.section_id || ""));
                 var title = escapeHtml(String(c.section_title || ""));
@@ -4602,6 +4604,7 @@ a { color: var(--accent); text-decoration: none; }
             if (_cancelAnswerStream) { _cancelAnswerStream(); _cancelAnswerStream = null; }
             var answerText = data.answer || "";
 
+            console.log("[specGPT] displayResults called, data.citations:", data.citations);
             renderAnswerMeta(data);
             renderSourcesSidebar(data.citations);
             var lat = document.getElementById("latency"); if (lat) lat.textContent = "";
