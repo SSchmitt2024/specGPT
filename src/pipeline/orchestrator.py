@@ -291,18 +291,29 @@ def hybrid_search(
     spec_filter = {"spec": config.spec}
 
     # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
-    for i, sq in enumerate(sub_queries):
-        start = time.time()
-        vec_results = search.vector_search(sq, top_k=config.vector_topk, filter=spec_filter)
-        took_vec = time.time() - start
+    import concurrent.futures
 
-        start = time.time()
-        tsv_results = search.tsvector_search(sq, top_k=config.tsvector_topk, filter=spec_filter)
-        took_tsv = time.time() - start
+    def _run_search(func, *args, **kwargs):
+        t0 = time.time()
+        res = func(*args, **kwargs)
+        return res, time.time() - t0
 
-        start = time.time()
-        bm25_results = search.bm25_search(sq, top_k=config.bm25_topk, filter=spec_filter)
-        took_bm25 = time.time() - start
+    futures = []
+    # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(36, len(sub_queries) * 3)) as executor:
+        for i, sq in enumerate(sub_queries):
+            futures.append({
+                "i": i, "sq": sq,
+                "vec_fut": executor.submit(_run_search, search.vector_search, sq, top_k=config.vector_topk, filter=spec_filter),
+                "tsv_fut": executor.submit(_run_search, search.tsvector_search, sq, top_k=config.tsvector_topk, filter=spec_filter),
+                "bm25_fut": executor.submit(_run_search, search.bm25_search, sq, top_k=config.bm25_topk, filter=spec_filter)
+            })
+
+    for f in futures:
+        i, sq = f["i"], f["sq"]
+        vec_results, took_vec = f["vec_fut"].result()
+        tsv_results, took_tsv = f["tsv_fut"].result()
+        bm25_results, took_bm25 = f["bm25_fut"].result()
 
         sub_trace.append(
             PipelineStage(
@@ -1225,16 +1236,46 @@ def orchestrate(
         if getattr(e, "kind", None)
         in ("field", "figure", "fid", "lid", "opcode", "cns", "status", "hex")
     ]
-    if _lookup_entities:
-        start = time.time()
-        struct_result = retriever.structured_lookup(
-            decomp,
-            use_llm=False,  # already did LLM in query_processor
-            max_fields=8,
-            spec=config.spec,
-            enable_fuzzy=config.enable_fuzzy_lookup,
-            fuzzy_cutoff=config.fuzzy_lookup_cutoff,
+    import concurrent.futures
+
+    struct_fut = None
+    hybrid_fut = None
+    
+    # -------------------------------------------------------------------------
+    # Stage 2b: Hybrid Search Prep
+    # -------------------------------------------------------------------------
+    search_queries: list[str] = [query]
+    for sq in decomp.sub_queries or []:
+        if sq and sq.strip() and sq.strip() != query.strip() and sq not in search_queries:
+            search_queries.append(sq)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        if _lookup_entities:
+            struct_fut = executor.submit(
+                retriever.structured_lookup,
+                decomp,
+                use_llm=False,  # already did LLM in query_processor
+                max_fields=8,
+                spec=config.spec,
+                enable_fuzzy=config.enable_fuzzy_lookup,
+                fuzzy_cutoff=config.fuzzy_lookup_cutoff,
+            )
+        else:
+            struct_fut = None
+
+        hybrid_fut = executor.submit(
+            hybrid_search,
+            query,
+            sub_queries=search_queries,
+            config=config,
         )
+
+    # -------------------------------------------------------------------------
+    # Retrieve structured results
+    # -------------------------------------------------------------------------
+    if _lookup_entities and struct_fut is not None:
+        start = time.time()
+        struct_result = struct_fut.result()
         took_struct = time.time() - start
 
         structured_chunks = struct_result.sources if struct_result.found else []
@@ -1275,21 +1316,10 @@ def orchestrate(
         )
 
     # -------------------------------------------------------------------------
-    # Stage 2b: Hybrid Search (always run; vector + BM25 + RRF, no rerank yet)
+    # Retrieve hybrid results
     # -------------------------------------------------------------------------
     start = time.time()
-    # Always include the verbatim original query so RRF can pick up direct
-    # phrase matches the LLM's reworded sub-queries miss.
-    search_queries: list[str] = [query]
-    for sq in decomp.sub_queries or []:
-        if sq and sq.strip() and sq.strip() != query.strip() and sq not in search_queries:
-            search_queries.append(sq)
-
-    hybrid_chunks, hybrid_trace = hybrid_search(
-        query,
-        sub_queries=search_queries,
-        config=config,
-    )
+    hybrid_chunks, hybrid_trace = hybrid_fut.result()
     took_hybrid = time.time() - start
 
     trace.extend(hybrid_trace)

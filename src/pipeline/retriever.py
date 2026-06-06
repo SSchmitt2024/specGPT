@@ -28,12 +28,16 @@ import difflib
 import json
 import logging
 import re
+import string
 import sys
+import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from src.pipeline.cache import ttl_cache
 from src.pipeline.query_processor import Entity, QueryDecomposition, process_query
 from src.pipeline.table_serializer import serialize_table
 
@@ -823,6 +827,7 @@ def _fuzzy_full_name_matches(
     return records, notes
 
 
+@ttl_cache(maxsize=1000, ttl=3600)
 def structured_lookup(
     query_or_decomposition: str | QueryDecomposition | dict,
     *,

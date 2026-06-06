@@ -65,27 +65,34 @@ class LLMResult:
 # ---------------------------------------------------------------------------
 # Shared pacing
 
-_last_call_ts: float = 0.0
-# FastAPI runs orchestrate() in asyncio.to_thread, so concurrent requests
-# share this module-level state. Without the lock, two threads can both
-# read _last_call_ts==X, sleep concurrently, and burst-trip provider
-# rate limits despite "pacing" being configured.
+_PACING_CAPACITY = {
+    "gemini": 5.0,
+    "openai": 50.0,
+}
+_capacity = _PACING_CAPACITY.get(PROVIDER, 5.0)
+_tokens: float = _capacity
+_last_update_ts: float = time.monotonic()
+
 _pace_lock = threading.Lock()
 
 
 def _pace() -> None:
-    global _last_call_ts
+    global _tokens, _last_update_ts
+    fill_rate = 1.0 / MIN_SECONDS_BETWEEN_CALLS
     with _pace_lock:
         now = time.monotonic()
-        elapsed = now - _last_call_ts
-        if elapsed < MIN_SECONDS_BETWEEN_CALLS:
-            sleep_for = MIN_SECONDS_BETWEEN_CALLS - elapsed
-        else:
+        elapsed = now - _last_update_ts
+        _tokens = min(_capacity, _tokens + elapsed * fill_rate)
+        _last_update_ts = now
+        
+        if _tokens >= 1.0:
+            _tokens -= 1.0
             sleep_for = 0.0
-        # Reserve our slot *before* releasing the lock so a second thread
-        # waiting on the lock will see the updated timestamp and pace itself
-        # against ours rather than against the previous caller's.
-        _last_call_ts = now + sleep_for
+        else:
+            deficit = 1.0 - _tokens
+            sleep_for = deficit / fill_rate
+            _tokens -= 1.0
+            
     if sleep_for > 0:
         time.sleep(sleep_for)
 

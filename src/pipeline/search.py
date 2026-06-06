@@ -68,6 +68,8 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from src.pipeline.cache import ttl_cache
+
 try:
     from supabase import Client, create_client
 except ImportError:
@@ -208,6 +210,7 @@ def _shape(row: dict, score: float, method: str) -> dict:
 # ---------------------------------------------------------------------------
 # 1. Vector search
 
+@ttl_cache(maxsize=1000, ttl=3600)
 def vector_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
@@ -257,6 +260,7 @@ def vector_search(
 # cover density (TF-IDF-flavored). Strong for natural-language prose
 # queries; weaker for exact-token queries like spec identifiers.
 
+@ttl_cache(maxsize=1000, ttl=3600)
 def tsvector_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
@@ -293,6 +297,7 @@ def tsvector_search(
 # runs in-process. The ~1,900-row corpus is loaded once per process and
 # cached; see bm25_index.py for index + tokenization details.
 
+@ttl_cache(maxsize=1000, ttl=3600)
 def bm25_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
