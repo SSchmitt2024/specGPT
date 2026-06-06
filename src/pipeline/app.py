@@ -1123,7 +1123,8 @@ body {
   letter-spacing: -0.006em;
   font-feature-settings: "ss01", "cv01";
 }
-::selection { background: var(--accent-soft); }
+::selection { background: var(--accent-bd); }
+[data-theme="dark"] ::selection { background: rgba(91, 140, 255, 0.35); }
 button { font-family: inherit; cursor: pointer; }
 input, select, textarea { font-family: inherit; }
 .mono { font-family: var(--mono); font-feature-settings: normal; letter-spacing: 0; }
@@ -1165,6 +1166,7 @@ a { color: var(--accent); text-decoration: none; }
 .picker-lbl { font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--t-faint); font-weight:600; white-space:nowrap; }
 .picker select { border:0; background:transparent; color:var(--ink); font-size:13px; font-weight:500;
   outline:none; cursor:pointer; max-width:180px; }
+[data-theme="dark"] select option { background:var(--surface-2); color:var(--ink); }
 .ghost-btn { height:34px; padding:0 13px; border:1px solid var(--border); border-radius:8px; background:var(--surface);
   color:var(--t-muted); font-size:13px; font-weight:500; transition:all .14s; white-space:nowrap; }
 .ghost-btn:hover { background:var(--surface-2); border-color:var(--border-2); color:var(--ink); }
@@ -1189,12 +1191,13 @@ a { color: var(--accent); text-decoration: none; }
     color-mix(in srgb, var(--accent) 13%, transparent),
     color-mix(in srgb, var(--accent) 4%, transparent) 72%), var(--surface);
   box-shadow:var(--shadow-md), 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent); }
-.composer-row { display:flex; align-items:center; gap:10px; }
-.composer-input-wrap { flex:1; display:flex; align-items:center; gap:10px; padding-left:4px; min-width:0; }
-.composer-input-wrap > svg { width:19px; height:19px; color:var(--t-faint); flex:none; }
-.composer input { flex:1; border:0; background:transparent; color:var(--ink); font-size:17px;
-  letter-spacing:-0.01em; outline:none; padding:8px 0; min-width:0; }
-.composer input::placeholder { color:var(--t-faint); }
+.composer-row { display:flex; align-items:flex-end; gap:10px; }
+.composer-input-wrap { flex:1; display:flex; align-items:flex-end; gap:10px; padding-left:4px; min-width:0; }
+.composer-input-wrap > svg { width:19px; height:19px; color:var(--t-faint); flex:none; margin-bottom:9px; }
+.composer textarea { flex:1; border:0; background:transparent; color:var(--ink); font-size:17px;
+  letter-spacing:-0.01em; outline:none; padding:8px 0; min-width:0; resize:none; overflow:hidden;
+  line-height:1.5; min-height:36px; max-height:200px; }
+.composer textarea::placeholder { color:var(--t-faint); }
 .ask-btn { height:42px; padding:0 20px; border-radius:9px; border:1px solid var(--ink); background:var(--ink);
   color:var(--surface); font-size:14px; font-weight:600; letter-spacing:-0.01em; display:inline-flex;
   align-items:center; gap:8px; transition:transform .08s, filter .14s, opacity .14s; flex:none; }
@@ -1294,6 +1297,7 @@ a { color: var(--accent); text-decoration: none; }
 /* answer card */
 .answer-box { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow-sm); overflow:hidden; }
+#answer-section.answer-stale { opacity: 0.4; pointer-events: none; transition: opacity 0.2s; }
 .answer-meta { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--surface-2); }
 .meta-q { font-size:13px; font-weight:600; color:var(--ink); margin-right:auto; letter-spacing:-0.01em;
   max-width:58%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1726,8 +1730,8 @@ a { color: var(--accent); text-decoration: none; }
                 <div class="composer-row">
                     <div class="composer-input-wrap">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
-                        <input type="text" id="query-input" autocomplete="off"
-                               placeholder="Ask about the NVMe spec...  e.g. What does CIRN indicate?">
+                        <textarea id="query-input" autocomplete="off" rows="1"
+                               placeholder="Ask about the NVMe spec...  e.g. What does CIRN indicate?"></textarea>
                     </div>
                     <button id="search-btn" class="ask-btn">
                         Ask
@@ -2540,7 +2544,7 @@ a { color: var(--accent); text-decoration: none; }
         // Token-budget assumptions (calibrated against typical NVMe queries):
         //   • System prompt:    ~900 tokens (load-bearing instructions)
         //   • User query:       ~60 tokens
-        //   • Avg chunk:        ~450 tokens (text + section title + header)
+        //   • Avg chunk:        ~350 tokens (median observed; was 450 which over-estimated)
         //   • Gap-analysis IO:  ~2200 in / ~400 out
         //   • Targeted-fetch:   ~1200 in / ~250 out
         // Numbers are coarse but consistent - the goal is "is this $0.01 or
@@ -2548,7 +2552,7 @@ a { color: var(--accent); text-decoration: none; }
         const COST_ASSUMPTIONS = {
             sys_tokens: 900,
             query_tokens: 60,
-            avg_chunk_tokens: 450,
+            avg_chunk_tokens: 350,       // was 450 — median observed chunk size
             gap_in: 2200, gap_out: 400,
             tfetch_in: 1200, tfetch_out: 250,
             embedding_price_per_1m: 0.02,
@@ -2615,7 +2619,7 @@ a { color: var(--accent); text-decoration: none; }
             const normalCtxBudget = 4000; // matches PipelineConfig.llm_max_context_tokens default
             const normalCtxTok = Math.min(cfg.final_rerank_topk * A.avg_chunk_tokens, normalCtxBudget);
             const normalIn  = A.sys_tokens + A.query_tokens + normalCtxTok;
-            const normalOut = 1024; // matches PipelineConfig.llm_max_output_tokens default
+            const normalOut = 500; // typical output; max is llm_max_output_tokens (1024)
             const normalCost = _llmCallCost(normalIn, normalOut, regPrice);
             rows.push({
                 name: "Generate (regular)",
@@ -2708,7 +2712,7 @@ a { color: var(--accent); text-decoration: none; }
                     <div class="cost-row-value">${_fmtCostShort(est.total)}</div>
                 </div>
                 <div class="cost-disclaimer">
-                    Rough estimate. Assumes ~${COST_ASSUMPTIONS.avg_chunk_tokens} tok per chunk and a ~${COST_ASSUMPTIONS.sys_tokens}-token system prompt. Real usage depends on query complexity and chunk size, so expect about a 30% variance. Embedding/rerank costs are negligible.
+                    Typical-case estimate using median chunk size and average output length. Actual cost is usually within 20% of this figure. Worst-case (max output, large chunks) could be 2x higher. Embedding/rerank costs are negligible.
                 </div>
             `;
         }
@@ -3716,9 +3720,19 @@ a { color: var(--accent); text-decoration: none; }
             configPanel.classList.toggle("open");
         });
 
-        // Search on Enter key
-        queryInput.addEventListener("keypress", (e) => {
-            if (e.key === "Enter") {
+        // Auto-resize textarea
+        const TEXTAREA_MAX_H = 200;
+        function autoResizeInput() {
+            queryInput.style.height = "auto";
+            queryInput.style.height = queryInput.scrollHeight + "px";
+            queryInput.style.overflowY = queryInput.scrollHeight > TEXTAREA_MAX_H ? "auto" : "hidden";
+        }
+        queryInput.addEventListener("input", autoResizeInput);
+
+        // Enter submits, Shift+Enter inserts newline
+        queryInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
                 runQuery();
             }
         });
@@ -3763,6 +3777,51 @@ a { color: var(--accent); text-decoration: none; }
             _stopThinking();
             if (searchBtn) searchBtn.disabled = false;
             _activeAbort = null;
+            answerSection.classList.remove("answer-stale");
+        }
+
+        // ─── Favicon badge ────────────────────────────────────────────────
+        var _faviconEl = null;
+        var _origFaviconHref = "/static/favicon.png";
+        function _getFaviconEl() {
+            if (!_faviconEl) _faviconEl = document.querySelector("link[rel='icon']");
+            return _faviconEl;
+        }
+        function _setBadgeFavicon() {
+            var img = new Image();
+            img.src = _origFaviconHref;
+            img.onload = function () {
+                var sz = img.width || 32;
+                var canvas = document.createElement("canvas");
+                canvas.width = sz; canvas.height = sz;
+                var ctx = canvas.getContext("2d");
+                ctx.drawImage(img, 0, 0, sz, sz);
+                var r = Math.max(5, sz * 0.22);
+                ctx.beginPath();
+                ctx.arc(sz - r, r, r, 0, 2 * Math.PI);
+                ctx.fillStyle = "#5b8cff";
+                ctx.fill();
+                var el = _getFaviconEl();
+                if (el) el.href = canvas.toDataURL("image/png");
+            };
+        }
+        function _restoreFavicon() {
+            var el = _getFaviconEl();
+            if (el) el.href = _origFaviconHref;
+        }
+        window.addEventListener("focus", _restoreFavicon);
+
+        function _notifyDone(title, body) {
+            _setBadgeFavicon();
+            if (!("Notification" in window)) return;
+            if (Notification.permission === "granted") {
+                try { new Notification(title, { body, icon: _origFaviconHref }); } catch (e) {}
+            }
+        }
+
+        function _requestNotifyPermission() {
+            if (!("Notification" in window) || Notification.permission !== "default") return;
+            Notification.requestPermission();
         }
 
         // ─── "Thinking about…" cycling ticker ─────────────────────────────
@@ -3920,6 +3979,8 @@ a { color: var(--accent); text-decoration: none; }
         async function runQuery() {
             const query = queryInput.value.trim();
             if (!query) return;
+            _requestNotifyPermission();
+            _restoreFavicon();
 
             // A new prompt is the only thing that clears open stage popups.
             closeAllStagePopups();
@@ -3952,7 +4013,11 @@ a { color: var(--accent); text-decoration: none; }
             // Show loading
             resultsDiv.classList.remove("hidden");
             errorDiv.classList.add("hidden");
-            answerSection.classList.add("hidden");
+            if (!answerSection.classList.contains("hidden")) {
+                answerSection.classList.add("answer-stale");
+            } else {
+                answerSection.classList.add("hidden");
+            }
 
             const agentic = agenticToggle.checked;
             const title = agentic ? "Thinking deeply…" : "Thinking…";
@@ -4303,7 +4368,11 @@ a { color: var(--accent); text-decoration: none; }
             };
 
             errorDiv.classList.add("hidden");
-            answerSection.classList.add("hidden");
+            if (!answerSection.classList.contains("hidden")) {
+                answerSection.classList.add("answer-stale");
+            } else {
+                answerSection.classList.add("hidden");
+            }
             _startLoading("Refining the answer…");
 
             _activeAbort = new AbortController();
@@ -4576,6 +4645,8 @@ a { color: var(--accent); text-decoration: none; }
             if (flagFab) { flagFab.classList.remove("flagged"); flagFab.hidden = false; }
 
             document.getElementById("answer-section").classList.remove("hidden");
+            document.getElementById("answer-section").classList.remove("answer-stale");
+            _notifyDone("specGPT", "Answer ready");
         };
 
         /* ── Flag answer: FAB + modal wiring ─────────────────────────────── */
@@ -4814,9 +4885,9 @@ a { color: var(--accent); text-decoration: none; }
                 if (btn) { btn.disabled = false; btn.textContent = "Delete failed, retry"; }
             }
         }
-        async function loadDevNotes() {
+        async function loadDevNotes({ silent = false } = {}) {
             var list = document.getElementById("dev-notes-list");
-            list.innerHTML = '<div class="dev-empty">Loading…</div>';
+            if (!silent) list.innerHTML = '<div class="dev-empty">Loading…</div>';
             try {
                 var res = await fetch("/api/dev-notes", { credentials: "same-origin" });
                 if (!res.ok) throw new Error("http " + res.status);
@@ -4844,7 +4915,7 @@ a { color: var(--accent); text-decoration: none; }
                     credentials: "same-origin",
                 });
                 if (!res.ok) throw new Error("http " + res.status);
-                await loadDevNotes();
+                await loadDevNotes({ silent: true });
             } catch (e) {
                 var err = document.getElementById("dev-note-err");
                 if (err) err.textContent = "Could not delete the note.";
@@ -4942,7 +5013,7 @@ a { color: var(--accent); text-decoration: none; }
                 });
                 if (!res.ok) throw new Error("http " + res.status);
                 input.value = "";
-                await loadDevNotes();
+                await loadDevNotes({ silent: true });
             } catch (e) {
                 err.textContent = "Could not save the note.";
             } finally {
@@ -4984,6 +5055,10 @@ a { color: var(--accent); text-decoration: none; }
             if (refresh) refresh.addEventListener("click", loadFlags);
             var addBtn = document.getElementById("dev-note-add");
             if (addBtn) addBtn.addEventListener("click", addDevNote);
+            var noteInput = document.getElementById("dev-note-input");
+            if (noteInput) noteInput.addEventListener("keydown", function (e) {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); addDevNote(); }
+            });
         })();
 
         /* ── renderSidebar override (gap-hint card) ──────────────────────── */
@@ -5064,6 +5139,8 @@ a { color: var(--accent); text-decoration: none; }
                 b.addEventListener("click", function () {
                     var qi = document.getElementById("query-input");
                     qi.value = b.textContent;
+                    qi.style.height = "auto";
+                    qi.style.height = qi.scrollHeight + "px";
                     hideEmpty();
                     runQuery();
                 });
@@ -5085,7 +5162,7 @@ a { color: var(--accent); text-decoration: none; }
             }
             var sb = document.getElementById("search-btn");
             if (sb) sb.addEventListener("click", hideEmpty);
-            if (i) i.addEventListener("keypress", function (e) { if (e.key === "Enter") hideEmpty(); });
+            if (i) i.addEventListener("keydown", function (e) { if (e.key === "Enter" && !e.shiftKey) hideEmpty(); });
         })();
 
         /* ── pipeline disclosure toggle ──────────────────────────────────── */
