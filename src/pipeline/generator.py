@@ -296,6 +296,31 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     # for citations.
     _BID = r"(?:\d+(?:\.\w+)+|[A-Z]\.\w+(?:\.\w+)*)"
 
+    # Preferred form: a bracket whose contents are ENTIRELY section ids,
+    # optionally prefixed with § and comma-separated. The full-bracket match
+    # avoids treating arbitrary "[...]" (e.g. markdown) as a citation.
+    bracket_pattern = re.compile(
+        r"\[\s*§?\s*" + _BID + r"\s*(?:,\s*§?\s*" + _BID + r"\s*)*\]"
+    )
+    single_id_pattern = re.compile(_BID)
+
+    # Legacy prose form. Accept singular/plural ("Section 5.2.1", "Sections
+    # 5.2.1 and 5.2.2") and the "Appendix" prefix the LLM sometimes uses for
+    # letter-prefixed ids. Trailing punctuation is not consumed.
+    section_pattern = re.compile(
+        r"(?:Sections?|Append(?:ix(?:es)?|ices))\s+(" + _ID + r")(?!\.\w)",
+        re.IGNORECASE,
+    )
+
+    # Collect ids in order of first appearance: bracket tags first (the form
+    # the model now emits), then any legacy prose references.
+    ordered_ids: list[str] = []
+    for bm in bracket_pattern.finditer(answer):
+        for sid in single_id_pattern.findall(bm.group(0)):
+            ordered_ids.append(sid.rstrip("."))
+    for sm in section_pattern.finditer(answer):
+        ordered_ids.append(sm.group(1).rstrip("."))
+
     chunk_sections = {c.get("section_id"): c for c in context_chunks if c.get("section_id")}
     context_ids = list(chunk_sections.keys())
 
@@ -325,50 +350,6 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
         if children:
             return chunk_sections[children[0]], children[0]
         return None, cited
-
-    # Preferred form: a bracket whose contents are ENTIRELY section ids,
-    # or any bracket prefixed with §. The full-bracket match
-    # avoids treating arbitrary "[...]" (e.g. markdown) as a citation.
-    bracket_pattern = re.compile(
-        r"\[\s*(?:§[^\]]+|" + _BID + r"\s*(?:,\s*" + _BID + r"\s*)*)\]"
-    )
-
-    # Legacy prose form. Accept singular/plural ("Section 5.2.1", "Sections
-    # 5.2.1 and 5.2.2") and the "Appendix" prefix the LLM sometimes uses for
-    # letter-prefixed ids. Trailing punctuation is not consumed.
-    section_pattern = re.compile(
-        r"(?:Sections?|Append(?:ix(?:es)?|ices))\s+(" + _ID + r")(?!\.\w)",
-        re.IGNORECASE,
-    )
-    
-    # Bare section IDs. Only extracted if they resolve to a context chunk.
-    bare_pattern = re.compile(_BID)
-
-    # Collect ids in order of first appearance across all forms.
-    ordered_ids_with_pos: list[tuple[int, str]] = []
-    
-    for bm in bracket_pattern.finditer(answer):
-        content = bm.group(0)[1:-1].strip()
-        if "§" in bm.group(0):
-            parts = [p.replace('§', '').strip() for p in content.split(',')]
-            for part in parts:
-                if part:
-                    ordered_ids_with_pos.append((bm.start(), part.rstrip(".")))
-        else:
-            for sid in re.findall(_BID, bm.group(0)):
-                ordered_ids_with_pos.append((bm.start(), sid.rstrip(".")))
-
-    for sm in section_pattern.finditer(answer):
-        ordered_ids_with_pos.append((sm.start(), sm.group(1).rstrip(".")))
-
-    for bm in bare_pattern.finditer(answer):
-        sid = bm.group(0).rstrip(".")
-        chunk, _ = _resolve(sid)
-        if chunk is not None:
-            ordered_ids_with_pos.append((bm.start(), sid))
-
-    ordered_ids_with_pos.sort(key=lambda x: x[0])
-    ordered_ids = [sid for _, sid in ordered_ids_with_pos]
 
     for section_id in ordered_ids:
         if not section_id:
