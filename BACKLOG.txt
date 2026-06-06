@@ -14,7 +14,7 @@ PIPELINE INEFFICIENCY AUDIT (ranked most -> least significant)
 Three layers: live query path, web layer (app.py), offline corpus build.
 
 --- TIER 0: dominant, system-wide ---
-1. Global 6.5s LLM pacing lock serializes every Gemini call process-wide
+[DONE] 1. Global 6.5s LLM pacing lock serializes every Gemini call process-wide
    (llm/client.py:48,76). Live: balanced query = 2 paced calls; agentic
    "thorough" ~25 calls = ~160s of pure sleep. Build: ~1,600 serial calls
    = ~2.9 HOURS of pure time.sleep() per full rebuild. Concurrency makes it
@@ -23,7 +23,7 @@ Three layers: live query path, web layer (app.py), offline corpus build.
    the only change that materially moves both build time and agentic latency.
 
 --- TIER 1: critical (live latency / event-loop blocking) ---
-2. Retrieval runs fully sequentially inside orchestrate() (orchestrator.py:
+[DONE] 2. Retrieval runs fully sequentially inside orchestrate() (orchestrator.py:
    294-330). Up to 12 serial network round-trips (vector+tsvector+bm25 x
    sub-queries); structured vs hybrid also serial. FIX: ThreadPoolExecutor
    over (method x sub-query); run structured + hybrid concurrently.
@@ -39,7 +39,7 @@ Three layers: live query path, web layer (app.py), offline corpus build.
    + sync flush stall per call. FIX: checkpoint every N=10-50 calls.
 
 --- TIER 2: high (wasted compute / cost / memory) ---
-7. [MISSING] No result/embedding/rerank caching anywhere - identical queries
+[PARTIALLY DONE - ttl_cache added for retrievers] 7. [MISSING] No result/embedding/rerank caching anywhere - identical queries
    redo all work. FIX: embedding cache + semantic/exact query->answer cache
    w/ TTL + memoize structured_lookup.
 8. [MISSING] No confidence short-circuit - HIGH-confidence structured lookups
@@ -106,4 +106,5 @@ when env var absent (retriever.py:122).
 
 BOTTOM LINE: fixing #1 (rate-limiter+concurrency), #2 (parallel retrieval),
 and #7 (caching) addresses the overwhelming majority of latency and cost.
+(Update: #1, #2, and parts of #7 have been completed via perf-optimizations PR)
 
