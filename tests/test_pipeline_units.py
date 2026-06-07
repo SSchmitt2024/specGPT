@@ -119,6 +119,39 @@ def test_extract_citations_flags_hallucinated_sections():
     assert cits[0]["hallucinated"] is True
 
 
+def test_extract_citations_resolves_title_only_pages():
+    """Spec 'pages' often carry no numeric section_id (e.g. "Persistent Event
+    Log Page"); the context header renders them as "[i] § <title>" so the model
+    cites them by title. Those must resolve to the chunk, not be flagged
+    hallucinated (the amber-dot bug)."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [{
+        "section_id": "",
+        "section_title": "Persistent Event Log Page",
+        "content_type": "prose",
+        "spec": "base",
+        "pdf_pages": [42],
+    }]
+    cits = _extract_citations(
+        "LREV shall be set to 03h [§Persistent Event Log Page]. It sits at "
+        "byte 16 [§Persistent Event Log Page].",
+        ctx,
+    )
+    assert len(cits) == 1, cits
+    assert cits[0]["hallucinated"] is False
+    assert cits[0]["section_title"] == "Persistent Event Log Page"
+
+
+def test_extract_citations_title_match_is_case_and_space_insensitive():
+    from src.pipeline.generator import _extract_citations
+    ctx = [{"section_id": "5.2", "section_title": "Get Log Page",
+            "content_type": "prose"}]
+    # Cited with different casing/whitespace; resolves to the real numeric id.
+    cits = _extract_citations("Details here [§get  log page].", ctx)
+    assert len(cits) == 1 and cits[0]["hallucinated"] is False
+    assert cits[0]["section_id"] == "5.2"
+
+
 def test_extract_citations_handles_alphabetic_appendix_sections():
     """Bug found during local boot: appendix sections (A.1, B.3, ...) were
     silently dropped because the regex only matched purely numeric IDs."""
