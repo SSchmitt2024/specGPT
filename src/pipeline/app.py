@@ -39,14 +39,12 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
+import re
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-
-import httpx
 
 
 def _load_dotenv(path: str = ".env") -> int:
@@ -82,7 +80,6 @@ _load_dotenv()
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
-    FileResponse,
     HTMLResponse,
     RedirectResponse,
     Response,
@@ -281,90 +278,16 @@ _EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "0").lower() in ("1", "true", "y
 
 # Specifications the UI can search. The `id` is the value stored on every
 # spec_chunks / lookup row (see scripts/load_lookup_data.py + indexer.py) and
-# the value the retrievers filter on. Add a row here when a new transport
-# corpus (e.g. RDMA/TCP) is ingested.
+# the value the retrievers filter on. `url` is the official nvmexpress.org PDF
+# the frontend deep-links to (with a #page=N fragment) when a citation/figure is
+# clicked - we reference the spec in place rather than re-hosting it. Add a row
+# here when a new transport corpus (e.g. RDMA/TCP) is ingested.
 AVAILABLE_SPECS = [
     {"id": "base", "label": "Base Specification", "version": "2.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-Revision-2.3-2025.08.01-Ratified.pdf"},
     {"id": "pcie", "label": "PCIe Transport", "version": "1.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVMe-over-PCIe-Transport-Specification-Revision-1.3-2025.08.01-Ratified.pdf"},
     {"id": "command", "label": "NVM Command Set", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVM-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
 ]
 _VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
-
-# Local source PDFs (used by the in-app /viewer so a citation can open the spec
-# at the right page and highlight the section header). The repo's `nvme_spec/`
-# is git/docker-ignored, so in production these are not on disk — the resolver
-# below downloads the official PDF (the `url` in AVAILABLE_SPECS) into a cache
-# dir on first request and serves it from there. Locally the committed file is
-# preferred so dev needs no network.
-_SPEC_PDF_FILES = {
-    "base": "NVMe_spec_full.pdf",
-    "pcie": "NVMe_PCIe_full.pdf",
-    "command": "NVMe_command_full.pdf",
-}
-_PDF_LOCAL_DIR = Path(__file__).resolve().parent.parent.parent / "nvme_spec"
-_PDF_CACHE_DIR = Path(
-    os.getenv("PDF_CACHE_DIR") or (Path(tempfile.gettempdir()) / "specgpt_pdfs")
-)
-# Per-spec download locks so two concurrent viewer opens don't both fetch.
-_pdf_locks: dict[str, threading.Lock] = {}
-_pdf_locks_guard = threading.Lock()
-
-
-def _pdf_lock(spec_id: str) -> threading.Lock:
-    with _pdf_locks_guard:
-        lock = _pdf_locks.get(spec_id)
-        if lock is None:
-            lock = threading.Lock()
-            _pdf_locks[spec_id] = lock
-        return lock
-
-
-def _resolve_spec_pdf(spec_id: str) -> Path | None:
-    """Return a local Path to the spec PDF, downloading + caching it on first
-    use if the committed copy isn't present. Returns None for unknown specs or
-    if the download fails."""
-    if spec_id not in _VALID_SPEC_IDS:
-        return None
-
-    # 1. Prefer the committed local file (dev machines).
-    fname = _SPEC_PDF_FILES.get(spec_id)
-    if fname:
-        local = _PDF_LOCAL_DIR / fname
-        if local.is_file() and local.stat().st_size > 0:
-            return local
-
-    # 2. Otherwise serve from / populate the on-disk download cache.
-    cached = _PDF_CACHE_DIR / f"{spec_id}.pdf"
-    if cached.is_file() and cached.stat().st_size > 0:
-        return cached
-
-    spec = next((s for s in AVAILABLE_SPECS if s["id"] == spec_id), None)
-    url = spec.get("url") if spec else None
-    if not url:
-        return None
-
-    lock = _pdf_lock(spec_id)
-    with lock:
-        # Re-check: another thread may have finished the download while we waited.
-        if cached.is_file() and cached.stat().st_size > 0:
-            return cached
-        try:
-            _PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = cached.with_suffix(".part")
-            with httpx.stream(
-                "GET", url, follow_redirects=True, timeout=120.0
-            ) as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as fh:
-                    for chunk in resp.iter_bytes(65536):
-                        fh.write(chunk)
-            tmp.replace(cached)
-            return cached
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "failed to fetch spec PDF for %s from %s", spec_id, url
-            )
-            return None
 
 
 app = FastAPI(
@@ -583,11 +506,13 @@ async def logout() -> Response:
 
 
 def _figures_from_sources(result: dict) -> list[dict]:
-    """Slim, deduped list of figures in the retrieved context so the UI can
-    link inline "Figure N" mentions to the PDF. Only figures with a known page
-    are kept (so the link can jump there). Spec falls back to the query's spec
+    """Slim, deduped list of figures the answer actually CITES, so the UI can
+    link inline "Figure N" mentions to the PDF and list them in the sidebar.
+    Only figures with a known page (so the link can jump there) AND that are
+    referenced in the answer text are kept. Spec falls back to the query's spec
     for agentically-fetched figure chunks that don't carry it."""
     sources = result.get("sources") or []
+    answer = result.get("answer") or ""
     default_spec = (result.get("config") or {}).get("spec")
     seen: set[str] = set()
     figures: list[dict] = []
@@ -601,6 +526,11 @@ def _figures_from_sources(result: dict) -> list[dict]:
         pages = ch.get("pdf_pages") or []
         if not pages:
             continue
+        # Only surface figures the answer references ("Figure 328", "[Figure
+        # 328]", "[§Figure 328]") - not every figure that happened to be
+        # retrieved - so chips and the sidebar reflect what was actually cited.
+        if not re.search(r"Figure\s+" + re.escape(fn) + r"\b", answer, re.IGNORECASE):
+            continue
         seen.add(fn)
         figures.append({
             "figure_number": fn,
@@ -610,6 +540,58 @@ def _figures_from_sources(result: dict) -> list[dict]:
             "section_id": ch.get("section_id") or "",
         })
     return figures
+
+
+# Strong refs to in-flight fire-and-forget logging tasks. asyncio only keeps a
+# weak reference to a bare create_task() result, so without this the task could
+# be garbage-collected before the DB write finishes.
+_qa_log_tasks: set[asyncio.Task] = set()
+
+
+def _qa_log_row(resp: QueryResponse, request_id: str) -> dict:
+    """Map a QueryResponse to a qa_log row. Pure (no IO) so it's unit-testable;
+    `spec`/`llm_model` are denormalized out of config for easy querying."""
+    config = resp.config or {}
+    return {
+        "request_id": request_id,
+        "query": resp.query,
+        "answer": resp.answer,
+        "config": config,
+        "citations": resp.citations,
+        "spec": config.get("spec"),
+        "llm_model": config.get("llm_model"),
+        "agentic": resp.agentic,
+        "latency_ms": resp.latency_ms,
+        "tokens_used": resp.tokens_used,
+    }
+
+
+async def _log_qa(resp: QueryResponse, request_id: str) -> None:
+    """Persist one answered query to qa_log. Best-effort: any failure is logged
+    and swallowed so a logging problem never affects the user's response. The
+    Supabase insert is sync, so it runs in a worker thread off the event loop."""
+    row = _qa_log_row(resp, request_id)
+    try:
+        from src.pipeline.search import supabase_client
+
+        await asyncio.to_thread(
+            lambda: supabase_client().table("qa_log").insert(row).execute()
+        )
+    except Exception:
+        logger.exception("qa_log insert failed [%s]", request_id)
+
+
+def _schedule_qa_log(resp: QueryResponse, request_id: str) -> None:
+    """Fire-and-forget the qa_log write so every Q&A is recorded without adding
+    latency to the request. Records *all* answers, unlike flagged_answers which
+    is only the subset a user explicitly flags."""
+    try:
+        task = asyncio.create_task(_log_qa(resp, request_id))
+    except RuntimeError:
+        # No running loop (shouldn't happen inside a request handler).
+        return
+    _qa_log_tasks.add(task)
+    task.add_done_callback(_qa_log_tasks.discard)
 
 
 @app.post("/api/query")
@@ -673,7 +655,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
             "tokens_used": result.get("tokens_used"),
         })
 
-    return QueryResponse(
+    resp = QueryResponse(
         query=result["query"],
         answer=result["answer"],
         citations=result["citations"],
@@ -686,6 +668,8 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         figures=_figures_from_sources(result),
         request_id=request_id if not req.agentic else None,
     )
+    _schedule_qa_log(resp, request_id)
+    return resp
 
 
 def _dump_model(model: BaseModel) -> dict:
@@ -751,6 +735,7 @@ async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_aut
                 figures=_figures_from_sources(result),
                 request_id=request_id if not req.agentic else None,
             )
+            _schedule_qa_log(resp, request_id)
             queue.put_nowait({"type": "done", "data": _dump_model(resp)})
         except GenerationError as e:
             logger.warning("Stream generation failure [%s]: %s", request_id, e.cause)
@@ -842,7 +827,7 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         "tokens_used": result.get("tokens_used"),
     })
 
-    return QueryResponse(
+    resp = QueryResponse(
         query=result["query"],
         answer=result["answer"],
         citations=result["citations"],
@@ -855,6 +840,8 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         figures=_figures_from_sources(result),
         request_id=req.request_id,
     )
+    _schedule_qa_log(resp, req.request_id)
+    return resp
 
 
 @app.post("/api/refine/stream")
@@ -915,6 +902,7 @@ async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_a
                 figures=_figures_from_sources(result),
                 request_id=request_id,
             )
+            _schedule_qa_log(resp, request_id)
             queue.put_nowait({"type": "done", "data": _dump_model(resp)})
         except GenerationError as e:
             logger.warning("Stream refine generation failure [%s]: %s", request_id, e.cause)
@@ -966,37 +954,6 @@ async def presets_endpoint(_: bool = Depends(require_auth)) -> dict:
 async def specs_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Specs the UI can search, plus the default selection."""
     return {"specs": AVAILABLE_SPECS, "default": PipelineConfig().spec}
-
-
-@app.get("/spec-pdf/{spec_id}")
-def spec_pdf_endpoint(
-    spec_id: str,
-    specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
-) -> Response:
-    """Stream a spec's source PDF (same-origin, so the /viewer can render it and
-    PDF.js can issue Range requests). Sync def so the one-time blocking download
-    in `_resolve_spec_pdf` runs in the threadpool, off the event loop."""
-    if not verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
-        raise HTTPException(status_code=401, detail={"error": "auth_required"})
-    path = _resolve_spec_pdf(spec_id)
-    if path is None:
-        raise HTTPException(status_code=404, detail={"error": "spec_pdf_unavailable"})
-    return FileResponse(
-        str(path),
-        media_type="application/pdf",
-        headers={"Cache-Control": "private, max-age=86400"},
-    )
-
-
-@app.get("/viewer", response_class=HTMLResponse)
-async def viewer_page(
-    specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
-) -> Response:
-    """In-app PDF viewer: opens a spec at a given page and highlights the cited
-    section header. Driven by query params (spec, page, sec, title)."""
-    if not verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
-        return RedirectResponse(url="/login?next=/viewer", status_code=303)
-    return HTMLResponse(VIEWER_HTML)
 
 
 @app.get("/api/models")
@@ -1177,446 +1134,6 @@ async def frontend(
     if not verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
         return RedirectResponse(url="/login", status_code=303)
     return HTMLResponse(FRONTEND_HTML)
-
-
-# ============================================================================
-# In-app PDF viewer (opened from a citation; jumps to page + highlights header)
-# ============================================================================
-
-# NOTE: raw string (r""") so the embedded JS keeps its literal backslashes
-# (regex \s,   etc.). No %-formatting / .format() is applied to it, so
-# literal % and {} in the CSS/JS are safe.
-VIEWER_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>specGPT - spec viewer</title>
-  <link rel="icon" type="image/png" href="/static/favicon.png">
-  <style>
-    * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: #0f1115; color: #e6e8ec;
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-    #bar { position: sticky; top: 0; height: 48px; display: flex; align-items: center;
-      gap: 14px; padding: 0 16px; background: #171a21; border-bottom: 1px solid #262a33;
-      z-index: 10; }
-    #bar a.back { color: #9aa4b2; text-decoration: none; font-size: 13px; white-space: nowrap; }
-    #bar a.back:hover { color: #e6e8ec; }
-    #bar .title { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
-      white-space: nowrap; }
-    #bar .status { margin-left: auto; font-size: 12px; color: #9aa4b2; white-space: nowrap; }
-    #scroll { position: absolute; top: 48px; bottom: 0; left: 0; right: 0; overflow: auto; }
-    #pages { display: flex; flex-direction: column; align-items: center; gap: 16px;
-      padding: 20px 12px 120px; }
-    .page { position: relative; background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.5); }
-    .page canvas { display: block; }
-    .page .ov { position: absolute; inset: 0; pointer-events: none; }
-    .hl { position: absolute; background: rgba(255,214,10,.42); border-radius: 2px;
-      mix-blend-mode: multiply; box-shadow: 0 0 0 1px rgba(245,158,11,.65);
-      animation: hlpulse 1.1s ease-in-out 2; }
-    @keyframes hlpulse { 0%,100% { background: rgba(255,214,10,.42); }
-      50% { background: rgba(255,184,10,.70); } }
-    .pnum { position: absolute; top: 6px; right: 8px; font-size: 10px; color: #94a3b8;
-      pointer-events: none; }
-    #msg { padding: 48px 20px; text-align: center; color: #9aa4b2; line-height: 1.6; }
-  </style>
-</head>
-<body>
-  <div id="bar">
-    <a class="back" href="/">&#8592; Back to specGPT</a>
-    <span class="title" id="spec-title"></span>
-    <span class="status" id="status"></span>
-  </div>
-  <div id="scroll"><div id="pages"><div id="msg">Loading spec&#8230;</div></div></div>
-
-  <script src="/static/pdfjs/pdf.min.js"></script>
-  <script>
-  (function () {
-    var pdfjsLib = window["pdfjsLib"];
-    if (!pdfjsLib) {
-      document.getElementById("pages").innerHTML =
-        '<div id="msg">Could not load the PDF engine (offline?).</div>';
-      return;
-    }
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "/static/pdfjs/pdf.worker.min.js";
-
-    var params = new URLSearchParams(location.search);
-    var spec = params.get("spec") || "base";
-    var targetPage = parseInt(params.get("page") || "0", 10) || 0;  // 1-indexed
-    var sec = (params.get("sec") || "").trim();
-    var title = (params.get("title") || "").trim();
-
-    var SPEC_LABELS = {
-      base: "NVMe Base Specification",
-      pcie: "PCIe Transport Specification",
-      command: "NVM Command Set Specification"
-    };
-    var label = SPEC_LABELS[spec] || spec;
-    if (sec) label += "  -  Section " + sec;
-    document.getElementById("spec-title").textContent = label;
-
-    var statusEl = document.getElementById("status");
-    function setStatus(t) { statusEl.textContent = t; }
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, function (c) {
-        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-      });
-    }
-
-    var pagesEl = document.getElementById("pages");
-    var scrollEl = document.getElementById("scroll");
-
-    var pdfDoc = null;
-    var cssScale = 1;             // PDF user units -> CSS px
-    var pageDivs = [];            // pageDivs[n] is the container for page n
-    var rendered = {};
-    var renderingPromises = {};
-
-    // Canonical form for matching: lowercase, drop registered/trademark marks
-    // and other punctuation, keep letters + digits + dots (section numbers),
-    // collapse whitespace. Lets the cited title compare equal to the PDF's even
-    // when the (R)/(TM) glyph or spacing differs.
-    function canon(s) {
-      return String(s || "")
-        .toLowerCase()
-        .replace(/[\u2122\u00ae\u00a9]/g, " ")
-        .replace(/[^a-z0-9. ]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    }
-
-    function computeScale(v1) {
-      var avail = Math.min(scrollEl.clientWidth - 28, 980);
-      if (avail < 320) avail = 320;
-      return avail / v1.width;
-    }
-
-    function makePageDiv(n, w, h) {
-      var d = document.createElement("div");
-      d.className = "page";
-      d.style.width = w + "px";
-      d.style.height = h + "px";
-      d.setAttribute("data-page", String(n));
-      var num = document.createElement("div");
-      num.className = "pnum";
-      num.textContent = "p." + n;
-      d.appendChild(num);
-      return d;
-    }
-
-    function renderPage(n) {
-      if (rendered[n]) {
-        // Resolve with the cached page object for highlight positioning.
-        return renderingPromises[n];
-      }
-      if (renderingPromises[n]) return renderingPromises[n];
-      var p = pdfDoc.getPage(n).then(function (page) {
-        var viewport = page.getViewport({ scale: cssScale });
-        var dpr = window.devicePixelRatio || 1;
-        var div = pageDivs[n];
-        div.style.width = viewport.width + "px";
-        div.style.height = viewport.height + "px";
-        var canvas = document.createElement("canvas");
-        canvas.width = Math.floor(viewport.width * dpr);
-        canvas.height = Math.floor(viewport.height * dpr);
-        canvas.style.width = viewport.width + "px";
-        canvas.style.height = viewport.height + "px";
-        var ctx = canvas.getContext("2d");
-        var rv = page.getViewport({ scale: cssScale * dpr });
-        return page.render({ canvasContext: ctx, viewport: rv }).promise.then(function () {
-          div.insertBefore(canvas, div.firstChild);
-          rendered[n] = true;
-          return { page: page, div: div, viewport: viewport };
-        });
-      });
-      renderingPromises[n] = p;
-      return p;
-    }
-
-    // Cited-header matching.
-    //
-    // Headers don't render as one tidy item: the section number and the title
-    // are often separate items, and in the Base spec deep-subsection numbers
-    // aren't in the text layer at all (only the title is). So we canonicalize
-    // every item, concatenate them into one searchable string (tracking which
-    // chars belong to which item) and look for queries in priority order:
-    //   1. "<sec> <title>"  (full header, most specific)
-    //   2. "<title>"        (Base subsections where the number is absent)
-    //   3. "<sec>"          (header numbered but title text differs)
-    // The search runs each query across the whole page window before falling
-    // back to a weaker one, so the real "<sec> <title>" header always beats a
-    // bare prose mention of the title on a neighbouring page (which happens
-    // when a citation resolves to a continuation chunk mid-section).
-    function buildQueries() {
-      var secC = canon(sec), titleC = canon(title), qs = [];
-      if (secC && titleC) qs.push(secC + " " + titleC);
-      if (titleC) qs.push(titleC);
-      if (secC) qs.push(secC);
-      return qs;
-    }
-
-    // Best occurrence of `query` on a page, or null. Returns
-    // { items, score, y } where `score` is 1 when the match sits on a short,
-    // heading-like line (not a "Figure"/"Table" caption) and 0 otherwise.
-    // Preferring heading-like matches lets the real section header win over a
-    // prose mention of the same title elsewhere in the section. Within a page
-    // we keep the best by (score, then topmost).
-    function matchQueryOnItems(items, query) {
-      if (!query) return null;
-      var joined = "", ranges = [];
-      for (var t = 0; t < items.length; t++) {
-        var c = canon(items[t].str);
-        if (!c) continue;
-        if (joined) joined += " ";
-        var start = joined.length;
-        joined += c;
-        ranges.push({ start: start, end: joined.length, it: items[t], c: c });
-      }
-      function itemsInRange(a, b) {
-        var sel = [];
-        for (var r = 0; r < ranges.length; r++) {
-          if (ranges[r].end > a && ranges[r].start < b) sel.push(ranges[r].it);
-        }
-        return sel;
-      }
-      function headingScore(sel) {
-        var baseY = sel[0].transform[5];
-        var lineChars = 0, lead = null;
-        for (var r = 0; r < ranges.length; r++) {
-          if (Math.abs(ranges[r].it.transform[5] - baseY) <= 4) {
-            lineChars += (ranges[r].end - ranges[r].start);
-            if (!lead || ranges[r].it.transform[4] < lead.it.transform[4]) lead = ranges[r];
-          }
-        }
-        var leadC = lead ? lead.c : "";
-        var caption = leadC.indexOf("figure") === 0 || leadC.indexOf("table") === 0;
-        return (lineChars <= 48 && !caption) ? 1 : 0;
-      }
-      var from = 0, best = null;
-      while (true) {
-        var at = joined.indexOf(query, from);
-        if (at < 0) break;
-        var sel = itemsInRange(at, at + query.length);
-        if (sel.length) {
-          var cand = { items: sel, score: headingScore(sel), y: sel[0].transform[5] };
-          if (!best || cand.score > best.score ||
-              (cand.score === best.score && cand.y > best.y)) best = cand;
-        }
-        from = at + 1;
-      }
-      return best;
-    }
-
-    // Per-page text items, cached (a page may be probed by several queries).
-    var _itemsCache = {};
-    function getPageItems(n) {
-      if (_itemsCache[n]) return Promise.resolve(_itemsCache[n]);
-      return renderPage(n).then(function (r) {
-        return r.page.getTextContent().then(function (tc) {
-          var items = tc.items.filter(function (it) { return it.str && it.str.trim().length; });
-          var rec = { items: items, r: r };
-          _itemsCache[n] = rec;
-          return rec;
-        });
-      });
-    }
-
-    // Scroll `el` to `frac` down the viewport, instantly. Recomputes from live
-    // rects and re-asserts on the next frame (and twice shortly after) so it
-    // self-corrects as neighbouring pages render in and shift the layout. We
-    // avoid `behavior:"smooth"` on purpose: a long animated scroll gets
-    // cancelled by those lazy-render reflows in some browsers, stranding the
-    // user at the top.
-    function bringIntoView(el, frac, persist) {
-      if (!el) return;
-      frac = (frac == null) ? 0.28 : frac;
-      var lastSet = null, cancelled = false;
-      function apply() {
-        if (cancelled) return;
-        // If the user has scrolled since our last adjustment, stop fighting them.
-        if (lastSet != null && Math.abs(scrollEl.scrollTop - lastSet) > 4) {
-          cancelled = true; return;
-        }
-        var er = el.getBoundingClientRect();
-        var sr = scrollEl.getBoundingClientRect();
-        var delta = (er.top - sr.top) - scrollEl.clientHeight * frac;
-        if (Math.abs(delta) > 1) scrollEl.scrollTop += delta;
-        lastSet = scrollEl.scrollTop;
-      }
-      apply();
-      requestAnimationFrame(apply);
-      if (persist) { setTimeout(apply, 180); setTimeout(apply, 450); }
-    }
-
-    function drawHighlight(r, match) {
-      var ov = document.createElement("div");
-      ov.className = "ov";
-      var vp = r.viewport;
-      match.forEach(function (it) {
-        var tx = pdfjsLib.Util.transform(vp.transform, it.transform);
-        var fh = Math.hypot(tx[2], tx[3]) || (it.height * cssScale) || 12;
-        var w = it.width * cssScale;
-        var hl = document.createElement("div");
-        hl.className = "hl";
-        hl.style.left = (tx[4] - 2) + "px";
-        hl.style.top = (tx[5] - fh - 2) + "px";
-        hl.style.width = (w + 4) + "px";
-        hl.style.height = (fh + 4) + "px";
-        ov.appendChild(hl);
-      });
-      r.div.appendChild(ov);
-      bringIntoView(ov.querySelector(".hl") || r.div, 0.28, true);
-    }
-
-    // Look for the header across `windowPages` (proximity-ordered). Tries the
-    // strongest query first; for each query it scans every page and keeps the
-    // best candidate (heading-like beats prose; ties break to the nearer page),
-    // only falling back to a weaker query if nothing matched. Returns the page
-    // it highlighted on, or 0.
-    function locateHeader(windowPages) {
-      var queries = buildQueries();
-      if (!queries.length) return Promise.resolve(0);
-      var qi = 0;
-      function tryQuery() {
-        if (qi >= queries.length) return Promise.resolve(0);
-        var query = queries[qi++];
-        var pi = 0, chosen = null, chosenR = null, chosenPage = 0;
-        function tryPage() {
-          if (pi >= windowPages.length) {
-            if (chosen) { drawHighlight(chosenR, chosen.items); return chosenPage; }
-            return tryQuery();
-          }
-          var n = windowPages[pi++];
-          return getPageItems(n).then(function (rec) {
-            var cand = matchQueryOnItems(rec.items, query);
-            // Iterating in proximity order + strict ">" keeps the nearer page
-            // on a score tie.
-            if (cand && (!chosen || cand.score > chosen.score)) {
-              chosen = cand; chosenR = rec.r; chosenPage = n;
-            }
-            return tryPage();
-          });
-        }
-        return tryPage();
-      }
-      return tryQuery();
-    }
-
-    // Fallback when a citation carries no page: scan pages for the header.
-    // The title also shows up in the table of contents and in prose, so we skip
-    // dot-leader (TOC) pages and return the first page where the title appears
-    // as an actual heading (scored match). Only if no heading exists anywhere do
-    // we fall back to the first prose mention.
-    function searchDocument() {
-      setStatus("Searching…");
-      var queries = buildQueries();
-      if (!queries.length) return Promise.resolve(0);
-      var secC = canon(sec);
-      var n = 1, fallback = 0;
-      function step() {
-        if (n > pdfDoc.numPages) return Promise.resolve(fallback);
-        return pdfDoc.getPage(n).then(function (page) {
-          return page.getTextContent().then(function (tc) {
-            var raw = tc.items.map(function (it) { return it.str; }).join(" ");
-            var isToc = (raw.match(/\.\s?\.\s?\./g) || []).length >= 3;
-            if (!isToc) {
-              var items = tc.items.filter(function (it) { return it.str && it.str.trim().length; });
-              // The real section page contains the section number (even when it
-              // renders apart from the title); requiring it rejects incidental
-              // mentions of the title elsewhere in the spec.
-              var secOK = !secC || canon(raw).indexOf(secC) >= 0;
-              for (var qi = 0; qi < queries.length; qi++) {
-                var cand = matchQueryOnItems(items, queries[qi]);
-                if (cand) {
-                  if (cand.score === 1 && secOK) { var f = n; n = pdfDoc.numPages + 1; return f; }
-                  if (!fallback) fallback = n;
-                  break;
-                }
-              }
-            }
-            n++;
-            return step();
-          });
-        });
-      }
-      return step();
-    }
-
-    function setupObserver() {
-      var io = new IntersectionObserver(function (entries) {
-        entries.forEach(function (e) {
-          if (e.isIntersecting) {
-            var n = parseInt(e.target.getAttribute("data-page"), 10);
-            if (n) renderPage(n);
-          }
-        });
-      }, { root: scrollEl, rootMargin: "500px 0px" });
-      for (var n = 1; n < pageDivs.length; n++) if (pageDivs[n]) io.observe(pageDivs[n]);
-    }
-
-    function scrollToPage(n) {
-      var d = pageDivs[n];
-      if (d) bringIntoView(d, 0.02, false);
-    }
-
-    // Pages to probe for the header, ordered by proximity to the cited page.
-    // Forward-biased (the header usually starts at or just after the chunk's
-    // first page) but includes two pages back so a citation that landed on a
-    // continuation chunk still finds the header above it.
-    function headerWindow(pageNo) {
-      var order = [pageNo, pageNo + 1, pageNo + 2, pageNo + 3, pageNo - 1, pageNo - 2];
-      var seen = {}, out = [];
-      order.forEach(function (n) {
-        if (n >= 1 && n <= pdfDoc.numPages && !seen[n]) { seen[n] = 1; out.push(n); }
-      });
-      return out;
-    }
-
-    function start() {
-      var find = Promise.resolve(targetPage);
-      if (!targetPage && (sec || title)) find = searchDocument();
-      return find.then(function (pageNo) {
-        if (!pageNo) { setStatus(pdfDoc.numPages + " pages"); return; }
-        if (pageNo < 1) pageNo = 1;
-        if (pageNo > pdfDoc.numPages) pageNo = pdfDoc.numPages;
-        scrollToPage(pageNo);
-        setStatus("Page " + pageNo + " / " + pdfDoc.numPages);
-        if (!sec && !title) return;
-        return locateHeader(headerWindow(pageNo)).then(function (hp) {
-          if (hp) setStatus("Page " + hp + " / " + pdfDoc.numPages);
-        });
-      });
-    }
-
-    setStatus("Loading…");
-    pdfjsLib.getDocument({
-      url: "/spec-pdf/" + encodeURIComponent(spec),
-      withCredentials: true
-    }).promise.then(function (pdf) {
-      pdfDoc = pdf;
-      return pdf.getPage(1).then(function (p1) {
-        var v1 = p1.getViewport({ scale: 1 });
-        cssScale = computeScale(v1);
-        var w = v1.width * cssScale, h = v1.height * cssScale;
-        pagesEl.innerHTML = "";
-        pageDivs = new Array(pdf.numPages + 1);
-        for (var n = 1; n <= pdf.numPages; n++) {
-          var d = makePageDiv(n, w, h);
-          pagesEl.appendChild(d);
-          pageDivs[n] = d;
-        }
-        setupObserver();
-        return start();
-      });
-    }).catch(function (err) {
-      pagesEl.innerHTML = '<div id="msg">Could not load this spec PDF.<br>'
-        + escapeHtml((err && err.message) || "Unknown error") + "</div>";
-      setStatus("Error");
-    });
-  })();
-  </script>
-</body>
-</html>"""
 
 
 # ============================================================================
@@ -2240,10 +1757,12 @@ a { color: var(--accent); text-decoration: none; }
 .dev-btn-danger:hover { color:#fff; background:var(--danger); border-color:var(--danger); }
 .dev-count { font-size:12px; color:var(--t-subtle); font-family:var(--mono); }
 .dev-empty { font-size:12.5px; color:var(--t-subtle); padding:18px 4px; }
-/* flag rows */
-.dev-row { border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:8px; background:var(--surface); overflow:hidden; }
-.dev-row-head { display:flex; align-items:flex-start; gap:10px; width:100%; text-align:left; padding:10px 12px; background:transparent; border:0; cursor:pointer; }
-.dev-row-head:hover { background:var(--surface-2); }
+/* flag rows (master list — click a row to open its detail page) */
+.dev-row { display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+  border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:8px;
+  background:var(--surface); padding:10px 12px; cursor:pointer;
+  transition:border-color .12s ease, background .12s ease; }
+.dev-row:hover { background:var(--surface-2); border-color:var(--border-2); }
 .dev-row-main { flex:1; min-width:0; }
 .dev-row-q { font-size:13px; font-weight:600; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dev-row-sub { font-size:11.5px; color:var(--t-subtle); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -2251,8 +1770,11 @@ a { color: var(--accent); text-decoration: none; }
 .dev-chip { font-family:var(--mono); font-size:10px; padding:1px 7px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); color:var(--t-muted); }
 .dev-chip.agentic { color:var(--accent-ink); }
 .dev-row-date { font-size:10.5px; color:var(--t-faint); font-family:var(--mono); }
-.dev-row-body { display:none; padding:0 12px 14px; border-top:1px solid var(--border); }
-.dev-row.open .dev-row-body { display:block; }
+.dev-row-arrow { flex:none; color:var(--t-faint); display:flex; align-items:center; }
+/* flag detail page (drills in over the list, back button returns) */
+.dev-back { display:inline-flex; align-items:center; gap:6px; }
+.dev-detail-q { font-size:14.5px; font-weight:600; color:var(--ink); line-height:1.45; word-break:break-word; margin:2px 0 8px; }
+.dev-detail-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:2px; }
 .dev-field { margin-top:12px; }
 .dev-field-label { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--t-faint); margin-bottom:5px; }
 .dev-field-val { font-size:12.5px; color:var(--ink); white-space:pre-wrap; word-break:break-word; }
@@ -2715,11 +2237,22 @@ a { color: var(--accent); text-decoration: none; }
             </div>
             <div class="dev-body">
                 <div id="dev-pane-flags" class="dev-pane">
-                    <div class="dev-toolbar">
-                        <button class="dev-btn" id="dev-refresh" type="button">Refresh</button>
-                        <span class="dev-count" id="dev-flags-count"></span>
+                    <div id="dev-flags-listview">
+                        <div class="dev-toolbar">
+                            <button class="dev-btn" id="dev-refresh" type="button">Refresh</button>
+                            <span class="dev-count" id="dev-flags-count"></span>
+                        </div>
+                        <div id="dev-flags-list"></div>
                     </div>
-                    <div id="dev-flags-list"></div>
+                    <div id="dev-flags-detailview" hidden>
+                        <div class="dev-toolbar">
+                            <button class="dev-btn dev-back" id="dev-flag-back" type="button">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+                                Back to flags
+                            </button>
+                        </div>
+                        <div id="dev-flag-detail"></div>
+                    </div>
                 </div>
                 <div id="dev-pane-notes" class="dev-pane" hidden>
                     <textarea class="dev-note-input" id="dev-note-input" placeholder="Write a note..."></textarea>
@@ -3687,7 +3220,6 @@ a { color: var(--accent); text-decoration: none; }
                     for (const i of [...fqIds].sort((a, b) => a - b)) {
                         const fq = stages[`agentic.followup_search_q${i}`];
                         const decomp = stages[`agentic.followup_decomp_q${i}`];
-                        const qText = (fq && fq.input && fq.input.query) || `gap-q${i}`;
                         const chunks = (fq && fq.output && fq.output.chunk_count) || 0;
 
                         // Collect this follow-up's sub-query indices from the
@@ -3702,8 +3234,12 @@ a { color: var(--accent); text-decoration: none; }
                         const fqSorted = [...fqSubIds].sort((a, b) => a - b);
                         const fqRrf = stages[`${nsPrefix}hybrid_search.rrf_merge`];
 
-                        // Open a subgraph for this follow-up.
-                        L.push(`  subgraph FQGRP${i}["Follow-up ${i+1}: ${_vizText(qText, 56)} · ${chunks} chunks"]`);
+                        // Open a subgraph for this follow-up. The title is kept
+                        // short (number + chunk count) so it stays a single,
+                        // centered line — the long follow-up question wraps into
+                        // 3 lines and overlaps the nodes inside. The actual
+                        // question text is shown on the Sub-query node within.
+                        L.push(`  subgraph FQGRP${i}["Follow-up ${i+1} · ${chunks} chunks"]`);
                         // Follow-up header node (clickable target for the GAP edge).
                         const decompSub = decomp && decomp.output && decomp.output.sub_queries
                             ? `${decomp.output.sub_queries.length} sub-quer${decomp.output.sub_queries.length===1?"y":"ies"}`
@@ -5029,17 +4565,33 @@ a { color: var(--accent); text-decoration: none; }
            treated as a citation when every token inside it is a section id
            that the backend actually returned, so stray "[...]" is left alone.
            Regex-free to avoid backslash/unicode escaping inside this template. */
-        function linkifyCitations(root, citations) {
+        function linkifyCitations(root, citations, figures) {
             if (!root || !citations || !citations.length) return;
             var idset = {};
             var citeMap = {};
             citations.forEach(function (c) {
                 var id = String(c.section_id || "");
-                if (id) {
+                // Only resolved citations become clickable chips. Hallucinated
+                // ones (referenced but not in retrieved context) stay as plain
+                // text so they don't masquerade as a verified, linkable source.
+                if (id && !c.hallucinated) {
                     idset[id] = 1;
                     citeMap[id] = c;
                 }
             });
+            // Figures the model may cite inside a bracket ("[Figure 328]" or
+            // "[§8.1.13, Figure 328]"). Resolved via the figures payload, which
+            // carries the page. linkifyFigures handles the bare "Figure N" form.
+            var figMap = {};
+            (figures || []).forEach(function (f) {
+                var k = String(f.figure_number || "").trim();
+                if (k) figMap[k] = f;
+            });
+            // If a token is "Figure 328" / "Fig. 12a", return its number, else "".
+            function figTokNum(t) {
+                var m = /^fig(?:ure)?\\.?\\s*([0-9]+[a-z]?)$/i.exec(t);
+                return m ? m[1] : "";
+            }
 
             // Strip a leading § (U+00A7 = 167) and surrounding spaces.
             function cleanTok(t) {
@@ -5047,6 +4599,14 @@ a { color: var(--accent); text-decoration: none; }
                 while (a < b && (t.charCodeAt(a) === 32 || t.charCodeAt(a) === 167)) a++;
                 while (b > a && t.charCodeAt(b - 1) === 32) b--;
                 return t.slice(a, b);
+            }
+            // Normalize a whole bracket body to compare against a title-style
+            // citation id (mirrors the backend: drop the section mark, collapse
+            // whitespace, trim trailing dots). Lets a §-title that contains a
+            // comma resolve as one citation instead of being split on the comma.
+            function normWhole(s) {
+                return s.split(String.fromCharCode(167)).join(" ")
+                        .replace(/\\s+/g, " ").trim().replace(/\\.+$/, "");
             }
 
             var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
@@ -5065,22 +4625,45 @@ a { color: var(--accent); text-decoration: none; }
                     if (text.charAt(i) !== "[") { i++; continue; }
                     var close = text.indexOf("]", i + 1);
                     if (close === -1) break;
-                    var parts = text.slice(i + 1, close).split(",");
-                    var ids = [], ok = true;
-                    for (var p = 0; p < parts.length; p++) {
-                        var tok = cleanTok(parts[p]);
-                        if (tok && idset[tok]) ids.push(tok);
-                        else { ok = false; break; }
+                    var inner = text.slice(i + 1, close);
+                    // Each citation is "§"-prefixed; split on § (not comma) so a
+                    // section title containing a comma stays one token. Brackets
+                    // with no § (e.g. "[Figure 328]") fall back to comma split.
+                    var SEC = String.fromCharCode(167);
+                    var rawToks = inner.indexOf(SEC) !== -1 ? inner.split(SEC) : inner.split(",");
+                    var items = [], ok = true, any = false;
+                    for (var p = 0; p < rawToks.length; p++) {
+                        var tok = cleanTok(rawToks[p]).replace(/^[\\s,]+/, "").replace(/[\\s,]+$/, "");
+                        if (!tok) continue;        // empty (e.g. stray separator)
+                        any = true;
+                        if (idset[tok]) { items.push({ sec: tok }); continue; }
+                        var fn = figTokNum(tok);
+                        if (fn && figMap[fn]) { items.push({ fig: fn }); continue; }
+                        ok = false; break;
                     }
-                    if (ok && ids.length) {
+                    // Nothing resolved cleanly: the bracket may be a single
+                    // section TITLE containing a comma in a §-less form. Try the
+                    // whole body as one id.
+                    if (!ok || !any) {
+                        var whole = normWhole(inner);
+                        if (whole && idset[whole]) { items = [{ sec: whole }]; ok = true; }
+                        else { ok = false; }
+                    }
+                    if (ok && items.length) {
                         if (i > pos) frag.appendChild(document.createTextNode(text.slice(pos, i)));
-                        ids.forEach(function (id, k) {
+                        items.forEach(function (it, k) {
                             if (k > 0) frag.appendChild(document.createTextNode(" "));
                             var span = document.createElement("span");
-                            span.className = "cite-chip mono";
-                            span.setAttribute("data-sec", id);
                             span.setAttribute("tabindex", "0");
-                            span.textContent = id;
+                            if (it.fig) {
+                                span.className = "cite-chip fig-chip mono";
+                                span.setAttribute("data-fig", it.fig);
+                                span.textContent = "Figure " + it.fig;
+                            } else {
+                                span.className = "cite-chip mono";
+                                span.setAttribute("data-sec", it.sec);
+                                span.textContent = it.sec;
+                            }
                             frag.appendChild(span);
                         });
                         pos = close + 1;
@@ -5093,7 +4676,47 @@ a { color: var(--accent); text-decoration: none; }
                 node.parentNode.replaceChild(frag, node);
             });
 
+            // Second pass: bare section ids in prose. The model sometimes lists
+            // related sections without brackets ("... supports 8.2.6 8.1.9").
+            // Only dotted ids (≥1 dot) that are in the resolved citation set are
+            // linkified, so byte ranges ("257:256"), bit ranges ("15:12") and
+            // hex values ("10h") are never touched.
+            var bareRe = /\\b[A-Z]?[0-9]+(?:\\.[0-9]+)+[a-z]?\\b/g;
+            var bnodes = [], bn;
+            var bwalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            while ((bn = bwalker.nextNode())) {
+                if (bn.parentNode && bn.parentNode.closest &&
+                    bn.parentNode.closest(".cite-chip, code, pre, a")) continue;
+                bnodes.push(bn);
+            }
+            bnodes.forEach(function (node) {
+                var text = node.nodeValue;
+                bareRe.lastIndex = 0;
+                var frag = document.createDocumentFragment();
+                var pos = 0, m, changed = false;
+                while ((m = bareRe.exec(text)) !== null) {
+                    var tok = m[0];
+                    if (!idset[tok]) continue;
+                    if (m.index > pos) frag.appendChild(document.createTextNode(text.slice(pos, m.index)));
+                    var span = document.createElement("span");
+                    span.className = "cite-chip mono";
+                    span.setAttribute("data-sec", tok);
+                    span.setAttribute("tabindex", "0");
+                    span.textContent = tok;
+                    frag.appendChild(span);
+                    pos = m.index + tok.length;
+                    changed = true;
+                }
+                if (!changed) return;
+                if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+                node.parentNode.replaceChild(frag, node);
+            });
+
             root.querySelectorAll(".cite-chip").forEach(function (c) {
+                // Figure chips (incl. ones we made for bracketed figures) are
+                // wired by linkifyFigures, which runs next - skip them here so
+                // their click handler isn't bound twice (which opens two tabs).
+                if (c.classList.contains("fig-chip")) return;
                 c.addEventListener("mouseenter", function () { setActiveSec(c.getAttribute("data-sec")); });
                 c.addEventListener("mouseleave", function () { setActiveSec(null); });
                 c.addEventListener("click", function () {
@@ -5129,42 +4752,80 @@ a { color: var(--accent); text-decoration: none; }
         }
 
         /* ── citations click handling ─────────────────────────────────────── */
-        /* Open the in-app /viewer, which renders the spec PDF, scrolls to the
-           cited page and highlights the section header. pdf_pages are stored
-           0-indexed (page-iteration convention), so +1 for the 1-indexed
-           viewer. If a citation has no page, the viewer searches the document
-           for the header text instead. */
-        function openCitationPdf(c) {
-            if (!c || c.hallucinated) return;
-            var spec = c.spec
-                || (window._specData && window._specData[0] && window._specData[0].id)
-                || "base";
-            var qs = "spec=" + encodeURIComponent(spec);
-            if (c.pdf_pages && c.pdf_pages.length > 0) {
-                var p0 = parseInt(c.pdf_pages[0], 10);
-                if (!isNaN(p0)) qs += "&page=" + (p0 + 1);
+        /* Resolve a spec id to its official nvmexpress.org PDF URL (delivered by
+           /api/specs into window._specData). We deep-link to that URL rather
+           than re-hosting the PDF: the user's browser fetches the file straight
+           from NVM Express, so we only ever "reference/cite" the spec. Returns
+           "" when the spec or its url is unknown. */
+        function specPdfUrl(specId) {
+            var specs = window._specData || [];
+            for (var i = 0; i < specs.length; i++) {
+                if (specs[i].id === specId && specs[i].url) return specs[i].url;
             }
-            if (c.section_id) qs += "&sec=" + encodeURIComponent(c.section_id);
-            if (c.section_title) qs += "&title=" + encodeURIComponent(c.section_title);
-            window.open("/viewer?" + qs, "_blank");
+            return "";
         }
 
-        /* Open the viewer at a figure. Same page convention as citations
-           (pdf_pages 0-indexed → +1). `sec` = "Figure N" and `title` = the
-           caption so the viewer highlights the figure's caption line. */
-        function openFigurePdf(f) {
-            if (!f) return;
-            var spec = f.spec
+        /* PDF "#page=N" deep links are honoured by Chrome/Firefox/Edge but
+           silently ignored by Safari and every iOS browser (all WebKit), which
+           would open the spec at page 1 - a confusing jump-to-nowhere. On those
+           we make the citation/figure click a no-op instead of mis-opening. */
+        function pdfPageJumpSupported() {
+            var ua = navigator.userAgent || "";
+            var iOS = /iPad|iPhone|iPod/.test(ua) ||
+                (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+            var safari = /safari/i.test(ua) &&
+                !/chrome|chromium|crios|fxios|edg|opr|android/i.test(ua);
+            return !(iOS || safari);
+        }
+
+        /* Open a URL in a new tab via a synthesized anchor click. Chrome's PDF
+           viewer honours the "#page=N" fragment far more reliably from a real
+           link navigation than from window.open(...,"noopener"), whose two-step
+           popup navigation routinely drops the fragment and lands on page 1. */
+        function openInNewTab(url) {
+            var a = document.createElement("a");
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        }
+
+        /* Open the official spec PDF at the cited page in a new tab. pdf_pages
+           are stored 0-indexed, so +1 for the 1-indexed "#page=N" fragment that
+           browser PDF viewers honour. No page → opens at the top of the doc.
+           No-op on Safari/iOS (see pdfPageJumpSupported). */
+        function openCitationPdf(c) {
+            if (!c || c.hallucinated) return;
+            if (!pdfPageJumpSupported()) return;
+            var specId = c.spec
                 || (window._specData && window._specData[0] && window._specData[0].id)
                 || "base";
-            var qs = "spec=" + encodeURIComponent(spec);
+            var url = specPdfUrl(specId);
+            if (!url) return;
+            if (c.pdf_pages && c.pdf_pages.length > 0) {
+                var p0 = parseInt(c.pdf_pages[0], 10);
+                if (!isNaN(p0)) url += "#page=" + (p0 + 1);
+            }
+            openInNewTab(url);
+        }
+
+        /* Open the official spec PDF at a figure's page (same 0-indexed → +1
+           page convention as citations). No-op on Safari/iOS. */
+        function openFigurePdf(f) {
+            if (!f) return;
+            if (!pdfPageJumpSupported()) return;
+            var specId = f.spec
+                || (window._specData && window._specData[0] && window._specData[0].id)
+                || "base";
+            var url = specPdfUrl(specId);
+            if (!url) return;
             if (f.pdf_pages && f.pdf_pages.length > 0) {
                 var p0 = parseInt(f.pdf_pages[0], 10);
-                if (!isNaN(p0)) qs += "&page=" + (p0 + 1);
+                if (!isNaN(p0)) url += "#page=" + (p0 + 1);
             }
-            qs += "&sec=" + encodeURIComponent("Figure " + f.figure_number);
-            if (f.caption) qs += "&title=" + encodeURIComponent(f.caption);
-            window.open("/viewer?" + qs, "_blank");
+            openInNewTab(url);
         }
 
         /* Turn inline "Figure N" mentions in the answer into clickable chips.
@@ -5229,15 +4890,28 @@ a { color: var(--accent); text-decoration: none; }
         }
 
         /* ── sources sidebar ─────────────────────────────────────────────── */
-        function renderSourcesSidebar(citations) {
-            console.log("[specGPT] renderSourcesSidebar called, citations:", citations);
+        function renderSourcesSidebar(citations, figures) {
             var list = document.getElementById("citations-list");
             var box = document.getElementById("citations-box");
             var count = document.getElementById("sources-count");
-            console.log("[specGPT] list:", list, "box:", box);
-            if (!list || !box) { console.log("[specGPT] missing list/box element"); return; }
-            if (!citations || !citations.length) { console.log("[specGPT] citations empty, hiding box"); box.classList.add("hidden"); return; }
-            list.innerHTML = citations.map(function (c) {
+            if (!list || !box) return;
+            // Combined source list: section citations + cited figures (figures
+            // are real cited sources too, just delivered in a separate payload).
+            var sources = [];
+            (citations || []).forEach(function (c) { sources.push({ kind: "sec", c: c }); });
+            (figures || []).forEach(function (f) { sources.push({ kind: "fig", f: f }); });
+            if (!sources.length) { box.classList.add("hidden"); return; }
+            list.innerHTML = sources.map(function (s) {
+                if (s.kind === "fig") {
+                    var fnum = escapeHtml(String(s.f.figure_number || ""));
+                    var cap = escapeHtml(String(s.f.caption || ""));
+                    return '<button class="src" type="button" data-fig="' + fnum + '">'
+                         + '<div class="src-top"><span class="src-sec">Figure ' + fnum + "</span>"
+                         + '<span class="src-type">figure</span>'
+                         + '<span class="src-dot ok" title="Verified in retrieved context"></span></div>'
+                         + '<div class="src-title">' + cap + "</div></button>";
+                }
+                var c = s.c;
                 var sid = escapeHtml(String(c.section_id || ""));
                 var title = escapeHtml(String(c.section_title || ""));
                 var type = c.content_type || c.type || "";
@@ -5249,12 +4923,16 @@ a { color: var(--accent); text-decoration: none; }
                      + '<div class="src-top"><span class="src-sec">&#167;' + sid + "</span>" + typeHtml + dot + "</div>"
                      + '<div class="src-title">' + title + "</div></button>";
             }).join("");
-            if (count) count.textContent = String(citations.length);
+            if (count) count.textContent = String(sources.length);
             box.classList.remove("hidden");
-            list.querySelectorAll(".src").forEach(function (s, i) {
-                s.addEventListener("mouseenter", function () { setActiveSec(s.getAttribute("data-sec")); });
-                s.addEventListener("mouseleave", function () { setActiveSec(null); });
-                s.addEventListener("click", function () { openCitationPdf(citations[i]); });
+            list.querySelectorAll(".src").forEach(function (el, i) {
+                var s = sources[i];
+                el.addEventListener("mouseenter", function () { setActiveSec(el.getAttribute("data-sec")); });
+                el.addEventListener("mouseleave", function () { setActiveSec(null); });
+                el.addEventListener("click", function () {
+                    if (s.kind === "fig") openFigurePdf(s.f);
+                    else openCitationPdf(s.c);
+                });
             });
         }
 
@@ -5312,16 +4990,15 @@ a { color: var(--accent); text-decoration: none; }
             if (_cancelAnswerStream) { _cancelAnswerStream(); _cancelAnswerStream = null; }
             var answerText = data.answer || "";
 
-            console.log("[specGPT] displayResults called, data.citations:", data.citations);
             renderAnswerMeta(data);
-            renderSourcesSidebar(data.citations);
+            renderSourcesSidebar(data.citations, data.figures);
             var lat = document.getElementById("latency"); if (lat) lat.textContent = "";
 
             window._figures = data.figures || [];
             if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
                 _cancelAnswerStream = streamAnswerInto(answerEl, answerText, {
                     onDone: function () {
-                        linkifyCitations(answerEl, data.citations);
+                        linkifyCitations(answerEl, data.citations, data.figures);
                         linkifyFigures(answerEl, data.figures);
                         styleBlockAttributions(answerEl);
                     }
@@ -5483,17 +5160,26 @@ a { color: var(--accent); text-decoration: none; }
             }
             return (t.prompt || 0) + (t.completion || 0);
         }
+        // Compact list row — the full question/answer/trace live on the detail
+        // page so a long question can never overflow the collapsed row.
         function renderFlagRow(f, idx) {
-            var subBits = [];
-            if (f.reason) subBits.push(escapeHtml(String(f.reason)));
-            else subBits.push("(no reason given)");
-            var sub = subBits.join("");
+            var sub = f.reason ? escapeHtml(String(f.reason)) : "(no reason given)";
             var meta = '<div class="dev-row-meta">'
                 + (f.spec ? '<span class="dev-chip">' + escapeHtml(String(f.spec)) + "</span>" : "")
                 + (f.agentic ? '<span class="dev-chip agentic">agentic</span>' : "")
                 + '<span class="dev-row-date">' + escapeHtml(_devFmtDate(f.created_at)) + "</span>"
                 + "</div>";
-
+            return '<button class="dev-row" type="button" data-row="' + idx + '">'
+                + '<div class="dev-row-main">'
+                + '<div class="dev-row-q">' + escapeHtml(String(f.query || "(empty query)")) + "</div>"
+                + '<div class="dev-row-sub">' + sub + "</div>"
+                + "</div>" + meta
+                + '<span class="dev-row-arrow"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></span>'
+                + "</button>";
+        }
+        // Full detail page for one flag — rendered into #dev-flag-detail when a
+        // row is opened. Uses a stable flow-host id so the renderer can target it.
+        function renderFlagDetail(f, idx) {
             var trace = Array.isArray(f.pipeline_trace) ? f.pipeline_trace : [];
             var traceHtml = trace.length
                 ? '<ul class="dev-list">' + trace.map(function (s, i) {
@@ -5516,13 +5202,12 @@ a { color: var(--accent); text-decoration: none; }
                 + "<dt>flag id</dt><dd>" + escapeHtml(String(f.id)) + "</dd>"
                 + "</dl>";
 
-            return '<div class="dev-row" data-row="' + idx + '">'
-                + '<button class="dev-row-head" type="button" data-rowtoggle="' + idx + '">'
-                + '<div class="dev-row-main">'
-                + '<div class="dev-row-q">' + escapeHtml(String(f.query || "(empty query)")) + "</div>"
-                + '<div class="dev-row-sub">' + sub + "</div>"
-                + "</div>" + meta + "</button>"
-                + '<div class="dev-row-body">'
+            var metaChips = (f.spec ? '<span class="dev-chip">' + escapeHtml(String(f.spec)) + "</span>" : "")
+                + (f.agentic ? '<span class="dev-chip agentic">agentic</span>' : "")
+                + '<span class="dev-row-date">' + escapeHtml(_devFmtDate(f.created_at)) + "</span>";
+
+            return '<div class="dev-detail-q">' + escapeHtml(String(f.query || "(empty query)")) + "</div>"
+                + '<div class="dev-detail-meta">' + metaChips + "</div>"
                 + '<div class="dev-field"><div class="dev-field-label">Answer</div><div class="dev-answer">' + _devRenderMd(f.answer) + "</div></div>"
                 + '<div class="dev-field"><div class="dev-field-label">User reason</div><div class="dev-field-val">' + (f.reason ? escapeHtml(String(f.reason)) : "(none)") + "</div></div>"
                 + '<div class="dev-field"><div class="dev-field-label">Timing &amp; cost</div>' + timing + "</div>"
@@ -5535,12 +5220,46 @@ a { color: var(--accent); text-decoration: none; }
                 + '<div class="dev-field"><div class="dev-field-label">Pipeline trace</div>' + traceHtml + "</div>"
                 + '<div class="dev-field"><div class="dev-field-label">Citations</div>' + citesHtml + "</div>"
                 + '<div class="dev-field"><div class="dev-field-label">Config</div>' + _devKv(f.config) + "</div>"
-                + '<div class="dev-field"><button class="dev-btn dev-btn-danger" type="button" data-delflag="' + idx + '">Delete flag</button></div>'
-                + "</div></div>";
+                + '<div class="dev-field"><button class="dev-btn dev-btn-danger" type="button" data-delflag="' + idx + '">Delete flag</button></div>';
+        }
+        // Master/detail navigation within the flags pane.
+        function showFlagList() {
+            var lv = document.getElementById("dev-flags-listview");
+            var dv = document.getElementById("dev-flags-detailview");
+            if (lv) lv.hidden = false;
+            if (dv) dv.hidden = true;
+            var body = document.querySelector(".dev-body");
+            if (body) body.scrollTop = 0;
+        }
+        function openFlagDetail(idx) {
+            var f = (window._devFlags || [])[idx];
+            var host = document.getElementById("dev-flag-detail");
+            if (!f || !host) return;
+            host.innerHTML = renderFlagDetail(f, idx);
+            var flowBtn = host.querySelector("[data-flow]");
+            if (flowBtn) flowBtn.addEventListener("click", function () {
+                var fh = document.getElementById("dev-flow-" + idx);
+                if (!fh) return;
+                flowBtn.disabled = true; flowBtn.textContent = "Rendering…";
+                renderDevFlow(f.pipeline_trace, f.query, fh).then(function () {
+                    flowBtn.style.display = "none";
+                }).catch(function () {
+                    flowBtn.disabled = false; flowBtn.textContent = "Render flow chart";
+                });
+            });
+            var delBtn = host.querySelector("[data-delflag]");
+            if (delBtn) delBtn.addEventListener("click", function () { deleteFlag(f.id, delBtn); });
+            var lv = document.getElementById("dev-flags-listview");
+            var dv = document.getElementById("dev-flags-detailview");
+            if (lv) lv.hidden = true;
+            if (dv) dv.hidden = false;
+            var body = document.querySelector(".dev-body");
+            if (body) body.scrollTop = 0;
         }
         async function loadFlags() {
             var list = document.getElementById("dev-flags-list");
             var count = document.getElementById("dev-flags-count");
+            showFlagList();
             list.innerHTML = '<div class="dev-empty">Loading…</div>';
             try {
                 var res = await fetch("/api/flags?limit=200", { credentials: "same-origin" });
@@ -5551,32 +5270,9 @@ a { color: var(--accent); text-decoration: none; }
                 if (count) count.textContent = flags.length + (flags.length === 1 ? " flag" : " flags");
                 if (!flags.length) { list.innerHTML = '<div class="dev-empty">No flagged answers yet.</div>'; return; }
                 list.innerHTML = flags.map(function (f, i) { return renderFlagRow(f, i); }).join("");
-                list.querySelectorAll("[data-rowtoggle]").forEach(function (btn) {
+                list.querySelectorAll("[data-row]").forEach(function (btn) {
                     btn.addEventListener("click", function () {
-                        var row = btn.closest(".dev-row");
-                        if (row) row.classList.toggle("open");
-                    });
-                });
-                list.querySelectorAll("[data-flow]").forEach(function (btn) {
-                    btn.addEventListener("click", function () {
-                        var i = parseInt(btn.getAttribute("data-flow"), 10);
-                        var f = (window._devFlags || [])[i];
-                        var host = document.getElementById("dev-flow-" + i);
-                        if (!f || !host) return;
-                        btn.disabled = true; btn.textContent = "Rendering…";
-                        renderDevFlow(f.pipeline_trace, f.query, host).then(function () {
-                            btn.style.display = "none";
-                        }).catch(function () {
-                            btn.disabled = false; btn.textContent = "Render flow chart";
-                        });
-                    });
-                });
-                list.querySelectorAll("[data-delflag]").forEach(function (btn) {
-                    btn.addEventListener("click", function () {
-                        var i = parseInt(btn.getAttribute("data-delflag"), 10);
-                        var f = (window._devFlags || [])[i];
-                        if (!f) return;
-                        deleteFlag(f.id, btn);
+                        openFlagDetail(parseInt(btn.getAttribute("data-row"), 10));
                     });
                 });
             } catch (e) {
@@ -5750,6 +5446,7 @@ a { color: var(--accent); text-decoration: none; }
             });
             document.getElementById("dev-pane-flags").hidden = (tab !== "flags");
             document.getElementById("dev-pane-notes").hidden = (tab !== "notes");
+            if (tab === "flags") showFlagList();
         }
         (function () {
             var fab = document.getElementById("dev-fab");
@@ -5766,6 +5463,8 @@ a { color: var(--accent); text-decoration: none; }
             });
             var refresh = document.getElementById("dev-refresh");
             if (refresh) refresh.addEventListener("click", loadFlags);
+            var flagBack = document.getElementById("dev-flag-back");
+            if (flagBack) flagBack.addEventListener("click", showFlagList);
             var addBtn = document.getElementById("dev-note-add");
             if (addBtn) addBtn.addEventListener("click", addDevNote);
             var noteInput = document.getElementById("dev-note-input");

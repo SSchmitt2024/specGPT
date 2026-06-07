@@ -142,6 +142,67 @@ def test_extract_citations_resolves_title_only_pages():
     assert cits[0]["section_title"] == "Persistent Event Log Page"
 
 
+def test_extract_citations_title_with_internal_comma_is_one_citation():
+    """A §-title that contains a comma (e.g. the Identify Controller table title)
+    must NOT be split on the comma into two hallucinated halves - it resolves as
+    a single citation with the chunk's page."""
+    from src.pipeline.generator import _extract_citations
+    title = "Identify – Identify Controller Data Structure, I/O Command Set Independent"
+    ctx = [{
+        "section_id": "",
+        "section_title": title,
+        "content_type": "table",
+        "spec": "base",
+        "pdf_pages": [344],
+    }]
+    cits = _extract_citations(f"OACS lives here [§{title}].", ctx)
+    assert len(cits) == 1, cits
+    assert cits[0]["hallucinated"] is False
+    assert cits[0]["section_id"] == title
+    assert cits[0]["pdf_pages"] == [344]
+
+
+def test_extract_citations_mixed_bracket_id_and_comma_title():
+    """A bracket mixing a section id with a comma-containing title (split on §,
+    not comma) must yield two clean citations, not the title torn in half."""
+    from src.pipeline.generator import _extract_citations
+    title = "Identify – Identify Controller Data Structure, I/O Command Set Independent"
+    ctx = [
+        {"section_id": "", "section_title": title, "content_type": "table",
+         "spec": "base", "pdf_pages": [344]},
+        {"section_id": "8.1.16", "section_title": "NM", "content_type": "prose",
+         "pdf_pages": [604]},
+    ]
+    cits = _extract_citations(f"Support indicated [§8.1.16, §{title}].", ctx)
+    assert len(cits) == 2, cits
+    assert all(c["hallucinated"] is False for c in cits)
+    assert {c["section_id"] for c in cits} == {"8.1.16", title}
+
+
+def test_extract_citations_figure_token_not_a_section_citation():
+    """A '[§Figure 328]' bracket must not produce a hallucinated section
+    citation - figures are surfaced via the figures payload instead."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [{"section_id": "5.2", "section_title": "X", "content_type": "prose",
+            "pdf_pages": [1]}]
+    cits = _extract_citations("See [§Figure 328] and [§5.2].", ctx)
+    assert [c["section_id"] for c in cits] == ["5.2"]
+    assert cits[0]["hallucinated"] is False
+
+
+def test_extract_citations_comma_separated_ids_still_split():
+    """Regression guard for the comma-title fix: a real comma-separated id list
+    must still produce one citation per id."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [
+        {"section_id": "8.1.5", "section_title": "A", "content_type": "prose", "pdf_pages": [1]},
+        {"section_id": "8.2.6", "section_title": "B", "content_type": "prose", "pdf_pages": [2]},
+    ]
+    cits = _extract_citations("See [§8.1.5, §8.2.6] for details.", ctx)
+    assert sorted(c["section_id"] for c in cits) == ["8.1.5", "8.2.6"]
+    assert all(c["hallucinated"] is False for c in cits)
+
+
 def test_extract_citations_title_match_is_case_and_space_insensitive():
     from src.pipeline.generator import _extract_citations
     ctx = [{"section_id": "5.2", "section_title": "Get Log Page",
@@ -817,6 +878,133 @@ def test_fuzzy_full_name_empty_query_is_noop():
         "what is the of", _FUZZY_FIELD_INDEX, _fuzzy_name_index(), cutoff=0.86, max_hits=8,
     )
     assert recs == [] and notes == []
+
+
+# ---------------------------------------------------------------------------
+# qa_log row mapping (every Q&A is recorded, not just flagged ones)
+
+def test_qa_log_row_maps_response_and_denormalizes_config():
+    """Every answered query is logged to qa_log. The row builder is pure, so we
+    can assert the field mapping without touching Supabase, and confirm spec /
+    llm_model are pulled out of config for easy querying."""
+    import os
+    # app.py bootstraps auth at import; give it the minimum so import succeeds.
+    os.environ.setdefault("APP_PASSWORD", "test")
+    os.environ.setdefault("SESSION_SECRET", "x" * 32)
+    from src.pipeline.app import _qa_log_row, QueryResponse
+
+    resp = QueryResponse(
+        query="What is LBA?",
+        answer="A logical block address.",
+        citations=[{"section_id": "5.2", "hallucinated": False}],
+        config={"spec": "base", "llm_model": "claude-opus-4-8"},
+        latency_ms=1234.5,
+        tokens_used={"input": 10, "output": 20},
+        agentic=True,
+    )
+    row = _qa_log_row(resp, "req123abc")
+
+    assert row["request_id"] == "req123abc"
+    assert row["query"] == "What is LBA?"
+    assert row["answer"] == "A logical block address."
+    assert row["citations"] == [{"section_id": "5.2", "hallucinated": False}]
+    assert row["spec"] == "base"
+    assert row["llm_model"] == "claude-opus-4-8"
+    assert row["agentic"] is True
+    assert row["latency_ms"] == 1234.5
+    assert row["tokens_used"] == {"input": 10, "output": 20}
+
+
+def test_qa_log_row_tolerates_missing_config_keys():
+    import os
+    os.environ.setdefault("APP_PASSWORD", "test")
+    os.environ.setdefault("SESSION_SECRET", "x" * 32)
+    from src.pipeline.app import _qa_log_row, QueryResponse
+
+    resp = QueryResponse(
+        query="q", answer="a", citations=[], config={}, latency_ms=1.0,
+    )
+    row = _qa_log_row(resp, "rid")
+    assert row["spec"] is None and row["llm_model"] is None
+    assert row["agentic"] is False and row["tokens_used"] is None
+
+
+# ---------------------------------------------------------------------------
+# Context header: section-less chunks must not emit an empty "[Section ]"
+
+def test_assemble_context_section_less_chunk_uses_title_not_empty():
+    """Figure/table chunks from structured lookups have no section_id. The
+    header must fall back to the title so the model cites "[§<title>]" instead
+    of an empty "[§]" that breaks the sidebar and poisons citation brackets."""
+    from src.pipeline.generator import assemble_context
+    ctx = [{
+        "section_id": "",
+        "section_title": "Optional Admin Command Support",
+        "content_type": "table",
+        "text_raw": "Bit 0 SSRS: Security Send/Receive Supported.",
+        "pdf_pages": [256],
+    }]
+    formatted, _ = assemble_context("what is oacs", ctx)
+    assert "[Section ]" not in formatted          # the bug
+    assert "[Section Optional Admin Command Support]" in formatted
+
+
+def test_assemble_context_numberless_figure_chunk_uses_figure_header():
+    """A figure/table chunk with no section number must present a stable
+    "[Figure N]" header so the model cites [Figure N] rather than inventing a
+    section number from memory (which lands as a hallucinated citation)."""
+    from src.pipeline.generator import assemble_context
+    ctx = [{
+        "section_id": "",
+        "section_title": "Identify – Identify Controller Data Structure, I/O Command Set Independent",
+        "figure_number": "328",
+        "content_type": "table",
+        "text_raw": "Bytes 257:256 Optional Admin Command Support (OACS).",
+        "pdf_pages": [344],
+    }]
+    formatted, _ = assemble_context("what is oacs", ctx)
+    assert "[Figure 328]" in formatted
+    assert "[Section ]" not in formatted
+
+
+def test_assemble_context_numbered_chunk_keeps_normal_header():
+    from src.pipeline.generator import assemble_context
+    ctx = [{
+        "section_id": "8.1.5",
+        "section_title": "Command and Feature Lockdown",
+        "content_type": "prose",
+        "text_raw": "The Lockdown command ...",
+    }]
+    formatted, _ = assemble_context("lockdown", ctx)
+    assert "[Section 8.1.5] Command and Feature Lockdown" in formatted
+
+
+# ---------------------------------------------------------------------------
+# Citation deep-link backfill (pages/spec for structured-lookup citations)
+
+def test_backfill_citation_pages_sets_spec_without_db_when_pages_present():
+    """When every live citation already has pdf_pages, no DB lookup is needed;
+    the backfill only stamps the (single-spec) spec on those missing it, and
+    never touches hallucinated citations. Runs offline (no Supabase)."""
+    from src.pipeline.orchestrator import _backfill_citation_pages
+    cits = [
+        {"section_id": "5.2", "pdf_pages": [10], "spec": None, "hallucinated": False},
+        {"section_id": "5.3", "pdf_pages": [11], "spec": "base", "hallucinated": False},
+        {"section_id": "9.9", "pdf_pages": [], "spec": None, "hallucinated": True},
+    ]
+    _backfill_citation_pages(cits, "base")
+    assert cits[0]["spec"] == "base" and cits[0]["pdf_pages"] == [10]
+    assert cits[1]["spec"] == "base"          # already set, unchanged
+    assert cits[2]["spec"] is None and cits[2]["pdf_pages"] == []  # hallucinated untouched
+
+
+def test_backfill_citation_pages_noop_on_empty_or_no_spec():
+    from src.pipeline.orchestrator import _backfill_citation_pages
+    _backfill_citation_pages([], "base")  # must not raise
+    # No spec → can't look up pages, but also must not raise or query.
+    cits = [{"section_id": "5.2", "pdf_pages": [], "spec": None, "hallucinated": False}]
+    _backfill_citation_pages(cits, "")
+    assert cits[0]["pdf_pages"] == []
 
 
 # ---------------------------------------------------------------------------

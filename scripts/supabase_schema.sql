@@ -244,3 +244,34 @@ CREATE TABLE IF NOT EXISTS dev_notes (
     body       text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dev_notes_created_idx ON dev_notes (created_at DESC);
+
+-- ── Q&A log (every answered query, not just flagged ones) ───────────────────
+-- One row per answer returned by /api/query[/stream] and /api/refine[/stream].
+-- Written fire-and-forget so logging never adds latency to, or fails, a user
+-- request. This is the full firehose; flagged_answers is the curated subset a
+-- user explicitly reported. Shares request_id with flagged_answers so a flag
+-- can be correlated back to its log row.
+CREATE TABLE IF NOT EXISTS qa_log (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+
+    request_id  text,                      -- pipeline request id (correlation)
+
+    -- What the user asked and what we answered
+    query       text  NOT NULL,
+    answer      text  NOT NULL,
+
+    -- Context / config
+    config      jsonb NOT NULL,            -- PipelineConfig as used
+    citations   jsonb,                     -- sources shown to the user
+    spec        text,                      -- convenience: config->>'spec'
+    llm_model   text,                      -- convenience: config->>'llm_model'
+    agentic     boolean NOT NULL DEFAULT false,
+
+    -- Timing / cost
+    latency_ms  double precision,
+    tokens_used jsonb
+);
+
+CREATE INDEX IF NOT EXISTS qa_log_created_idx ON qa_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS qa_log_spec_idx    ON qa_log (spec);

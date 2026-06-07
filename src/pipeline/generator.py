@@ -75,11 +75,14 @@ DEFAULT_SYSTEM_PROMPT = """You are an expert on NVMe specifications. Answer the 
 
 RULES:
 1. Answer only using information from the provided context sections.
-2. Cite sources with a compact bracketed tag placed at the END of the sentence
-   or claim it supports — write [§5.2.1], or [§5.2.1, §5.3] when several
-   sections back the same point. Do NOT write "per Section 5.2.1", "according
-   to Section X", or otherwise name section numbers inline in the prose; the
-   bracketed tag is the ONLY citation form. This keeps the answer readable.
+2. Cite the SINGLE most relevant source with a compact bracketed tag placed at
+   the END of the sentence or claim it supports — write [§5.2.1]. Pick the one
+   section that most directly defines or governs the claim; do NOT append a list
+   of loosely related sections. Combine into [§5.2.1, §5.3] ONLY when the claim
+   genuinely depends on both sections together (rare) — two is the practical
+   maximum. Do NOT write "per Section 5.2.1", "according to Section X", or
+   otherwise name section numbers inline in the prose; the bracketed tag is the
+   ONLY citation form. This keeps the answer readable.
 2b. CITING NON-PROSE BLOCKS (tables, fenced code/byte-layout blocks, or any
    formatting that has no sentence to tag): a table row or code block cannot
    carry an end-of-sentence tag, so EVERY such block MUST still be cited on its
@@ -90,15 +93,29 @@ RULES:
    rows come from different sections you may instead add the tag inline in the
    relevant cell, but a single trailing `Source:` line is preferred. Treat a
    table or code block with no citation as incomplete — never emit one uncited.
-3. Cite once per claim or claim-group — never after every clause. Group related
-   facts under a single tag instead of repeating it.
+3. Cite once per claim or claim-group — never after every clause, and never a
+   pile of tags after one sentence. For an overview/definition sentence, cite
+   the section or figure that DEFINES the thing (e.g. for "OACS is a field in the
+   Identify Controller data structure", cite that data-structure figure — NOT
+   every command the field can enable). Mention each related command's own
+   section only where you actually discuss that command, one tag there.
 4. For bit/field definitions, include the exact offset and size if available.
 5. If the context does not contain the answer, explicitly state what information is missing.
-6. Never speculate, infer beyond the spec, or hallucinate details. Only tag a
-   section number that appears verbatim in a [Section ...] header above — copy
-   the id exactly. Never cite a section you did not receive; if the supporting
-   section isn't in the context, state the gap in prose instead of inventing a tag.
-7. If multiple sections address the question, synthesize them clearly and tag all relevant sections.
+6. Never speculate, infer beyond the spec, or hallucinate details. Only tag an
+   identifier that appears verbatim in a header above — copy it EXACTLY. Headers
+   are `[Section X]` for numbered sections and `[Figure N]` for figures/tables;
+   cite a figure/table as `[Figure N]` (e.g. `[Figure 328]`). NEVER cite a
+   section number you recall from memory that is not shown in a header above —
+   if the supporting source is a figure/table, cite its `[Figure N]`. If the
+   supporting source isn't in the context at all, state the gap in prose instead
+   of inventing a tag.
+   Example: if the only source for "OACS is in the Identify Controller data
+   structure" is a header `[Figure 328] Identify – Identify Controller Data
+   Structure (table)`, cite `[Figure 328]` — do NOT write `[§3.1.3]` or any
+   section number that is not printed in a header above.
+7. If multiple sections address DIFFERENT parts of the question, synthesize them
+   clearly and cite each at its OWN claim/sentence — do not gather them into one
+   trailing pile of tags.
 8. Keep answers concise but complete.
 9. FORMATTING: respond in GitHub-flavored markdown. Use:
    - Markdown tables for register/command-dword/bit-field layouts (any time you'd
@@ -231,12 +248,24 @@ def assemble_context(
         if total_tokens + chunk_tokens > max_context_tokens:
             continue
 
-        section_id = chunk.get("section_id", "unknown")
-        section_title = chunk.get("section_title", "")
+        section_id = chunk.get("section_id") or ""
+        section_title = chunk.get("section_title") or ""
+        figure_number = chunk.get("figure_number")
         content_type = chunk.get("content_type", "prose")
 
         chunk_no += 1
-        header = f"[Section {section_id}] {section_title}"
+        # The header carries the citable identifier the model must copy verbatim.
+        # Prefer the section number; for a numberless figure/table present its
+        # "Figure N" - a clean, stable tag - so the model cites "[Figure N]"
+        # instead of inventing a section number from memory (which lands as a
+        # hallucinated, unclickable citation). Fall back to the title only when
+        # there is neither a number nor a figure.
+        if section_id:
+            header = f"[Section {section_id}] {section_title}"
+        elif figure_number:
+            header = f"[Figure {figure_number}] {section_title}"
+        else:
+            header = f"[Section {section_title or 'unknown'}]"
         if content_type == "table":
             header += " (table)"
 
@@ -255,6 +284,10 @@ def assemble_context(
             "spec": chunk.get("spec"),
             "spec_document": chunk.get("spec_document"),
             "pdf_pages": chunk.get("pdf_pages") or [],
+            # Needed so _figures_from_sources can surface figures the answer
+            # cites ("Figure 328"); without it the figures payload is always
+            # empty and figure citations never become clickable.
+            "figure_number": chunk.get("figure_number"),
             "tokens_used": chunk_tokens,
         })
 
@@ -372,10 +405,27 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     for bm in bracket_pattern.finditer(answer):
         content = bm.group(0)[1:-1].strip()
         if "§" in bm.group(0):
-            parts = [p.replace('§', '').strip() for p in content.split(',')]
-            for part in parts:
-                if part:
-                    ordered_ids_with_pos.append((bm.start(), part.rstrip(".")))
+            # Each citation in the bracket is introduced by "§"; the comma is
+            # only a separator BETWEEN citations. Split on "§" (not ",") so a
+            # section TITLE that itself contains a comma (e.g. "Identify – ...
+            # Data Structure, I/O Command Set Independent") stays intact instead
+            # of being torn into non-resolving halves.
+            for seg in content.split("§"):
+                tok = seg.strip().strip(",").strip().rstrip(".")
+                # Drop figure refs ("Figure 328") - figures are surfaced to the
+                # UI via the separate figures payload, not as section citations.
+                if not tok or re.match(r"(?i)^fig(?:ure)?\b", tok):
+                    continue
+                if _resolve(tok)[0] is not None:
+                    ordered_ids_with_pos.append((bm.start(), tok))
+                    continue
+                # Unresolved segment: maybe "§5.2, 5.3" put one § before a list.
+                sub = [s.strip().rstrip(".") for s in tok.split(",") if s.strip()]
+                if len(sub) > 1 and all(re.fullmatch(_ID, s) for s in sub):
+                    for s in sub:
+                        ordered_ids_with_pos.append((bm.start(), s))
+                else:
+                    ordered_ids_with_pos.append((bm.start(), tok))
         else:
             for sid in re.findall(_BID, bm.group(0)):
                 ordered_ids_with_pos.append((bm.start(), sid.rstrip(".")))
@@ -458,6 +508,11 @@ def _call_with_retry(
                 system=system,
                 messages=messages,
                 timeout=timeout,
+                # Low temperature: this is a grounded spec-citation task, not
+                # creative writing. Keeps the model from improvising section
+                # numbers from memory (the main source of hallucinated cites)
+                # and makes answers/citations consistent run-to-run.
+                temperature=0.0,
             )
         except BadRequestError:
             # 4xx that isn't transient — re-raise immediately.
