@@ -1,5 +1,6 @@
 import time
 import threading
+import dataclasses
 from functools import wraps
 
 def ttl_cache(maxsize=1000, ttl=3600):
@@ -14,9 +15,14 @@ def ttl_cache(maxsize=1000, ttl=3600):
                 def _freeze(obj):
                     if hasattr(obj, "model_dump"):
                         return _freeze(obj.model_dump())
+                    if hasattr(obj, "to_dict"):
+                        return _freeze(obj.to_dict())
+                    if hasattr(obj, "__dataclass_fields__"):
+                        import dataclasses
+                        return _freeze(dataclasses.asdict(obj))
                     if isinstance(obj, dict):
                         return frozenset((k, _freeze(v)) for k, v in obj.items())
-                    elif isinstance(obj, list):
+                    elif isinstance(obj, (list, tuple, set)):
                         return tuple(_freeze(v) for v in obj)
                     return obj
                 

@@ -299,13 +299,29 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
     chunk_sections = {c.get("section_id"): c for c in context_chunks if c.get("section_id")}
     context_ids = list(chunk_sections.keys())
 
-    def _resolve(cited: str) -> tuple[dict | None, str]:
-        """Map a cited id to a context chunk via exact → parent → child match.
+    def _norm_title(t: str | None) -> str:
+        return re.sub(r"\s+", " ", (t or "").strip()).lower()
 
-        Returns (chunk, resolved_id). The resolved id is the *context*
-        section the citation actually points at, so two near-miss citations
-        that land on the same section (e.g. ``5.2`` and ``5.2.1.3`` when only
-        ``5.2.1`` is present) dedupe to a single chip.
+    # Title index: many spec "pages" carry no numeric section_id (e.g.
+    # "Persistent Event Log Page"). The context header renders such a chunk as
+    # "[i] § <title>", so the model cites it BY TITLE — "[§Persistent Event Log
+    # Page]". Resolve those by title so they aren't spuriously flagged
+    # hallucinated. First title wins on collisions.
+    chunk_titles: dict[str, dict] = {}
+    for c in context_chunks:
+        t = _norm_title(c.get("section_title"))
+        if t and t not in chunk_titles:
+            chunk_titles[t] = c
+
+    def _resolve(cited: str) -> tuple[dict | None, str]:
+        """Map a cited id/title to a context chunk.
+
+        Numeric/letter ids resolve via exact → parent → child match; a cited
+        section *title* resolves via the title index. Returns (chunk,
+        resolved_id) where the resolved id is the *context* section the
+        citation actually points at, so two near-miss citations that land on
+        the same section (e.g. ``5.2`` and ``5.2.1.3`` when only ``5.2.1`` is
+        present) dedupe to a single chip.
         """
         # Exact.
         if cited in chunk_sections:
@@ -324,6 +340,12 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
         )
         if children:
             return chunk_sections[children[0]], children[0]
+        # Title: the model cited a section by its title rather than a number.
+        # Match the chunk's real section_id when it has one, else keep the
+        # title as the display id (title-only pages).
+        chunk = chunk_titles.get(_norm_title(cited))
+        if chunk is not None:
+            return chunk, (chunk.get("section_id") or cited)
         return None, cited
 
     # Preferred form: a bracket whose contents are ENTIRELY section ids,
