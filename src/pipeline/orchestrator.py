@@ -739,6 +739,51 @@ def _aggregate_tokens(
     return out
 
 
+def _backfill_citation_pages(citations: list[dict], spec: str) -> None:
+    """Fill in missing pdf_pages / spec on citations so the UI can deep-link
+    them to the spec PDF.
+
+    Citations that resolve to synthetic structured-lookup chunks (the FID / LID
+    / opcode / CNS / status value lookups in retriever._enum_hit_to_source)
+    carry no pdf_pages and no spec, so the frontend produced a page-less link
+    that opened the PDF at page 1. Here we look the page up from spec_chunks by
+    section id, scoped to the query's spec (retrieval is single-spec, so every
+    citation belongs to it). Mutates in place; best-effort - a lookup failure
+    leaves citations untouched.
+    """
+    live = [c for c in citations if not c.get("hallucinated") and c.get("section_id")]
+    if not live:
+        return
+
+    needs_page = [c for c in live if not c.get("pdf_pages")]
+    page_by_section: dict[str, list[int]] = {}
+    if needs_page and spec:
+        section_ids = sorted({c["section_id"] for c in needs_page})
+        try:
+            res = (
+                search.supabase_client()
+                .table("spec_chunks")
+                .select("section_id, pdf_pages")
+                .eq("spec", spec)
+                .in_("section_id", section_ids)
+                .execute()
+            )
+            for row in (res.data or []):
+                sid, pages = row.get("section_id"), row.get("pdf_pages") or []
+                if sid and pages and sid not in page_by_section:
+                    page_by_section[sid] = pages
+        except Exception:
+            logger.exception("citation page backfill failed (spec=%s)", spec)
+
+    for c in live:
+        if spec and not c.get("spec"):
+            c["spec"] = spec
+        if not c.get("pdf_pages"):
+            pages = page_by_section.get(c["section_id"])
+            if pages:
+                c["pdf_pages"] = pages
+
+
 def _run_stage5_and_finalize(
     *,
     query: str,
@@ -1081,6 +1126,10 @@ def _run_stage5_and_finalize(
                 took_ms=took_gh * 1000,
             )
         )
+
+    # Ensure citations carry pdf_pages + spec so the UI can deep-link them to
+    # the spec PDF (structured-lookup citations otherwise arrive page-less).
+    _backfill_citation_pages(citations, config.spec)
 
     return {
         "query": query,
