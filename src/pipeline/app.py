@@ -5624,7 +5624,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             function apply() {
                 var on = agenticToggle.checked;
                 var strong = strongModelId();
-                ["global-model-select", "config-llm_model"].forEach(function (id) {
+                ["config-llm_model"].forEach(function (id) {
                     var el = document.getElementById(id);
                     if (!el) return;
                     if (on) {
