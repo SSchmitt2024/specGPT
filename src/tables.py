@@ -981,7 +981,13 @@ if __name__ == "__main__":
     from src import spec_env
     PDF_PATH        = spec_env.pdf_path()
     PAGE_OFFSET     = spec_env.page_offset(23)  # PDF idx 24 is printed p.1
-    FIRST_CONTENT   = 24  # skip cover + TOC
+    # First content page (skip cover + TOC). The Base spec's front matter runs
+    # to pdf idx 24; other specs begin much earlier (the Command Set spec's
+    # Figure 1 is at pdf idx 7). Hardcoding the Base value silently dropped
+    # every figure before the cutoff for the other corpora — e.g. the Command
+    # Set's Figures 1-18, which include Figure 11 (Protection Information /
+    # PRINFO). Override per-spec with SPEC_FIRST_CONTENT.
+    FIRST_CONTENT   = int(os.getenv("SPEC_FIRST_CONTENT", "24"))
     OUTPUT_PATH     = spec_env.data_path("tables.json")
 
     tables = extract_tables(

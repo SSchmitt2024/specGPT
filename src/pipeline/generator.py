@@ -140,6 +140,58 @@ RULES:
 _CHUNK_FENCE = "===== CHUNK %s ====="
 
 
+# Optional completeness self-assessment. When generate(emit_verdict=True), the
+# instruction below is appended to the system prompt and the model emits one
+# final sentinel line that the agentic loop uses to decide whether to keep
+# refining. The judgment comes from the model that actually read the whole
+# context — far stronger than the cheap gap-analyser, which only sees the answer
+# text + section titles. _split_verdict() parses the line off and strips it so
+# the user never sees it; cost is a few output tokens.
+_VERDICT_MARKER = "@@VERDICT@@"
+VERDICT_INSTRUCTION = (
+    "\n\nCOMPLETENESS SELF-CHECK (MANDATORY, MACHINE-READ):\n"
+    "After your full answer, emit ONE final line and nothing after it, in EXACTLY "
+    "this form:\n"
+    f'{_VERDICT_MARKER}{{"answered": true|false, "context_has_answer": true|false, '
+    '"missing": "<short phrase or empty>"}\n'
+    "- answered: true ONLY if the provided context fully answers the question.\n"
+    "- context_has_answer: true if the facts needed are present in the context "
+    "(false means the answer is incomplete because the context lacks them, so more "
+    "retrieval could help).\n"
+    "- missing: <=100 chars naming what is absent, or \"\" when answered is true.\n"
+    "This line is metadata, not part of the answer; never mention it in your prose."
+)
+
+
+def _split_verdict(text: str) -> tuple[str, dict | None]:
+    """Split a trailing ``@@VERDICT@@{...}`` sentinel off the answer.
+
+    Returns ``(clean_answer, verdict | None)``. Tolerant by design: if the
+    marker is absent or the JSON does not parse (e.g. the answer was truncated
+    at max_tokens before the line was emitted), returns ``(text, None)`` with
+    the answer unchanged, so a malformed verdict can never corrupt the answer
+    shown to the user."""
+    if not text or _VERDICT_MARKER not in text:
+        return text, None
+    head, _, tail = text.rpartition(_VERDICT_MARKER)
+    m = re.search(r"\{.*\}", tail, re.DOTALL)
+    if not m:
+        return head.rstrip(), None
+    try:
+        raw = json.loads(m.group(0))
+    except (ValueError, TypeError):
+        return head.rstrip(), None
+    if not isinstance(raw, dict):
+        return head.rstrip(), None
+    verdict = {
+        "answered": bool(raw.get("answered")),
+        # Default context_has_answer to `answered` when the model omits it.
+        "context_has_answer": bool(raw.get("context_has_answer", raw.get("answered"))),
+        "missing": str(raw.get("missing") or "")[:200],
+    }
+    return head.rstrip(), verdict
+
+
 @dataclass
 class GenerationResult:
     """Result from generate() with answer, citations, and metadata."""
@@ -770,7 +822,8 @@ def generate(
     max_tokens: int = 1024,
     timeout: float = DEFAULT_REQUEST_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> tuple[str, list[dict], list[dict], dict]:
+    emit_verdict: bool = False,
+) -> tuple[str, list[dict], list[dict], dict, dict | None]:
     """
     Generate an answer using Claude Sonnet from retrieved context.
 
@@ -787,10 +840,13 @@ def generate(
         max_retries: retry budget for transient (5xx, 429, timeout) failures.
 
     Returns:
-        ``(answer, citations, used_chunks, tokens_used)`` where ``answer`` is
-        the generated text, ``citations`` is a list of section refs (each with
+        ``(answer, citations, used_chunks, tokens_used, verdict)`` where ``answer``
+        is the generated text, ``citations`` is a list of section refs (each with
         a ``hallucinated`` flag), ``used_chunks`` describes what was fed to
-        the model, and ``tokens_used`` is ``{"prompt", "completion", "stop_reason"}``.
+        the model, ``tokens_used`` is ``{"prompt", "completion", "stop_reason"}``,
+        and ``verdict`` is the parsed completeness self-check
+        (``{answered, context_has_answer, missing}``) when ``emit_verdict`` is
+        set and the model emitted one, else ``None``.
 
     Raises:
         ValueError: if context_chunks is empty.
@@ -823,6 +879,8 @@ def generate(
     # The user query goes in the user message, never inside the system prompt,
     # to keep injection surface inside the context fence.
     full_system_prompt = system_prompt.format(context=context_text)
+    if emit_verdict:
+        full_system_prompt += VERDICT_INSTRUCTION
 
     # Step 3: Call the appropriate backend based on the model prefix.
     if model == "deepthought":
@@ -876,10 +934,17 @@ def generate(
             "stop_reason": stop_reason,
         }
 
-    # Step 4: Extract citations
+    # Step 4: Split off the optional completeness verdict BEFORE citation
+    # extraction, so the sentinel line can never be parsed as a citation or
+    # shown to the user.
+    verdict: dict | None = None
+    if emit_verdict:
+        answer, verdict = _split_verdict(answer)
+
+    # Step 5: Extract citations
     citations = _extract_citations(answer, used_chunks)
 
-    return answer, citations, used_chunks, tokens_used
+    return answer, citations, used_chunks, tokens_used, verdict
 
 
 def _main(argv: list[str]) -> int:
@@ -899,7 +964,7 @@ def _main(argv: list[str]) -> int:
         context_chunks = json.load(f)
 
     try:
-        answer, citations, used_chunks, tokens_used = generate(
+        answer, citations, used_chunks, tokens_used, _verdict = generate(
             args.query,
             context_chunks,
             model=args.model,

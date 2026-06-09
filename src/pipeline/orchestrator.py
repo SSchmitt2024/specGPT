@@ -797,10 +797,19 @@ def _run_stage5_and_finalize(
     context_chunks: list[dict],
     tokens_used: dict | None,
     llm_calls: list[dict] | None = None,
+    first_pass_verdict: dict | None = None,
 ) -> dict:
     """Run Stage 5 (agentic refinement loop) + Stage 6 (non-agentic gap hint)
     and assemble the response. Extracted so /api/refine can reuse it on top
     of a seeded first-pass state without redoing Stages 1–4.
+
+    ``first_pass_verdict`` is the generator's completeness self-check for the
+    inbound answer (``{answered, context_has_answer, missing}`` or None). The
+    agentic loop uses it as the stop signal — the model that read the full
+    context is a stronger judge of "is this answered?" than the cheap
+    gap-analyser, which only sees the answer text and section titles. None on
+    the /api/refine fast-path (the seed answer came from cache, not a fresh
+    verdict-emitting generation).
     """
     # llm_calls accumulates one entry per LLM call so the response can report
     # an accurate total token / cost figure (not just the final answer call).
@@ -844,9 +853,44 @@ def _run_stage5_and_finalize(
         expanded_pool: list[dict] = list(deduplicated)
         last_gap_reason = ""
         converged = False
+        # Stall detection: if an iteration's reranked context is byte-identical
+        # to the previous iteration's, regenerate would be handed the exact same
+        # input and reproduce the same answer. That's a deadlock — gap-analysis
+        # keeps asking for chunks the deterministic reranker keeps discarding.
+        # Detecting it lets us stop early instead of burning every remaining
+        # iteration (saving the regenerate + all later gap/fetch/rerank calls).
+        # Cheap: a tuple compare of ids we already have in hand.
+        prev_ctx_sig: tuple | None = None
+        stalled = False
+        # Strong-model completeness verdict for the *current* answer. The model
+        # that wrote the answer read the whole context, so its "is this answered?"
+        # is a far stronger stop signal than the cheap gap-analyser (which only
+        # sees the answer text + section titles). Seeded from the first pass;
+        # refreshed after each regenerate. None -> fall back to gap-analysis.
+        verdict: dict | None = first_pass_verdict
 
         for iteration in range(max_iters):
             suffix = f".iter{iteration}" if config.agentic_recursive else ""
+
+            # Strong-model self-assessment short-circuit: if the model that wrote
+            # the current answer says it fully answered the question, stop —
+            # fetching more context can't improve an already-complete answer, and
+            # re-running only risks drift + cost. Skips the gap-analysis call
+            # entirely. Falls through when there's no verdict (refine fast-path
+            # or the model didn't emit one).
+            if verdict is not None and verdict.get("answered"):
+                converged = True
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.verdict_converged{suffix}",
+                        input={"iteration": iteration},
+                        output={"verdict": verdict,
+                                "note": "generator self-assessment marked the answer "
+                                        "complete; stopping refinement"},
+                        took_ms=0.0,
+                    )
+                )
+                break
 
             start = time.time()
             followups, gap_reason, requested, gap_call = _agentic_gap_analysis(
@@ -1022,13 +1066,41 @@ def _run_stage5_and_finalize(
                 )
             )
 
+            # Stall guard: compare this iteration's reranked context to the last
+            # one. Identical -> regenerate can only reproduce the prior answer,
+            # so skip it and stop the loop. prev_ctx_sig is None on the first
+            # iteration, so we always run at least one agentic regenerate.
+            ctx_sig = tuple(
+                (c.get("id") or c.get("chunk_id") or
+                 (c.get("section_id"), c.get("figure_number"), c.get("content_type")))
+                for c in reranked2
+            )
+            if ctx_sig == prev_ctx_sig:
+                stalled = True
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.stalled{suffix}",
+                        input={"iteration": iteration},
+                        output={"reason": "reranked context unchanged from previous "
+                                          "iteration; regenerate would reproduce the "
+                                          "same answer",
+                                "context_unchanged": True,
+                                "last_gap_reason": last_gap_reason,
+                                "context_size": len(reranked2)},
+                        took_ms=0.0,
+                    )
+                )
+                break
+            prev_ctx_sig = ctx_sig
+
             start = time.time()
             try:
-                answer2, citations2, used2, tokens2 = generator.generate(
+                answer2, citations2, used2, tokens2, verdict2 = generator.generate(
                     query, reranked2,
                     model=config.agentic_model,
                     max_context_tokens=config.agentic_max_context_tokens,
                     max_tokens=config.agentic_max_output_tokens,
+                    emit_verdict=True,
                 )
                 took_g2 = time.time() - start
                 if isinstance(tokens2, dict):
@@ -1052,6 +1124,7 @@ def _run_stage5_and_finalize(
                         output={"answer_length": len(answer2),
                                 "citation_count": len(citations2),
                                 "tokens": tokens2,
+                                "verdict": verdict2,
                                 "context_used": [
                                     {"section_id": c.get("section_id"),
                                      "section_title": c.get("section_title"),
@@ -1062,6 +1135,9 @@ def _run_stage5_and_finalize(
                     )
                 )
                 answer, citations, context_chunks, tokens_used = answer2, citations2, used2, tokens2
+                # Refresh the stop signal from the model that just read the
+                # context. Next iteration's top-of-loop check consumes it.
+                verdict = verdict2
                 # Keep the cached pool in sync so the refine cache (or a later
                 # iteration) sees the post-merge pool, not just first-pass.
                 deduplicated = expanded_pool
@@ -1081,7 +1157,7 @@ def _run_stage5_and_finalize(
                 )
                 break
 
-        if config.agentic_recursive and not converged:
+        if config.agentic_recursive and not converged and not stalled:
             trace.append(
                 PipelineStage(
                     stage="agentic.cap_reached",
@@ -1189,6 +1265,15 @@ def orchestrate(
     """
     if config is None:
         config = PipelineConfig()
+
+    # Agentic mode always runs on the strongest tier: force the first-pass model
+    # to the agentic model so the whole pipeline (first pass + completeness
+    # verdict + regenerate) uses one strong model. This is authoritative — it
+    # overrides whatever llm_model the request carried, matching the UI which
+    # disables the model picker when agentic is on. Keeps the verdict (the loop's
+    # stop signal) coming from the strong model rather than a weaker first pass.
+    if agentic:
+        config.llm_model = config.agentic_model
 
     # _ProgressTrace behaves exactly like a list but fires `on_progress` as each
     # stage is appended, so the web layer can stream live pipeline progress.
@@ -1468,12 +1553,15 @@ def orchestrate(
     # -------------------------------------------------------------------------
     start = time.time()
     try:
-        answer, citations, context_used, tokens_used = generator.generate(
+        answer, citations, context_used, tokens_used, first_pass_verdict = generator.generate(
             query,
             retrieved_chunks,
             model=config.llm_model,
             max_context_tokens=config.llm_max_context_tokens,
             max_tokens=config.llm_max_output_tokens,
+            # Only the agentic loop consumes the completeness verdict; skip the
+            # extra instruction/tokens when the loop won't run.
+            emit_verdict=agentic,
         )
         took_gen = time.time() - start
         if isinstance(tokens_used, dict):
@@ -1553,6 +1641,7 @@ def orchestrate(
         answer=answer, citations=citations, context_chunks=context_chunks,
         tokens_used=tokens_used,
         llm_calls=llm_calls,
+        first_pass_verdict=first_pass_verdict,
     )
 
 

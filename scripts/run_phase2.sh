@@ -66,18 +66,21 @@ select_spec() {
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Base Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-24}"
       ;;
     pcie)
       export NVME_SPEC="pcie"
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/pcie}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
       ;;
     command)
       export NVME_SPEC="command"
       export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/command}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVM Command Set Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-7}"
       ;;
   esac
 

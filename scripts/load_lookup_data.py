@@ -110,7 +110,10 @@ def _tables_row(record: dict, spec: str) -> dict | None:
     return {
         "spec":          spec,
         "figure_number": str(fig),
-        "title":         record.get("title"),
+        # tables.json from src.tables uses the key "caption"; older/other
+        # producers may use "title". Prefer an explicit title, fall back to
+        # caption so the column is never silently NULL.
+        "title":         record.get("title") or record.get("caption"),
         "section_id":    record.get("section_id"),
         "raw_text":      record.get("raw_text"),
         "table_json":    record.get("table_json"),

@@ -930,6 +930,47 @@ def test_qa_log_row_tolerates_missing_config_keys():
 
 
 # ---------------------------------------------------------------------------
+# Completeness verdict: the agentic loop's stop signal must parse cleanly and,
+# above all, never leak the sentinel into the user-facing answer.
+
+def test_split_verdict_parses_and_strips_sentinel():
+    from src.pipeline.generator import _split_verdict
+    ans, verdict = _split_verdict(
+        'The PRACT bit is ignored. [§3.3.5]\n'
+        '@@VERDICT@@{"answered": true, "context_has_answer": true, "missing": ""}'
+    )
+    assert ans == "The PRACT bit is ignored. [§3.3.5]"  # sentinel stripped
+    assert "@@VERDICT@@" not in ans
+    assert verdict == {"answered": True, "context_has_answer": True, "missing": ""}
+
+
+def test_split_verdict_absent_marker_returns_answer_unchanged():
+    from src.pipeline.generator import _split_verdict
+    text = "A normal answer with no verdict line. [§5.2]"
+    ans, verdict = _split_verdict(text)
+    assert ans == text and verdict is None
+
+
+def test_split_verdict_malformed_json_never_corrupts_answer():
+    """A truncated/garbled verdict must degrade to (clean_answer, None) — the
+    sentinel is still stripped so the user never sees it, but no exception and
+    no partial answer loss."""
+    from src.pipeline.generator import _split_verdict
+    ans, verdict = _split_verdict("Body of the answer.\n@@VERDICT@@ {oops not json")
+    assert ans == "Body of the answer."
+    assert "@@VERDICT@@" not in ans
+    assert verdict is None
+
+
+def test_split_verdict_defaults_context_has_answer_to_answered():
+    from src.pipeline.generator import _split_verdict
+    _, verdict = _split_verdict('x\n@@VERDICT@@{"answered": false, "missing": "Figure 11"}')
+    assert verdict["answered"] is False
+    assert verdict["context_has_answer"] is False  # defaulted from answered
+    assert verdict["missing"] == "Figure 11"
+
+
+# ---------------------------------------------------------------------------
 # Context header: section-less chunks must not emit an empty "[Section ]"
 
 def test_assemble_context_section_less_chunk_uses_title_not_empty():

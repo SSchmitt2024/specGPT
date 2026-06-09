@@ -1614,6 +1614,9 @@ a { color: var(--accent); text-decoration: none; }
 .stage-raw summary { font-size:11.5px; color:var(--t-subtle); cursor:pointer; }
 .stage-json { font-family:var(--mono); font-size:11px; background:var(--subtle); border:1px solid var(--border); border-radius:var(--radius-xs); padding:10px; overflow:auto; margin-top:6px; max-height:340px; color:var(--t-muted); }
 
+/* model picker locked while agentic is on (always uses the strongest model) */
+select.locked-agentic { opacity:.55; cursor:not-allowed; }
+
 /* model panel */
 .model-panel { margin-top:14px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden; }
 .model-panel-header { display:flex; align-items:center; gap:9px; padding:11px 14px; width:100%; background:transparent; border:0; text-align:left; font-size:12.5px; font-weight:600; color:var(--ink); }
@@ -5605,6 +5608,47 @@ a { color: var(--accent); text-decoration: none; }
             });
             agenticToggle.addEventListener("change", sync);
             sync();
+        })();
+
+        /* ── agentic locks the model picker to the strongest model ─────────────
+           Agentic mode always runs on the strong (agentic) model — the backend
+           forces it server-side — so the regular model picker is disabled while
+           agentic is on and shows the strong model. The previous pick is stashed
+           and restored when agentic is turned back off. No change events are
+           dispatched, so the advanced agentic-model select is never clobbered. */
+        (function _wireAgenticModelLock() {
+            function strongModelId() {
+                var ag = document.getElementById("config-agentic_model");
+                return ag && ag.value ? ag.value : null;
+            }
+            function apply() {
+                var on = agenticToggle.checked;
+                var strong = strongModelId();
+                ["global-model-select", "config-llm_model"].forEach(function (id) {
+                    var el = document.getElementById(id);
+                    if (!el) return;
+                    if (on) {
+                        if (el.dataset.prevModel === undefined) el.dataset.prevModel = el.value;
+                        if (strong) el.value = strong;
+                        el.disabled = true;
+                        el.classList.add("locked-agentic");
+                        el.title = "Agentic mode always uses the strongest model";
+                    } else {
+                        el.disabled = false;
+                        el.classList.remove("locked-agentic");
+                        el.title = "";
+                        if (el.dataset.prevModel !== undefined) {
+                            el.value = el.dataset.prevModel;
+                            delete el.dataset.prevModel;
+                        }
+                    }
+                });
+                if (typeof renderCostEstimate === "function") {
+                    try { renderCostEstimate(); } catch (e) {}
+                }
+            }
+            agenticToggle.addEventListener("change", apply);
+            apply();  // set initial state (handles presets that default agentic on)
         })();
 
         /* ── close popovers on outside click ─────────────────────────────── */

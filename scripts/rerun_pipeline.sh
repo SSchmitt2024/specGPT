@@ -75,6 +75,9 @@ select_spec() {
       export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_spec_full.pdf}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Base Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      # Base front matter (cover + TOC) runs to pdf idx 24; body figures start
+      # there. src.tables reads SPEC_FIRST_CONTENT to know where to begin.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-24}"
       # Intentionally NOT setting SPEC_PAGE_OFFSET: each module keeps its own
       # historical Base offset (toc_rebuild=24, others=23).
       ;;
@@ -84,6 +87,10 @@ select_spec() {
       export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_PCIe_full.pdf}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express PCIe Transport Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      # PCIe body content starts at pdf idx 5 (cover/TOC are shorter than
+      # Base's). Without this, src.tables' Base default of 24 silently dropped
+      # PCIe Figures 3-43 (the PCI config-space register tables).
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
       # The PCIe PDF's cover/TOC length differs from Base, so the offset must
       # be explicit. Verified against NVMe_PCIe_full.pdf (Rev 1.3): printed
       # p.6 == 0-indexed pdf idx 5, so the baseline (page-iteration) offset is
@@ -101,6 +108,10 @@ select_spec() {
       export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVMe_command_full.pdf}"
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVM Command Set Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Command Set body content starts at pdf idx 7. Without this, src.tables'
+      # Base default of 24 silently dropped Figures 1-18, including Figure 11
+      # (Protection Information / PRINFO), the master PRACT definition.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-7}"
       # Verified against NVMe_command_full.pdf (Rev 1.2): printed p.8 == 0-indexed
       # pdf idx 7, so the baseline (page-iteration) offset is -1 (toc_rebuild
       # auto-adds its +1 — see src/spec_env.py). Prompt unless already set.
