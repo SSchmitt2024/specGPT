@@ -2435,10 +2435,10 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 if (m.provider !== "Claude (Anthropic)") continue;
                 (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
             }
-            // Stable provider order matching the catalog declaration.
+            // Stable provider order matching the catalog declaration (only included providers).
             const providerOrder = [];
             for (const m of MODEL_CATALOG) {
-                if (!providerOrder.includes(m.provider)) providerOrder.push(m.provider);
+                if (byProvider[m.provider] && !providerOrder.includes(m.provider)) providerOrder.push(m.provider);
             }
             let html = "";
             let defaultId = null;
