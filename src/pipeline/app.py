@@ -1429,7 +1429,7 @@ a { color: var(--accent); text-decoration: none; }
 /* answer card */
 .answer-box { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow-sm); overflow:hidden; }
-#answer-section.answer-stale { opacity: 0.4; pointer-events: none; transition: opacity 0.2s; }
+#answer-section.answer-stale { opacity: 0.4; transition: opacity 0.2s; }
 .answer-meta { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--surface-2); }
 .meta-q { font-size:13px; font-weight:600; color:var(--ink); margin-right:auto; letter-spacing:-0.01em;
   max-width:58%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1497,9 +1497,13 @@ a { color: var(--accent); text-decoration: none; }
 .src-sec { font-family:var(--mono); font-size:12.5px; font-weight:600; color:var(--accent-ink); }
 .src-type { font-size:10px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; padding:1px 6px;
   border-radius:4px; background:var(--subtle); color:var(--t-subtle); }
-.src-dot { margin-left:auto; width:7px; height:7px; border-radius:50%; flex:none; }
+.src-dot { margin-left:auto; width:14px; height:14px; border-radius:50%; flex:none;
+  display:grid; place-items:center; font-size:9px; font-weight:700; line-height:1; color:#fff; }
+[data-theme="dark"] .src-dot { color:#0c0c0e; }
 .src-dot.ok { background:var(--ok); }
+.src-dot.ok::before { content:"\\2713"; }
 .src-dot.warn { background:var(--warn); }
+.src-dot.warn::before { content:"?"; }
 .src-title { font-size:12.5px; color:var(--t-muted); line-height:1.45; }
 .sources-foot { margin-top:12px; padding:10px 12px; border:1px dashed var(--border); border-radius:var(--radius-sm);
   font-size:11.5px; color:var(--t-faint); line-height:1.5; display:flex; gap:8px; align-items:flex-start; }
@@ -1868,7 +1872,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     <span class="picker-lbl">Spec</span>
                     <select id="global-spec-select"></select>
                 </label>
-                <label class="picker" title="Sets both LLMs at once">
+                <label class="picker" title="Sets both the regular and agentic model at once. Shows Custom when they differ.">
                     <span class="picker-lbl">Model</span>
                     <select id="global-model-select"></select>
                 </label>
@@ -1908,36 +1912,25 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                     <select id="config-llm_model" data-model-select="llm"></select>
                                 </div>
                                 <div class="config-item">
-                                    <label>Vector Top-K</label>
-                                    <input type="number" id="config-vector_topk" value="10" min="1" max="50">
+                                    <label>Context Chunks</label>
+                                    <input type="number" id="config-final_rerank_topk" value="10" min="1" max="20" title="How many top-ranked sections are sent to the model. More = better coverage, higher cost.">
                                 </div>
                                 <div class="config-item">
-                                    <label>tsvector Top-K</label>
-                                    <input type="number" id="config-tsvector_topk" value="10" min="1" max="50">
+                                    <label title="After answering, a cheap model checks for gaps and offers agentic refinement when coverage looks thin"><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
                                 </div>
-                                <div class="config-item">
-                                    <label>BM25 Top-K</label>
-                                    <input type="number" id="config-bm25_topk" value="10" min="1" max="50">
-                                </div>
-                                <div class="config-item">
-                                    <label>RRF K</label>
-                                    <input type="number" id="config-rrf_k" value="60" min="10" max="200">
-                                </div>
-                                <div class="config-item">
-                                    <label>RRF Output Top-K</label>
-                                    <input type="number" id="config-rrf_output_topk" value="20" min="5" max="50">
-                                </div>
-                                <div class="config-item">
-                                    <label>Final Rerank Top-K</label>
-                                    <input type="number" id="config-final_rerank_topk" value="7" min="1" max="20">
-                                </div>
-                                <div class="config-item">
-                                    <label>Max Sub-Queries</label>
-                                    <input type="number" id="config-max_subqueries" value="3" min="1" max="5">
-                                </div>
-                                <div class="config-item">
-                                    <label><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
-                                </div>
+                            </div>
+
+                            <!-- Advanced retrieval internals: still applied per request (presets
+                                 drive them; JS reads them when building the config payload), just
+                                 not user-editable. Hidden, not removed, so every
+                                 getElementById("config-*") call site keeps working. -->
+                            <div hidden aria-hidden="true">
+                                <input type="number" id="config-vector_topk" value="5">
+                                <input type="number" id="config-tsvector_topk" value="5">
+                                <input type="number" id="config-bm25_topk" value="5">
+                                <input type="number" id="config-rrf_k" value="60">
+                                <input type="number" id="config-rrf_output_topk" value="20">
+                                <input type="number" id="config-max_subqueries" value="3">
                             </div>
 
                             <div class="config-section-label">Agentic refinement</div>
@@ -1948,31 +1941,19 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                         <select id="config-agentic_model" data-model-select="agentic"></select>
                                     </div>
                                     <div class="config-item">
-                                        <label>Max Follow-ups</label>
-                                        <input type="number" id="config-agentic_max_followups" value="3" min="0" max="5">
-                                    </div>
-                                    <div class="config-item">
-                                        <label>Agentic Rerank Top-K</label>
-                                        <input type="number" id="config-agentic_rerank_topk" value="14" min="5" max="25">
-                                    </div>
-                                    <div class="config-item">
-                                        <label>Context Tokens</label>
-                                        <input type="number" id="config-agentic_max_context_tokens" value="16000" min="4000" max="24000" step="1000">
-                                    </div>
-                                    <div class="config-item">
-                                        <label>Output Tokens</label>
-                                        <input type="number" id="config-agentic_max_output_tokens" value="2048" min="512" max="4096" step="256">
-                                    </div>
-                                    <div class="config-item">
-                                        <label><input type="checkbox" id="config-agentic_targeted_fetch" checked> Targeted Fetch</label>
-                                    </div>
-                                    <div class="config-item">
-                                        <label><input type="checkbox" id="config-agentic_recursive" checked> Recursive</label>
+                                        <label title="Keep refining until the gap analyser reports no missing context"><input type="checkbox" id="config-agentic_recursive" checked> Recursive</label>
                                     </div>
                                     <div class="config-item">
                                         <label>Max Iterations</label>
-                                        <input type="number" id="config-agentic_max_iterations" value="5" min="1" max="10">
+                                        <input type="number" id="config-agentic_max_iterations" value="4" min="1" max="10">
                                     </div>
+                                </div>
+                                <div hidden aria-hidden="true">
+                                    <input type="number" id="config-agentic_max_followups" value="3">
+                                    <input type="number" id="config-agentic_rerank_topk" value="14">
+                                    <input type="number" id="config-agentic_max_context_tokens" value="16000">
+                                    <input type="number" id="config-agentic_max_output_tokens" value="2048">
+                                    <input type="checkbox" id="config-agentic_targeted_fetch" checked>
                                 </div>
                             </div>
                         </div>
@@ -1986,14 +1967,20 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     (function () {
                         // Config presets (#3): a dropdown that applies a bundle of
                         // pipeline settings to the existing config inputs. The server
-                        // (/api/presets) is the source of truth; this fallback keeps
-                        // the selector working if that fetch fails.
+                        // (/api/presets, mirroring orchestrator.PRESETS) is the source
+                        // of truth; this fallback keeps the selector working if that
+                        // fetch fails. agentic_model is listed before llm_model on
+                        // purpose so the global picker (synced on each change, last
+                        // one wins) ends up displaying the regular model.
                         var FALLBACK = {
-                            fast:     { label: "Fast",     agentic: false, config: { vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, final_rerank_topk: 5, auto_gap_check: false } },
-                            balanced: { label: "Balanced", agentic: false, config: {} },
-                            thorough: { label: "Thorough", agentic: true,  config: { vector_topk: 14, tsvector_topk: 14, bm25_topk: 14, final_rerank_topk: 10, agentic_recursive: true, agentic_targeted_fetch: true, agentic_max_iterations: 6, llm_model: "claude-sonnet-4-6", agentic_model: "claude-sonnet-4-6" } }
+                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-haiku-4-5-20251001", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1 } },
+                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "claude-opus-4-7", llm_model: "claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4 } },
+                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "claude-opus-4-7", llm_model: "claude-opus-4-7", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4 } }
                         };
                         var PRESETS = FALLBACK, DEFAULT = "balanced";
+                        // True while apply() is programmatically writing inputs, so the
+                        // divergence listeners below don't mistake it for a hand-edit.
+                        var applying = false;
                         function setInput(key, val) {
                             var el = document.getElementById("config-" + key);
                             if (!el) return;
@@ -2003,20 +1990,32 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         function apply(name) {
                             var p = PRESETS[name] || PRESETS[DEFAULT];
                             if (!p) return;
-                            var cfg = p.config || {};
-                            for (var k in cfg) if (Object.prototype.hasOwnProperty.call(cfg, k)) setInput(k, cfg[k]);
-                            var tog = document.getElementById("agentic-toggle");
-                            if (tog && tog.checked !== !!p.agentic) {
-                                tog.checked = !!p.agentic;
-                                tog.dispatchEvent(new Event("change", { bubbles: true }));
-                            }
+                            applying = true;
+                            try {
+                                var cfg = p.config || {};
+                                for (var k in cfg) if (Object.prototype.hasOwnProperty.call(cfg, k)) setInput(k, cfg[k]);
+                                var tog = document.getElementById("agentic-toggle");
+                                if (tog && tog.checked !== !!p.agentic) {
+                                    tog.checked = !!p.agentic;
+                                    tog.dispatchEvent(new Event("change", { bubbles: true }));
+                                }
+                            } finally { applying = false; }
                             try { localStorage.setItem("specgpt_preset", name); } catch (e) {}
                         }
                         function render(sel, cur) {
                             sel.innerHTML = Object.keys(PRESETS).map(function (k) {
                                 return '<option value="' + k + '">' + (PRESETS[k].label || k) + "</option>";
-                            }).join("");
-                            sel.value = PRESETS[cur] ? cur : DEFAULT;
+                            }).join("") + '<option value="custom" disabled hidden>Custom</option>';
+                            sel.value = (cur === "custom" || PRESETS[cur]) ? cur : DEFAULT;
+                        }
+                        // Hand-editing any config knob diverges from the applied preset;
+                        // show "Custom" instead of letting the selector lie. Re-picking a
+                        // preset re-applies the bundle. Not persisted: the last real
+                        // preset stays in localStorage.
+                        function markCustom() {
+                            if (applying) return;
+                            var sel = document.getElementById("preset-select");
+                            if (sel && sel.value !== "custom") sel.value = "custom";
                         }
                         document.addEventListener("DOMContentLoaded", function () {
                             var sel = document.getElementById("preset-select");
@@ -2025,7 +2024,19 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                             try { cur = localStorage.getItem("specgpt_preset") || "balanced"; } catch (e) {}
                             render(sel, cur);
                             apply(sel.value);
-                            sel.addEventListener("change", function () { apply(sel.value); });
+                            sel.addEventListener("change", function () {
+                                if (sel.value !== "custom") apply(sel.value);
+                            });
+                            // #agentic-config is watched separately because the refine
+                            // overlay moves that node out of #config-panel.
+                            ["config-panel", "agentic-config"].forEach(function (id) {
+                                var host = document.getElementById(id);
+                                if (!host) return;
+                                host.addEventListener("change", markCustom);
+                                host.addEventListener("input", markCustom);
+                            });
+                            var tog = document.getElementById("agentic-toggle");
+                            if (tog) tog.addEventListener("change", markCustom);
                             fetch("/api/presets").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
                                 if (d && d.presets) { PRESETS = d.presets; DEFAULT = d.default || "balanced"; render(sel, sel.value); }
                             }).catch(function () {});
@@ -2045,7 +2056,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     <div id="cost-estimator" class="cost-estimator" role="button" aria-expanded="false" tabindex="0" onclick="toggleCostBreakdown(event)">
                         <div class="cost-chip cost-summary">
                             <span class="cost-chip-lbl">Est. cost</span>
-                            <span class="cost-total" id="cost-total">$0.00</span>
+                            <span class="cost-total" id="cost-total">&ndash;</span>
                             <span class="cost-context" id="cost-context"></span>
                             <span class="cost-toggle" id="cost-toggle">&#9662;</span>
                         </div>
@@ -2061,8 +2072,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     <span class="agentic-hint">
                         Decomposes the answer, runs follow-up retrieval to fill gaps, then
                         regenerates with the agentic model and a larger context. Slower
-                        (about 30 to 60 seconds) and roughly 10x the cost, so leave it off
-                        for routine queries.
+                        (about 30 to 90 seconds) and many times the cost, so leave it off
+                        for routine queries. The Est. cost chip shows the price for the
+                        current settings.
                     </span>
                 </div>
             </div>
@@ -2185,7 +2197,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                 <div id="citations-list" class="src-list"></div>
                                 <div class="sources-foot">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4m0-4h.01"/></svg>
-                                    <span>Amber dot = section the model referenced but that was not in retrieved context. Green = verified in context.</span>
+                                    <span>A green check marks a section verified in the retrieved context. An amber question mark means the model cited it without it being in the retrieved context.</span>
                                 </div>
                             </div>
                         </aside>
@@ -2336,7 +2348,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 securityLevel: "strict",
                 theme: "base",
                 themeVariables: dark ? {
-                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                    fontFamily: "'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
                     fontSize: "12.5px",
                     primaryColor: "#1b2740",
                     primaryTextColor: "#e7eaf0",
@@ -2348,7 +2360,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     clusterBkg: "#141d33",
                     clusterBorder: "#2a3956",
                 } : {
-                    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                    fontFamily: "'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
                     fontSize: "12.5px",
                     primaryColor: "#ffffff",
                     primaryTextColor: "#1c1917",
@@ -2420,8 +2432,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             {id: "gemini-2.5-pro",        label: "Gemini 2.5 Pro",        provider: "Gemini (Google)", in: 1.25,  out: 10.0,  speed: 7, tags: ["most capable"]},
             // Claude (Anthropic)
             {id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  provider: "Claude (Anthropic)", in: 1.0,  out: 5.0,   speed: 1, tags: []},
-            {id: "claude-sonnet-4-5",         label: "Claude Sonnet 4.5", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: [], defaultFor: ["llm"]},
-            {id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: []},
+            {id: "claude-sonnet-4-5",         label: "Claude Sonnet 4.5", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: []},
+            {id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: [], defaultFor: ["llm"]},
             {id: "claude-opus-4-7",           label: "Claude Opus 4.7",   provider: "Claude (Anthropic)", in: 15.0, out: 75.0,  speed: 8, tags: ["most capable"], defaultFor: ["agentic"]},
             // OpenAI
             {id: "gpt-4o-mini",  label: "GPT-4o mini",  provider: "OpenAI", in: 0.15, out: 0.60,  speed: 1, tags: []},
@@ -2494,28 +2506,40 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 
         // Top-right global picker: sets both LLMs at once. Fires a change
         // event on each underlying select so all dependent UI (cost panel,
-        // model table) recomputes via existing listeners.
+        // model table) recomputes via existing listeners. When the two
+        // per-stage selects differ (the defaults do), the picker shows a
+        // "Custom (per stage)" placeholder instead of misreporting one of them.
         (function _wireGlobalModelPicker() {
             const globalEl = document.getElementById("global-model-select");
             if (!globalEl) return;
+            const llmEl = document.getElementById("config-llm_model");
+            const agEl  = document.getElementById("config-agentic_model");
+            const mixed = document.createElement("option");
+            mixed.value = "__mixed__";
+            mixed.textContent = "Custom (per stage)";
+            mixed.disabled = true;
+            mixed.hidden = true;
+            globalEl.appendChild(mixed);
+            function syncFromPanels() {
+                if (!llmEl || !agEl) return;
+                globalEl.value = (llmEl.value === agEl.value) ? llmEl.value : "__mixed__";
+            }
+            // The agentic model-lock rewrites config-llm_model without firing
+            // change events, so it calls this hook directly.
+            window._syncGlobalModel = syncFromPanels;
             globalEl.addEventListener("change", () => {
                 const id = globalEl.value;
-                for (const targetId of ["config-llm_model", "config-agentic_model"]) {
-                    const el = document.getElementById(targetId);
+                if (id === "__mixed__") return;
+                for (const el of [llmEl, agEl]) {
                     if (!el) continue;
                     el.value = id;
                     el.dispatchEvent(new Event("change", {bubbles: true}));
                 }
             });
-            // Keep the global picker in sync if the user changes either of the
-            // panel selects directly. Whichever was changed last wins.
-            for (const targetId of ["config-llm_model", "config-agentic_model"]) {
-                const el = document.getElementById(targetId);
-                if (!el) continue;
-                el.addEventListener("change", () => {
-                    if (globalEl.value !== el.value) globalEl.value = el.value;
-                });
+            for (const el of [llmEl, agEl]) {
+                if (el) el.addEventListener("change", syncFromPanels);
             }
+            syncFromPanels();
         })();
 
         // ── Spec picker (Base vs PCIe Transport) ───────────────────────────
@@ -2762,9 +2786,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const str = (id, def) => { const el = v(id); return el ? el.value : def; };
             return {
                 agentic: v("agentic-toggle") ? v("agentic-toggle").checked : false,
-                llm_model:                  str("config-llm_model", "claude-sonnet-4-5"),
+                llm_model:                  str("config-llm_model", "claude-sonnet-4-6"),
                 agentic_model:              str("config-agentic_model", "claude-opus-4-7"),
-                final_rerank_topk:          num("config-final_rerank_topk", 7),
+                final_rerank_topk:          num("config-final_rerank_topk", 10),
                 auto_gap_check:             chk("config-auto_gap_check"),
                 agentic_rerank_topk:        num("config-agentic_rerank_topk", 14),
                 agentic_max_context_tokens: num("config-agentic_max_context_tokens", 16000),
@@ -2772,7 +2796,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_max_followups:      num("config-agentic_max_followups", 3),
                 agentic_targeted_fetch:     chk("config-agentic_targeted_fetch"),
                 agentic_recursive:          chk("config-agentic_recursive"),
-                agentic_max_iterations:     num("config-agentic_max_iterations", 5),
+                agentic_max_iterations:     num("config-agentic_max_iterations", 4),
             };
         }
 
@@ -2871,10 +2895,14 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const breakEl = document.getElementById("cost-breakdown");
             if (!totalEl || !ctxEl || !breakEl) return;
 
-            totalEl.textContent = "~" + _fmtCostShort(est.total);
             totalEl.classList.remove("cost-warn", "cost-high");
-            if (est.total >= 1.0)      totalEl.classList.add("cost-high");
-            else if (est.total >= 0.10) totalEl.classList.add("cost-warn");
+            if (!isFinite(est.total) || est.total <= 0) {
+                totalEl.textContent = "\\u2013";
+            } else {
+                totalEl.textContent = "~" + _fmtCostShort(est.total);
+                if (est.total >= 1.0)      totalEl.classList.add("cost-high");
+                else if (est.total >= 0.10) totalEl.classList.add("cost-warn");
+            }
 
             const ctxParts = [];
             ctxParts.push(cfg.agentic ? "Agentic mode" : "Regular mode");
@@ -3756,7 +3784,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 ["Rerank top-k", val("config-agentic_rerank_topk") || "14"],
                 ["Max ctx tok",  val("config-agentic_max_context_tokens") || "16000"],
                 ["Targeted fetch", chk("config-agentic_targeted_fetch") ? "on" : "off"],
-                ["Recursive",    chk("config-agentic_recursive") ? "on (max " + (val("config-agentic_max_iterations") || "5") + " iter)" : "off"],
+                ["Recursive",    chk("config-agentic_recursive") ? "on (max " + (val("config-agentic_max_iterations") || "4") + " iter)" : "off"],
             ];
             document.getElementById("ag-confirm-rows").innerHTML = rows.map(([k, v]) =>
                 `<span class="ag-confirm-key">${escapeHtml(k)}</span><span class="ag-confirm-val">${escapeHtml(String(v))}</span>`
@@ -5124,7 +5152,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     return '<button class="src" type="button" data-fig="' + fnum + '">'
                          + '<div class="src-top"><span class="src-sec">Figure ' + fnum + "</span>"
                          + '<span class="src-type">figure</span>'
-                         + '<span class="src-dot ok" title="Verified in retrieved context"></span></div>'
+                         + '<span class="src-dot ok" role="img" title="Verified in retrieved context" aria-label="Verified in retrieved context"></span></div>'
                          + '<div class="src-title">' + cap + "</div></button>";
                 }
                 var c = s.c;
@@ -5134,7 +5162,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 var typeHtml = type ? '<span class="src-type">' + escapeHtml(String(type)) + "</span>" : "";
                 var grounded = !c.hallucinated;
                 var dotTitle = grounded ? "Verified in retrieved context" : "Referenced but not in retrieved context";
-                var dot = '<span class="src-dot ' + (grounded ? "ok" : "warn") + '" title="' + dotTitle + '"></span>';
+                var dot = '<span class="src-dot ' + (grounded ? "ok" : "warn") + '" role="img" title="' + dotTitle + '" aria-label="' + dotTitle + '"></span>';
                 return '<button class="src" type="button" data-sec="' + sid + '">'
                      + '<div class="src-top"><span class="src-sec">&#167;' + sid + "</span>" + typeHtml + dot + "</div>"
                      + '<div class="src-title">' + title + "</div></button>";
@@ -5863,6 +5891,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         }
                     }
                 });
+                if (typeof window._syncGlobalModel === "function") {
+                    try { window._syncGlobalModel(); } catch (e) {}
+                }
                 if (typeof renderCostEstimate === "function") {
                     try { renderCostEstimate(); } catch (e) {}
                 }

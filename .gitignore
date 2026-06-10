@@ -14,3 +14,4 @@ ruvector.db
 *.db
 .DS_Store
 
+scripts/preset_sim.py

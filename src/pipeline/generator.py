@@ -45,7 +45,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Model defaults
-DEFAULT_MODEL = "claude-sonnet-4-5"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
 DEFAULT_REQUEST_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 3

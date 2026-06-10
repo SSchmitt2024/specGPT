@@ -84,17 +84,23 @@ class PipelineConfig:
     # relies on per-chunk `spec` provenance for citation links.
     spec: str = "base"
 
-    # Search parameters
-    vector_topk: int = 10
-    tsvector_topk: int = 10
-    bm25_topk: int = 10
+    # Search parameters. Tuned via scripts/preset_sim.py against the eval set:
+    # leaner per-method lists measurably beat deeper ones at a fixed context
+    # budget (extra depth surfaces plausible-but-wrong chunks that outscore
+    # gold ones at the rerank cut), so these defaults are intentionally small.
+    # These defaults ARE the "Balanced" preset — keep PRESETS["balanced"] in
+    # sync when changing them.
+    vector_topk: int = 5
+    tsvector_topk: int = 5
+    bm25_topk: int = 5
 
     # RRF merge parameters
     rrf_k: int = 60
     rrf_output_topk: int = 20
 
-    # Reranking parameters
-    final_rerank_topk: int = 7
+    # Reranking parameters. final_rerank_topk is the dominant recall knob
+    # (eval recall 0.90 @ 5 chunks, 0.95 @ 10, 0.98 @ 14).
+    final_rerank_topk: int = 10
     cross_encoder_model: str = "rerank-2-lite"
 
     # Structured-lookup fuzzy fallback — runs *after* the exact lookup tables.
@@ -111,7 +117,7 @@ class PipelineConfig:
     max_subqueries: int = 3
 
     # Generation parameters
-    llm_model: str = "claude-sonnet-4-5"
+    llm_model: str = "claude-sonnet-4-6"
     llm_max_context_tokens: int = 4000
     llm_max_output_tokens: int = 1024
 
@@ -140,7 +146,9 @@ class PipelineConfig:
     # Safety cap on agentic iterations. The loop can never exceed this (and is
     # further bounded by the absolute ceiling _AGENTIC_HARD_CAP), so a gap
     # analyser that keeps asking for unavailable data cannot loop forever.
-    agentic_max_iterations: int = 5
+    # qa_log shows median 0 / mean ~1.8 refinement passes, so 4 is effectively
+    # never binding and exists to bound worst-case cost.
+    agentic_max_iterations: int = 4
 
     # When True and agentic mode is OFF, still run a one-shot gap analysis
     # after the first-pass answer and surface the result as `gap_hint` in
@@ -399,37 +407,118 @@ _AGENTIC_HARD_CAP = 10
 # source of truth; the web layer serves it via /api/presets and the frontend
 # resolves the chosen preset into the request's `config` + `agentic`.
 #
-# `config` only ever holds a subset of PipelineConfig fields; `spec` is
-# deliberately excluded (it's chosen independently via the spec control) and is
-# merged in on top of the preset by the caller.
+# `config` only ever holds PipelineConfig field names; `spec` is deliberately
+# excluded (it's chosen independently via the spec control) and is merged in on
+# top of the preset by the caller. Every preset sets the FULL set of knobs it
+# cares about so switching presets in the UI is deterministic — a preset with a
+# partial config would silently inherit leftovers from the previous selection.
+#
+# Values are tuned against the 60-item eval set via scripts/preset_sim.py
+# (retrieval cached once at max depth, then every candidate config replayed
+# offline through the real rrf_merge + rerank-score ordering + pinning).
+# Key findings that shaped these numbers:
+#   - final_rerank_topk drives recall almost single-handedly: expected-section
+#     recall on the eval set is 0.90 @ 5 chunks, 0.95 @ 10, 0.98 @ 14.
+#   - LEANER per-method top-k wins at a fixed context budget: top-k 4-6 beats
+#     10-14 everywhere (deep lists add plausible-but-wrong chunks that outscore
+#     gold ones at the rerank cut). The old presets over-retrieved: old
+#     balanced (topk 10, 7 chunks) scored 0.90; new balanced (topk 5,
+#     10 chunks) scores 0.95 at ~$0.003 extra. Old thorough's topk=14 scored
+#     *below* topk=8 at the same budget.
+#   - Sub-query decomposition is recall-neutral on single-fact queries, so
+#     Fast caps it at 1 (less fan-out, smaller rerank pool); multi-part
+#     questions still benefit, so Balanced/Thorough keep 3.
+#   - rrf_k and rrf_output_topk barely matter (kept at 60 / 20; Fast trims
+#     the pool to 12 since only 5 survive anyway).
+#   - Live spot-check: Haiku 4.5 follows the bracket-citation format exactly
+#     as well as Sonnet on identical context, so Fast can ride the cheap fast
+#     model safely (~$0.006 and ~5-8 s vs ~$0.02 and ~13 s on Sonnet).
+#   - Agentic iteration cap 4: qa_log shows median 0 / mean ~1.8 refinement
+#     passes, so 4 is never binding in practice and bounds worst-case cost.
 PRESETS: dict[str, dict] = {
+    # Quick lookups: cheapest/fastest model, lean single-query retrieval, no
+    # gap check. Same measured recall as the old Fast AND old Balanced (0.90)
+    # at roughly a third of the cost and half the latency. The agentic_* values
+    # only matter if the user manually flips agentic on: single pass, small
+    # context, Sonnet.
     "fast": {
         "label": "Fast",
         "agentic": False,
         "config": {
+            "agentic_model": "claude-sonnet-4-6",
+            "llm_model": "claude-haiku-4-5-20251001",
             "vector_topk": 6,
             "tsvector_topk": 6,
             "bm25_topk": 6,
+            "rrf_k": 60,
+            "rrf_output_topk": 12,
             "final_rerank_topk": 5,
+            "max_subqueries": 1,
             "auto_gap_check": False,
+            "agentic_max_followups": 2,
+            "agentic_rerank_topk": 10,
+            "agentic_max_context_tokens": 8000,
+            "agentic_max_output_tokens": 1024,
+            "agentic_targeted_fetch": True,
+            "agentic_recursive": False,
+            "agentic_max_iterations": 1,
         },
     },
+    # The default. Matches PipelineConfig server defaults (keep the two in
+    # sync). 0.95 recall at ~$0.025/query: lean per-method retrieval feeding a
+    # 10-chunk context on Sonnet, with the cheap post-answer gap check on so
+    # the UI can offer agentic refinement when coverage looks thin.
     "balanced": {
         "label": "Balanced",
         "agentic": False,
-        "config": {},  # server defaults — current behavior
+        "config": {
+            "agentic_model": "claude-opus-4-7",
+            "llm_model": "claude-sonnet-4-6",
+            "vector_topk": 5,
+            "tsvector_topk": 5,
+            "bm25_topk": 5,
+            "rrf_k": 60,
+            "rrf_output_topk": 20,
+            "final_rerank_topk": 10,
+            "max_subqueries": 3,
+            "auto_gap_check": True,
+            "agentic_max_followups": 3,
+            "agentic_rerank_topk": 14,
+            "agentic_max_context_tokens": 16000,
+            "agentic_max_output_tokens": 2048,
+            "agentic_targeted_fetch": True,
+            "agentic_recursive": True,
+            "agentic_max_iterations": 4,
+        },
     },
+    # Maximum answer quality, cost shown is the price of admission: recursive
+    # agentic refinement on Opus with targeted structured fetches. First pass
+    # is the same 10-chunk context (0.92 recall); the agentic re-rerank at 14
+    # chunks reaches the measured ceiling (0.98) and the loop keeps filling
+    # gaps until the verdict says complete. Slightly wider nets (topk 8) than
+    # Balanced; wider still measured WORSE, so this is the sweet spot, not a
+    # compromise. Typical ~$0.45 and 30-90 s; worst case ~4x that.
     "thorough": {
         "label": "Thorough",
         "agentic": True,
         "config": {
-            "vector_topk": 14,
-            "tsvector_topk": 14,
-            "bm25_topk": 14,
+            "agentic_model": "claude-opus-4-7",
+            "llm_model": "claude-opus-4-7",
+            "vector_topk": 8,
+            "tsvector_topk": 8,
+            "bm25_topk": 8,
+            "rrf_k": 60,
+            "rrf_output_topk": 20,
             "final_rerank_topk": 10,
-            "agentic_recursive": True,
+            "max_subqueries": 3,
+            "auto_gap_check": True,
+            "agentic_max_followups": 3,
+            "agentic_rerank_topk": 14,
+            "agentic_max_context_tokens": 16000,
+            "agentic_max_output_tokens": 2048,
             "agentic_targeted_fetch": True,
-            "agentic_max_iterations": 6,
+            "agentic_recursive": True,
+            "agentic_max_iterations": 4,
         },
     },
 }
