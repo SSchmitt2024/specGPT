@@ -98,7 +98,15 @@ from src.pipeline.auth import (
     verify_session_token,
 )
 from src.pipeline.generator import DeepThoughtUnreachableError
-from src.pipeline.orchestrator import GenerationError, orchestrate, PipelineConfig, PRESETS, DEFAULT_PRESET
+from src.pipeline.orchestrator import (
+    ALL_SPECS,
+    CONCRETE_SPEC_IDS,
+    GenerationError,
+    orchestrate,
+    PipelineConfig,
+    PRESETS,
+    DEFAULT_PRESET,
+)
 
 
 def _generation_error_detail(e: GenerationError, request_id: str, *, include_trace: bool) -> dict:
@@ -286,8 +294,19 @@ AVAILABLE_SPECS = [
     {"id": "base", "label": "Base Specification", "version": "2.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-Revision-2.3-2025.08.01-Ratified.pdf"},
     {"id": "pcie", "label": "PCIe Transport", "version": "1.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVMe-over-PCIe-Transport-Specification-Revision-1.3-2025.08.01-Ratified.pdf"},
     {"id": "command", "label": "NVM Command Set", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVM-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    # Sentinel: search every corpus at once (orchestrator.ALL_SPECS). There is
+    # no single PDF, so url is None; citation deep-links use each chunk's own
+    # spec provenance instead. Keep this entry LAST so the frontend's
+    # _specData[0] fallback for spec-less citations stays the base spec.
+    {"id": "all", "label": "All Specifications", "version": "", "url": None},
 ]
 _VALID_SPEC_IDS = {s["id"] for s in AVAILABLE_SPECS}
+# The all-specs merge in the orchestrator expands ALL_SPECS to
+# CONCRETE_SPEC_IDS; fail loudly at import time if this list drifts from it.
+assert _VALID_SPEC_IDS == set(CONCRETE_SPEC_IDS) | {ALL_SPECS}, (
+    f"AVAILABLE_SPECS ids {_VALID_SPEC_IDS} out of sync with "
+    f"orchestrator.CONCRETE_SPEC_IDS {CONCRETE_SPEC_IDS}"
+)
 
 
 app = FastAPI(
@@ -1678,6 +1697,19 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
   font-size:11px; font-weight:500; padding:3px 7px; border-radius:5px; white-space:nowrap;
   opacity:0; transform:translateY(2px); transition:opacity .08s ease, transform .08s ease; box-shadow:var(--shadow-pop); }
 .popup-tip.show { opacity:1; transform:translateY(0); }
+
+/* citation preview popover (click a blue section chip in the answer) */
+.cite-pop { position:fixed; z-index:3000; width:min(420px,90vw); background:var(--surface);
+  border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 32px rgba(0,0,0,.18);
+  padding:12px 14px; }
+.cite-pop-title { font-size:12.5px; font-weight:600; color:var(--ink); margin-bottom:6px; }
+.cite-pop-title .mono { font-family:var(--mono); }
+.cite-pop-body { font-size:12.5px; color:var(--t-muted); line-height:1.55; max-height:180px; overflow:auto; }
+.cite-pop-foot { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:10px; }
+.cite-pop-page { font-size:11.5px; color:var(--t-faint); }
+.cite-pop-open { border:1px solid var(--border); background:var(--surface-2); color:var(--ink);
+  font-size:12px; font-weight:600; padding:5px 10px; border-radius:7px; cursor:pointer; }
+.cite-pop-open:hover { background:var(--accent); border-color:var(--accent); color:#fff; }
 
 /* overlays (agentic confirm + config) */
 .ag-confirm-overlay, .ag-config-overlay { position:fixed; inset:0; z-index:2100; background:color-mix(in srgb, var(--ink) 38%, transparent);
@@ -4654,6 +4686,83 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             });
         }
 
+        /* ── citation preview popover ─────────────────────────────────────
+           Clicking a section chip opens a small anchored popover showing the
+           cited section's title, a snippet of its text (shipped with the
+           citations payload, so no extra fetch), the page, and an Open PDF
+           button. Esc or clicking elsewhere dismisses it. */
+        var _citePop = null;
+        function closeCitePop() {
+            if (_citePop) { _citePop.remove(); _citePop = null; }
+        }
+        function showCitePop(chip, c) {
+            closeCitePop();
+            if (!chip || !c) return;
+            var pop = document.createElement("div");
+            pop.className = "cite-pop";
+
+            var title = document.createElement("div");
+            title.className = "cite-pop-title";
+            var sid = document.createElement("span");
+            sid.className = "mono";
+            sid.textContent = String.fromCharCode(167) + String(c.section_id || "");
+            title.appendChild(sid);
+            if (c.section_title && c.section_title !== c.section_id) {
+                title.appendChild(document.createTextNode("  " + c.section_title));
+            }
+            pop.appendChild(title);
+
+            if (c.snippet) {
+                var body = document.createElement("div");
+                body.className = "cite-pop-body";
+                body.textContent = c.snippet;
+                pop.appendChild(body);
+            }
+
+            var foot = document.createElement("div");
+            foot.className = "cite-pop-foot";
+            var page = document.createElement("span");
+            page.className = "cite-pop-page";
+            if (c.pdf_pages && c.pdf_pages.length > 0) {
+                var p0 = parseInt(c.pdf_pages[0], 10);
+                if (!isNaN(p0)) page.textContent = "p. " + (p0 + 1);
+            }
+            foot.appendChild(page);
+            if (pdfPageJumpSupported()) {
+                var btn = document.createElement("button");
+                btn.type = "button";
+                btn.className = "cite-pop-open";
+                btn.textContent = "Open PDF";
+                btn.addEventListener("click", function (e) {
+                    e.stopPropagation();
+                    openCitationPdf(c);
+                });
+                foot.appendChild(btn);
+            }
+            pop.appendChild(foot);
+
+            document.body.appendChild(pop);
+            _citePop = pop;
+            // Anchor under the chip, clamped to the viewport.
+            var r = chip.getBoundingClientRect();
+            var left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+            var top = r.bottom + 8;
+            if (top + pop.offsetHeight > window.innerHeight - 8) {
+                top = Math.max(8, r.top - pop.offsetHeight - 8);
+            }
+            pop.style.left = left + "px";
+            pop.style.top = top + "px";
+        }
+        document.addEventListener("click", function (e) {
+            if (!_citePop) return;
+            if (_citePop.contains(e.target)) return;
+            if (e.target.closest && e.target.closest(".cite-chip")) return;
+            closeCitePop();
+        });
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape") closeCitePop();
+        });
+
         /* Replace the model's bracketed citation tags ([§5.2.1] or
            [§5.2.1, §5.3]) in the rendered answer with clean citation chips.
            Walks text nodes only (skips code/pre/anchors). A bracket is only
@@ -4828,7 +4937,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 c.addEventListener("mouseleave", function () { setActiveSec(null); });
                 c.addEventListener("click", function () {
                     var sec = c.getAttribute("data-sec");
-                    openCitationPdf(citeMap[sec]);
+                    showCitePop(c, citeMap[sec]);
                 });
             });
         }

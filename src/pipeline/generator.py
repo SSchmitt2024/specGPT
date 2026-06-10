@@ -516,6 +516,12 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
         seen_sections.add(key)
 
         if chunk is not None:
+            # Short preview of the cited chunk so the UI can show a popup
+            # citation without a second fetch. Whitespace-collapsed and
+            # capped — full text stays server-side.
+            snippet = " ".join((chunk.get("text_raw") or "").split())
+            if len(snippet) > 360:
+                snippet = snippet[:357] + "..."
             cite = {
                 "section_id": resolved_id,
                 "section_title": chunk.get("section_title", ""),
@@ -526,6 +532,7 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
                 "spec": chunk.get("spec"),
                 "spec_document": chunk.get("spec_document"),
                 "pdf_pages": chunk.get("pdf_pages") or [],
+                "snippet": snippet,
                 "hallucinated": False,
             }
             if section_id != resolved_id:

@@ -84,6 +84,7 @@ def test_extract_citations_strips_trailing_dot():
         "content_type": "prose",
         # Provenance fields default to None/[] when the context chunk omits them.
         "spec": None, "spec_document": None, "pdf_pages": [],
+        "snippet": "",
         "hallucinated": False,
     }]
 
@@ -1100,6 +1101,90 @@ def test_backfill_citation_pages_noop_on_empty_or_no_spec():
     cits = [{"section_id": "5.2", "pdf_pages": [], "spec": None, "hallucinated": False}]
     _backfill_citation_pages(cits, "")
     assert cits[0]["pdf_pages"] == []
+
+
+# ---------------------------------------------------------------------------
+# All-specs mode ("all" sentinel searches every corpus at once)
+
+def test_backfill_citation_pages_all_specs_never_stamps_sentinel():
+    """In all-specs mode a citation's spec must come from per-chunk provenance
+    (or the section lookup), never the "all" sentinel, which has no PDF URL
+    and would break the frontend deep link. Runs offline: every live citation
+    already has pages so no DB lookup happens."""
+    from src.pipeline.orchestrator import ALL_SPECS, _backfill_citation_pages
+    cits = [
+        {"section_id": "5.2", "pdf_pages": [10], "spec": None, "hallucinated": False},
+        {"section_id": "2.1", "pdf_pages": [44], "spec": "pcie", "hallucinated": False},
+    ]
+    _backfill_citation_pages(cits, ALL_SPECS)
+    assert cits[0]["spec"] is None      # left unset, not "all"
+    assert cits[1]["spec"] == "pcie"    # per-chunk provenance preserved
+
+
+def test_resolve_requested_resources_all_mode_probes_each_corpus(monkeypatch):
+    """All-specs targeted fetch probes every corpus's figure index and stamps
+    each chunk with its source spec. Figure numbers collide across specs, so
+    the two "Figure 11"s must come back as distinct chunks (distinct ids) with
+    distinct spec provenance."""
+    from src.pipeline import orchestrator as orch
+
+    tables = {
+        "base":    {"11": {"figure_number": "11", "parent_section": "1.1",
+                           "raw_text": "base table", "caption": "Base Fig 11"}},
+        "pcie":    {"11": {"figure_number": "11", "parent_section": "2.2",
+                           "raw_text": "pcie table", "caption": "PCIe Fig 11"}},
+        "command": {},
+    }
+    monkeypatch.setattr(orch.retriever, "load_tables_by_figure", lambda spec: tables[spec])
+    monkeypatch.setattr(orch.retriever, "load_field_index", lambda spec: {})
+
+    out = orch._resolve_requested_resources(
+        {"figures": ["11"], "fields": [], "sections": []},
+        spec=orch.ALL_SPECS,
+    )
+    assert sorted(c["spec"] for c in out) == ["base", "pcie"]
+    assert len({c["id"] for c in out}) == 2  # spec-prefixed ids stay distinct
+
+
+def test_structured_lookup_all_specs_merges_and_stamps_spec(monkeypatch):
+    """The all-specs structured lookup merges per-corpus results: found/
+    confidence aggregate across specs, sources get spec provenance plus
+    spec-prefixed ids (so dedup can't collapse colliding figure numbers), and
+    notes say which corpus they came from."""
+    from src.pipeline import orchestrator as orch
+    from src.pipeline.retriever import StructuredLookupResult
+
+    def fake_lookup(decomp, *, use_llm, max_fields, spec, enable_fuzzy, fuzzy_cutoff):
+        if spec == "pcie":
+            return StructuredLookupResult(
+                query="q", found=True, confidence="HIGH",
+                fields=[{"name": "X"}], tables=[{"figure_number": "11"}],
+                sources=[{"chunk_id": "table:11", "score": 1.0,
+                          "method": "structured_lookup"}],
+                notes=["hit"],
+            )
+        return StructuredLookupResult(query="q", found=False, confidence="LOW",
+                                      notes=["miss"])
+
+    monkeypatch.setattr(orch.retriever, "structured_lookup", fake_lookup)
+    res = orch._structured_lookup_all_specs("ignored-decomp")
+    assert res.found and res.confidence == "HIGH"
+    assert res.fields == [{"name": "X", "spec": "pcie"}]
+    assert res.sources[0]["spec"] == "pcie"
+    assert res.sources[0]["chunk_id"] == "pcie:table:11"
+    assert "[base] miss" in res.notes and "[pcie] hit" in res.notes
+
+
+def test_all_specs_option_registered():
+    """The "all" sentinel must be selectable (validated spec id) and must stay
+    LAST in AVAILABLE_SPECS so the frontend's _specData[0] fallback for
+    spec-less citations remains the base spec."""
+    from src.pipeline import app as app_mod
+    from src.pipeline.orchestrator import ALL_SPECS
+    assert ALL_SPECS in app_mod._VALID_SPEC_IDS
+    assert app_mod.AVAILABLE_SPECS[-1]["id"] == ALL_SPECS
+    assert app_mod.AVAILABLE_SPECS[0]["id"] == "base"
+    assert app_mod.AVAILABLE_SPECS[-1]["url"] is None
 
 
 # ---------------------------------------------------------------------------

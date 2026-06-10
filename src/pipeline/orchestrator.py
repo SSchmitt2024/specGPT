@@ -60,13 +60,28 @@ class GenerationError(RuntimeError):
         self.retrieved_chunks = retrieved_chunks or []
 
 
+# Sentinel spec id meaning "search every ingested corpus at once". Retrieval
+# drops its spec filter; spec-keyed structured lookups run once per corpus and
+# merge (the field/figure indexes are scoped per corpus and figure numbers
+# collide across specs - Base, PCIe and Command Set each have their own
+# "Figure 11" - so every merged hit is stamped with the spec it came from).
+ALL_SPECS = "all"
+
+# Every ingested corpus, i.e. what ALL_SPECS expands to. Must match the
+# concrete (non-"all") ids in app.AVAILABLE_SPECS; app.py asserts this at
+# import time so the two lists can't drift.
+CONCRETE_SPEC_IDS: tuple[str, ...] = ("base", "pcie", "command")
+
+
 @dataclass
 class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
-    # Which specification corpus to search: "base" | "pcie" | "command" (see
-    # AVAILABLE_SPECS in app.py). Scopes every retrieval (vector / tsvector /
-    # BM25 / structured lookup) to rows tagged with this spec, so different
-    # specs' results never co-mingle.
+    # Which specification corpus to search: "base" | "pcie" | "command", or
+    # ALL_SPECS to search every ingested corpus (see AVAILABLE_SPECS in
+    # app.py). A concrete spec scopes every retrieval (vector / tsvector /
+    # BM25 / structured lookup) to rows tagged with it so different specs'
+    # results never co-mingle; ALL_SPECS removes the retrieval filter and
+    # relies on per-chunk `spec` provenance for citation links.
     spec: str = "base"
 
     # Search parameters
@@ -288,7 +303,10 @@ def hybrid_search(
     total_input = 0
 
     # Scope every retriever to the selected spec so Base/PCIe never co-mingle.
-    spec_filter = {"spec": config.spec}
+    # ALL_SPECS searches every corpus: omitting the spec key makes the RPCs
+    # and BM25 skip the filter (each hit still carries its own spec
+    # provenance, which the UI uses to label and deep-link citations).
+    spec_filter = {} if config.spec == ALL_SPECS else {"spec": config.spec}
 
     # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
     import concurrent.futures
@@ -633,21 +651,23 @@ def _resolve_requested_resources(
 ) -> list[dict]:
     """Direct-fetch chunks for specific figures/fields/sections, scoped to `spec`.
 
-    Returns chunk dicts matching the standard shape (compatible with the
-    dedup/rerank pool). Tags ``method="agentic_fetch_*"`` so the trace can
-    distinguish them from hybrid-search hits.
+    ALL_SPECS probes every ingested corpus and stamps each chunk with its
+    source spec. Returns chunk dicts matching the standard shape (compatible
+    with the dedup/rerank pool). Tags ``method="agentic_fetch_*"`` so the
+    trace can distinguish them from hybrid-search hits.
     """
     chunks: list[dict] = []
     if not any(requested.values()):
         return chunks
 
-    try:
-        tables_by_fig = retriever.load_tables_by_figure(spec)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("agentic targeted-fetch: tables load failed: %s", e)
-        tables_by_fig = {}
+    # Figure/field indexes are keyed per corpus and figure numbers collide
+    # across specs, so all-specs mode probes each corpus separately. Every
+    # fetched chunk is stamped with the spec it came from (and the spec is
+    # baked into the id so the dedup pool can't collapse two corpora's
+    # identically numbered tables).
+    specs_to_probe = CONCRETE_SPEC_IDS if spec == ALL_SPECS else (spec,)
 
-    def _chunk_from_table(table: dict, *, src_tag: str, source: str) -> dict | None:
+    def _chunk_from_table(table: dict, *, src_tag: str, source: str, chunk_spec: str) -> dict | None:
         fig = table.get("figure_number") or table.get("parent_figure")
         if fig is None:
             return None
@@ -658,8 +678,8 @@ def _resolve_requested_resources(
         except Exception:
             text = table.get("raw_text") or ""
         return {
-            "id": f"agentic_fetch:{src_tag}",
-            "chunk_id": f"agentic_fetch:{src_tag}",
+            "id": f"agentic_fetch:{chunk_spec}:{src_tag}",
+            "chunk_id": f"agentic_fetch:{chunk_spec}:{src_tag}",
             "section_id": section_id,
             "section_title": table.get("caption") or f"Figure {fig_s}",
             "content_type": "table",
@@ -667,57 +687,67 @@ def _resolve_requested_resources(
             "pdf_pages": [table.get("pdf_page")] if table.get("pdf_page") else [],
             "figure_number": fig_s,
             "has_normative": "shall" in (table.get("raw_text") or "").lower(),
+            "spec": chunk_spec,
             "score": 1.0,
             "method": source,
         }
 
-    # ── Figures: direct table lookup ────────────────────────────────────
-    for fig in requested.get("figures") or []:
-        keys = {str(fig).strip(),
-                str(fig).strip().lstrip("0") or str(fig).strip(),
-                str(fig).strip().upper()}
-        table = next((tables_by_fig[k] for k in keys if k in tables_by_fig), None)
-        if not table:
-            continue
-        ch = _chunk_from_table(table, src_tag=f"fig{fig}", source="agentic_fetch_figure")
-        if ch:
-            chunks.append(ch)
+    for probe_spec in specs_to_probe:
+        try:
+            tables_by_fig = retriever.load_tables_by_figure(probe_spec)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agentic targeted-fetch: tables load failed (spec=%s): %s", probe_spec, e)
+            tables_by_fig = {}
 
-    # ── Fields: resolve to parent figure(s) ─────────────────────────────
-    try:
-        field_index = retriever.load_field_index(spec)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("agentic targeted-fetch: field_index load failed: %s", e)
-        field_index = {}
-
-    for name in requested.get("fields") or []:
-        recs = field_index.get(name) or field_index.get(name.upper()) or []
-        if not isinstance(recs, list):
-            recs = [recs]
-        for rec in recs[:3]:
-            parent = rec.get("parent_figure") if isinstance(rec, dict) else None
-            if parent is None:
-                continue
-            table = tables_by_fig.get(str(parent))
+        # ── Figures: direct table lookup ────────────────────────────────
+        for fig in requested.get("figures") or []:
+            keys = {str(fig).strip(),
+                    str(fig).strip().lstrip("0") or str(fig).strip(),
+                    str(fig).strip().upper()}
+            table = next((tables_by_fig[k] for k in keys if k in tables_by_fig), None)
             if not table:
                 continue
-            ch = _chunk_from_table(table, src_tag=f"field:{name}@fig{parent}",
-                                   source="agentic_fetch_field")
+            ch = _chunk_from_table(table, src_tag=f"fig{fig}",
+                                   source="agentic_fetch_figure", chunk_spec=probe_spec)
             if ch:
                 chunks.append(ch)
 
+        # ── Fields: resolve to parent figure(s) ─────────────────────────
+        try:
+            field_index = retriever.load_field_index(probe_spec)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agentic targeted-fetch: field_index load failed (spec=%s): %s", probe_spec, e)
+            field_index = {}
+
+        for name in requested.get("fields") or []:
+            recs = field_index.get(name) or field_index.get(name.upper()) or []
+            if not isinstance(recs, list):
+                recs = [recs]
+            for rec in recs[:3]:
+                parent = rec.get("parent_figure") if isinstance(rec, dict) else None
+                if parent is None:
+                    continue
+                table = tables_by_fig.get(str(parent))
+                if not table:
+                    continue
+                ch = _chunk_from_table(table, src_tag=f"field:{name}@fig{parent}",
+                                       source="agentic_fetch_field", chunk_spec=probe_spec)
+                if ch:
+                    chunks.append(ch)
+
     # ── Sections: fall back to tsvector search keyed on the section id ──
     if enable_section_fallback:
+        sec_filter = {} if spec == ALL_SPECS else {"spec": spec}
         for sid in requested.get("sections") or []:
             try:
                 hits = search.tsvector_search(sid, top_k=3,
-                                              filter={"section_prefix": sid, "spec": spec})
+                                              filter={"section_prefix": sid, **sec_filter})
             except Exception:
                 hits = []
             if not hits:
                 try:
                     hits = search.tsvector_search(f"Section {sid}", top_k=3,
-                                                  filter={"spec": spec})
+                                                  filter=sec_filter)
                 except Exception:
                     hits = []
             for h in hits:
@@ -727,6 +757,68 @@ def _resolve_requested_resources(
                 chunks.append(h)
 
     return chunks
+
+
+def _structured_lookup_all_specs(
+    decomp,
+    *,
+    max_fields: int = 8,
+    enable_fuzzy: bool = True,
+    fuzzy_cutoff: float = 0.86,
+):
+    """Run the per-corpus structured lookup against every ingested spec and
+    merge the results into one StructuredLookupResult.
+
+    The per-spec indexes are lru-cached and the lookups are in-memory dict
+    probes, so this costs N dict probes, not N network round-trips (only the
+    first all-specs query pays the extra index loads). Figure numbers collide
+    across corpora, so every merged source/field is stamped with the spec it
+    came from - that provenance flows through generation into citations, which
+    is what makes the deep links land on the right PDF. Chunk ids get a spec
+    prefix so the dedup pool can't collapse two corpora's identically numbered
+    tables into one.
+    """
+    from src.pipeline.retriever import StructuredLookupResult
+
+    merged = StructuredLookupResult(query="", found=False, confidence="LOW")
+    conf_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    for spec_id in CONCRETE_SPEC_IDS:
+        try:
+            res = retriever.structured_lookup(
+                decomp,
+                use_llm=False,
+                max_fields=max_fields,
+                spec=spec_id,
+                enable_fuzzy=enable_fuzzy,
+                fuzzy_cutoff=fuzzy_cutoff,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("structured lookup failed for spec=%s: %s", spec_id, e)
+            continue
+        if not merged.query:
+            merged.query = res.query
+            merged.entities = res.entities
+        if res.found:
+            merged.found = True
+            if conf_rank.get(res.confidence, 0) > conf_rank.get(merged.confidence, 0):
+                merged.confidence = res.confidence
+            for src in res.sources:
+                src["spec"] = spec_id
+                for key in ("id", "chunk_id"):
+                    if src.get(key):
+                        src[key] = f"{spec_id}:{src[key]}"
+            for f in res.fields:
+                f.setdefault("spec", spec_id)
+            merged.sources.extend(res.sources)
+            merged.fields.extend(res.fields)
+            merged.tables.extend(res.tables)
+        merged.notes.extend(f"[{spec_id}] {n}" for n in res.notes)
+
+    # Keep the merged result the same size as a single-spec one so the pinned
+    # structured chunks can't crowd reranked hybrid hits out of the context.
+    merged.fields = merged.fields[:max_fields]
+    merged.sources = merged.sources[:max_fields]
+    return merged
 
 
 def _aggregate_tokens(
@@ -766,8 +858,11 @@ def _backfill_citation_pages(citations: list[dict], spec: str) -> None:
     carry no pdf_pages and no spec, so the frontend produced a page-less link
     that opened the PDF at page 1. Here we look the page up from spec_chunks by
     section id, scoped to the query's spec (retrieval is single-spec, so every
-    citation belongs to it). Mutates in place; best-effort - a lookup failure
-    leaves citations untouched.
+    citation belongs to it). In ALL_SPECS mode the lookup is unscoped and the
+    chunk row's own spec is used instead; a section id that exists in more
+    than one corpus is left untouched rather than deep-linked to the wrong
+    PDF. Mutates in place; best-effort - a lookup failure leaves citations
+    untouched.
     """
     live = [c for c in citations if not c.get("hallucinated") and c.get("section_id")]
     if not live:
@@ -775,27 +870,42 @@ def _backfill_citation_pages(citations: list[dict], spec: str) -> None:
 
     needs_page = [c for c in live if not c.get("pdf_pages")]
     page_by_section: dict[str, list[int]] = {}
+    spec_by_section: dict[str, str] = {}
     if needs_page and spec:
         section_ids = sorted({c["section_id"] for c in needs_page})
         try:
-            res = (
+            builder = (
                 search.supabase_client()
                 .table("spec_chunks")
-                .select("section_id, pdf_pages")
-                .eq("spec", spec)
-                .in_("section_id", section_ids)
-                .execute()
+                .select("section_id, pdf_pages, spec")
             )
+            if spec != ALL_SPECS:
+                builder = builder.eq("spec", spec)
+            res = builder.in_("section_id", section_ids).execute()
+            by_sid: dict[str, list[dict]] = {}
             for row in (res.data or []):
-                sid, pages = row.get("section_id"), row.get("pdf_pages") or []
-                if sid and pages and sid not in page_by_section:
+                sid = row.get("section_id")
+                if sid:
+                    by_sid.setdefault(sid, []).append(row)
+            for sid, rows in by_sid.items():
+                specs_seen = {r.get("spec") for r in rows}
+                if spec == ALL_SPECS and len(specs_seen) > 1:
+                    continue  # same section id in multiple corpora: ambiguous
+                pages = next((r.get("pdf_pages") for r in rows if r.get("pdf_pages")), None)
+                if pages:
                     page_by_section[sid] = pages
+                    row_spec = next(iter(specs_seen))
+                    if row_spec:
+                        spec_by_section[sid] = row_spec
         except Exception:
             logger.exception("citation page backfill failed (spec=%s)", spec)
 
     for c in live:
-        if spec and not c.get("spec"):
-            c["spec"] = spec
+        if not c.get("spec"):
+            if spec and spec != ALL_SPECS:
+                c["spec"] = spec
+            elif spec_by_section.get(c["section_id"]):
+                c["spec"] = spec_by_section[c["section_id"]]
         if not c.get("pdf_pages"):
             pages = page_by_section.get(c["section_id"])
             if pages:
@@ -1416,7 +1526,18 @@ def orchestrate(
             search_queries.append(sq)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        if _lookup_entities:
+        if _lookup_entities and config.spec == ALL_SPECS:
+            # Structured indexes are per-corpus, so all-specs mode runs the
+            # lookup once per ingested spec and merges (in-memory after the
+            # first load; see _structured_lookup_all_specs).
+            struct_fut = executor.submit(
+                _structured_lookup_all_specs,
+                decomp,
+                max_fields=8,
+                enable_fuzzy=config.enable_fuzzy_lookup,
+                fuzzy_cutoff=config.fuzzy_lookup_cutoff,
+            )
+        elif _lookup_entities:
             struct_fut = executor.submit(
                 retriever.structured_lookup,
                 decomp,
