@@ -607,6 +607,24 @@ def _agentic_gap_analysis(
     return clean[:max_followups], str(parsed.get("reason", "")), requested, call
 
 
+def _hallucinated_section_ids(citations: list[dict] | None) -> list[str]:
+    """Dotted section ids the answer cited that did NOT resolve to any
+    retrieved chunk. These are exactly the sections a targeted fetch can pull
+    to ground the next regeneration — the model claimed facts from them, so
+    leaving them unfetched leaves the answer unverifiable. Only id-like cites
+    are returned (figure/title misses aren't fetchable by section id)."""
+    out: list[str] = []
+    for c in citations or []:
+        if not c.get("hallucinated"):
+            continue
+        sid = str(c.get("section_id") or "").strip()
+        if sid in out:
+            continue
+        if re.fullmatch(r"\d+(?:\.\w+)+|[A-Z]\.\w+(?:\.\w+)*", sid):
+            out.append(sid)
+    return out[:8]
+
+
 def _resolve_requested_resources(
     requested: dict[str, list[str]],
     *,
@@ -878,7 +896,16 @@ def _run_stage5_and_finalize(
             # re-running only risks drift + cost. Skips the gap-analysis call
             # entirely. Falls through when there's no verdict (refine fast-path
             # or the model didn't emit one).
-            if verdict is not None and verdict.get("answered"):
+            # Exception: an "answered" verdict doesn't excuse citations to
+            # sections that were never retrieved — those claims are
+            # unverifiable, so keep iterating (the targeted fetch below pulls
+            # the cited sections; the stall detector bounds us if they don't
+            # exist in the corpus).
+            unfetched_cites = (
+                _hallucinated_section_ids(citations)
+                if config.agentic_targeted_fetch else []
+            )
+            if verdict is not None and verdict.get("answered") and not unfetched_cites:
                 converged = True
                 trace.append(
                     PipelineStage(
@@ -907,6 +934,11 @@ def _run_stage5_and_finalize(
             targeted_requested = (
                 requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
             )
+            # Sections the answer cited but we never retrieved are gaps by
+            # definition — fetch them even if the gap-analyser didn't ask.
+            for sid in unfetched_cites:
+                if sid not in targeted_requested["sections"]:
+                    targeted_requested["sections"].append(sid)
             gap_has_work = bool(followups) or any(targeted_requested.values())
             trace.append(
                 PipelineStage(

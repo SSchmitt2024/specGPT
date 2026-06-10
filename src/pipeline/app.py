@@ -2927,6 +2927,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     "  classDef stage_followup fill:#161a3a,color:#c7d2fe,stroke:#4f46e5,stroke-width:1px",
                     "  classDef stage_agen     fill:#c7d2fe,color:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,rx:6,ry:6",
                     "  classDef stage_tfetch   fill:#0a221f,color:#99f6e4,stroke:#0d9488,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_stop      fill:#241f0a,color:#fde68a,stroke:#ca8a04,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5",
+                    "  classDef stage_converged fill:#0f2418,color:#86efac,stroke:#22c55e,stroke-width:1px,rx:5,ry:5",
                 ];
             }
             return [
@@ -2948,6 +2950,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 "  classDef stage_followup fill:#eef2ff,color:#3730a3,stroke:#c7d2fe,stroke-width:1px",
                 "  classDef stage_agen     fill:#312e81,color:#fff,stroke:#312e81,stroke-width:1.5px,rx:6,ry:6",
                 "  classDef stage_tfetch   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_stop      fill:#fefce8,color:#854d0e,stroke:#ca8a04,stroke-width:1px,stroke-dasharray:4 3,rx:5,ry:5",
+                "  classDef stage_converged fill:#f0fdf4,color:#166534,stroke:#22c55e,stroke-width:1px,rx:5,ry:5",
             ];
         }
 
@@ -2976,33 +2980,44 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             // `.` when it's mid-name. "$1" captures either "." or "".
             const stripIter = stage => stage.replace(/\\.iter(\\d+)(\\.|$)/, "$2");
 
+            // Which page a stage belongs on. Usually its own iteration
+            // number, but the convergence verdict is emitted with the
+            // *skipped* iteration's suffix (the loop checked it at the top
+            // of iterN and stopped before doing anything), so it belongs on
+            // the previous page - the pass whose regenerate produced that
+            // verdict. Without this it becomes the sole stage of a final
+            // page that renders as an empty chart.
+            const effIter = s => {
+                const m = s.stage.match(ITER_RE);
+                if (!m) return null;
+                const n = parseInt(m[1], 10);
+                return /^agentic\\.verdict_converged\\./.test(s.stage)
+                    ? Math.max(0, n - 1) : n;
+            };
+
             let maxIter = -1;
             for (const s of trace) {
-                const m = s.stage.match(ITER_RE);
-                if (m) maxIter = Math.max(maxIter, parseInt(m[1], 10));
+                const n = effIter(s);
+                if (n !== null) maxIter = Math.max(maxIter, n);
             }
             if (maxIter < 0) return null;
 
             const result = [];
             for (let i = 0; i <= maxIter; i++) {
-                if (i === 0) {
-                    // Pass 1: full base pipeline + iter0 agentic stages.
-                    result.push(trace.filter(s => {
-                        const m = s.stage.match(ITER_RE);
-                        if (!m) return true; // base stage
-                        return parseInt(m[1], 10) === 0;
-                    }).map(s => ({...s, stage: stripIter(s.stage)})));
-                } else {
-                    // Pass 2+: only this iteration's agentic stages. The
-                    // base pipeline didn't re-run - the chart starts from
-                    // what gap analysis requested and shows the follow-up
-                    // sub-pipeline (decompose → hybrid search → rerank →
-                    // regenerate).
-                    result.push(trace.filter(s => {
-                        const m = s.stage.match(ITER_RE);
-                        return m && parseInt(m[1], 10) === i;
-                    }).map(s => ({...s, stage: stripIter(s.stage)})));
-                }
+                // Page 1 carries the full base pipeline + iter0 agentic
+                // stages. Pages 2+ carry only that iteration's agentic
+                // stages (the base pipeline didn't re-run). Suffix-less
+                // stages are base-pipeline stages, except the terminal
+                // cap-reached marker, which describes the END of the loop
+                // and so belongs on the last page.
+                result.push(trace.filter(s => {
+                    const n = effIter(s);
+                    if (n === null) {
+                        return s.stage === "agentic.cap_reached"
+                            ? i === maxIter : i === 0;
+                    }
+                    return n === i;
+                }).map(s => ({...s, stage: stripIter(s.stage)})));
             }
             return result;
         }
@@ -3176,8 +3191,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             // In refine mode there's no GEN node, so the final-answer arrow
             // falls back to RESUME until the agentic regen succeeds and
             // promotes itself to GEN2. For agentic-only charts (recursive
-            // pass 2+) the answer node is just GEN2 (nothing upstream).
-            let agAnswerNode = gen ? "GEN" : (refineSeed ? "RESUME" : "GEN2");
+            // pass 2+) start from Q - the only node guaranteed to exist -
+            // and promote to GEN2 only once that node is actually declared.
+            // (A stalled pass has no regenerate, so a bare "GEN2" here would
+            // make Mermaid auto-create an unstyled box literally labelled
+            // GEN2.)
+            let agAnswerNode = gen ? "GEN" : (refineSeed ? "RESUME" : "Q");
             if (gap) {
                 const needs = gap.output && gap.output.needs_followup;
                 const reason = _vizText((gap.output && gap.output.reason) || "", 60);
@@ -3302,10 +3321,57 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                             : _label("Regenerate", a2.toLocaleString() + " chars · " + c2 + " citation" + (c2===1?"":"s") + " · Opus", ag_gen);
                         L.push(`  GEN2["${label}"]:::stage_agen`);
                         if (ag_rr) L.push("  RR2 --> GEN2");
-                        if (!errType) agAnswerNode = "GEN2";
+                        // On an errored regenerate the prior answer is kept,
+                        // so the upstream node (GEN/RESUME) stays the answer
+                        // source - unless this is an agentic-only page where
+                        // GEN2 is the only sensible terminus.
+                        if (!errType || (!gen && !refineSeed)) agAnswerNode = "GEN2";
                         nodeMap["GEN2"] = ag_gen;
                     }
                 }
+            }
+
+            // Non-agentic advisory gap hint (auto_gap_check): rendered as a
+            // side note off the generated answer - it never changes the
+            // answer flow, it just reports whether a follow-up would help.
+            const hint = stages.gap_hint;
+            if (hint && gen) {
+                const hNeeds = hint.output && hint.output.needs_followup;
+                const hSub = hNeeds
+                    ? "needs follow-up: " + _vizText((hint.output && hint.output.reason) || "", 60)
+                    : "answer covers the question";
+                L.push(`  HINT{"${_label("Gap hint", hSub, hint)}"}:::stage_gap`);
+                L.push("  GEN --> HINT");
+                nodeMap["HINT"] = hint;
+            }
+
+            // ─── Terminal markers from the recursive loop ─────────────────
+            // Stall guard: the reranked context matched the previous pass
+            // byte-for-byte, so regenerate was skipped and the loop stopped.
+            const stall = stages["agentic.stalled"];
+            if (stall) {
+                L.push(`  STALL[["${_label("Stopped: stalled", "context unchanged · kept previous answer", null)}"]]:::stage_stop`);
+                L.push(`  ${ag_rr ? "RR2" : agAnswerNode} --> STALL`);
+                nodeMap["STALL"] = stall;
+                agAnswerNode = "STALL";
+            }
+            // Convergence verdict: the generator's self-assessment marked
+            // the answer complete, ending the loop.
+            const vc = stages["agentic.verdict_converged"];
+            if (vc) {
+                L.push(`  VC[["${_label("Converged", "model judged the answer complete", null)}"]]:::stage_converged`);
+                L.push(`  ${agAnswerNode} --> VC`);
+                nodeMap["VC"] = vc;
+                agAnswerNode = "VC";
+            }
+            // Iteration cap: the loop ran out of passes before converging.
+            const cap = stages["agentic.cap_reached"];
+            if (cap) {
+                const capIters = (cap.output && cap.output.iterations_run) || 0;
+                L.push(`  CAP[["${_label("Iteration cap reached", capIters + " pass" + (capIters === 1 ? "" : "es") + " · stopped before converging", null)}"]]:::stage_stop`);
+                L.push(`  ${agAnswerNode} --> CAP`);
+                nodeMap["CAP"] = cap;
+                agAnswerNode = "CAP";
             }
 
             L.push('  ANS(["<b>Final answer</b>"]):::output');
@@ -3432,8 +3498,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 return;
             }
 
+            // Use the split pages even when there's only one: its stage
+            // names have the `.iterN` suffixes stripped, which the builder
+            // requires. Rendering the raw trace would silently drop every
+            // agentic stage of a single-iteration recursive run.
             const iters = splitTraceByIteration(trace);
-            if (iters && iters.length > 1) {
+            if (iters) {
                 for (const sub of iters) {
                     _vizPages.push(buildMermaidFromTrace(sub, _vizQuery));
                 }
@@ -4265,6 +4335,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             "agentic.rerank":               {t: "Rerank expanded pool",          s: "Rescore everything collected so far",                      g: "agentic"},
             "agentic.regenerate":           {t: "Regenerate answer",             s: "Synthesize the final answer with a larger context",        g: "agentic"},
             "agentic.cap_reached":          {t: "Iteration cap reached",         s: "Agentic loop stopped at its max-iterations setting",       g: "agentic"},
+            "agentic.verdict_converged":    {t: "Converged",                     s: "Generator self-assessment marked the answer complete",     g: "agentic"},
+            "agentic.stalled":              {t: "Stalled",                       s: "Reranked context unchanged from the previous pass; stopped early", g: "agentic"},
         };
 
         function formatStageDisplay(name) {
@@ -4569,17 +4641,26 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
            that the backend actually returned, so stray "[...]" is left alone.
            Regex-free to avoid backslash/unicode escaping inside this template. */
         function linkifyCitations(root, citations, figures) {
-            if (!root || !citations || !citations.length) return;
-            var idset = {};
+            // Figure-only answers arrive with citations=[] but a populated
+            // figures payload - still linkify those brackets, so don't bail
+            // unless BOTH are empty.
+            if (!root) return;
+            if (!((citations && citations.length) || (figures && figures.length))) return;
             var citeMap = {};
-            citations.forEach(function (c) {
+            var aliasMap = {};  // text the model wrote -> resolved section id
+            (citations || []).forEach(function (c) {
                 var id = String(c.section_id || "");
                 // Only resolved citations become clickable chips. Hallucinated
                 // ones (referenced but not in retrieved context) stay as plain
                 // text so they don't masquerade as a verified, linkable source.
                 if (id && !c.hallucinated) {
-                    idset[id] = 1;
                     citeMap[id] = c;
+                    aliasMap[id] = id;
+                    // The backend resolves near-miss cites ("5.3") to the
+                    // in-context section ("5.3.2.1") and reports the original
+                    // as cited_as - index it so the inline text the user
+                    // actually sees gets chipped and tied to this source.
+                    if (c.cited_as) aliasMap[String(c.cited_as)] = id;
                 }
             });
             // Figures the model may cite inside a bracket ("[Figure 328]" or
@@ -4639,7 +4720,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         var tok = cleanTok(rawToks[p]).replace(/^[\\s,]+/, "").replace(/[\\s,]+$/, "");
                         if (!tok) continue;        // empty (e.g. stray separator)
                         any = true;
-                        if (idset[tok]) { items.push({ sec: tok }); continue; }
+                        if (aliasMap[tok]) { items.push({ sec: aliasMap[tok], label: tok }); continue; }
                         var fn = figTokNum(tok);
                         if (fn && figMap[fn]) { items.push({ fig: fn }); continue; }
                         ok = false; break;
@@ -4649,7 +4730,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     // whole body as one id.
                     if (!ok || !any) {
                         var whole = normWhole(inner);
-                        if (whole && idset[whole]) { items = [{ sec: whole }]; ok = true; }
+                        if (whole && aliasMap[whole]) { items = [{ sec: aliasMap[whole], label: whole }]; ok = true; }
                         else { ok = false; }
                     }
                     if (ok && items.length) {
@@ -4665,7 +4746,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                             } else {
                                 span.className = "cite-chip mono";
                                 span.setAttribute("data-sec", it.sec);
-                                span.textContent = it.sec;
+                                // Show what the answer wrote (the alias) while
+                                // linking/highlighting via the resolved id.
+                                span.textContent = it.label || it.sec;
                             }
                             frag.appendChild(span);
                         });
@@ -4699,11 +4782,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 var pos = 0, m, changed = false;
                 while ((m = bareRe.exec(text)) !== null) {
                     var tok = m[0];
-                    if (!idset[tok]) continue;
+                    var rid = aliasMap[tok];
+                    if (!rid) continue;
                     if (m.index > pos) frag.appendChild(document.createTextNode(text.slice(pos, m.index)));
                     var span = document.createElement("span");
                     span.className = "cite-chip mono";
-                    span.setAttribute("data-sec", tok);
+                    span.setAttribute("data-sec", rid);
                     span.setAttribute("tabindex", "0");
                     span.textContent = tok;
                     frag.appendChild(span);
@@ -5349,8 +5433,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 host.innerHTML = '<div class="viz-empty">Mermaid failed to load (CDN blocked?). The stage list above still has every step.</div>';
                 return;
             }
+            // Single split page still needs its `.iterN` suffixes stripped
+            // (see renderPipelineViz) - only fall back to the raw trace when
+            // there are no iteration suffixes at all.
             var iters = splitTraceByIteration(trace);
-            if (iters && iters.length > 1) {
+            if (iters) {
                 iters.forEach(function (sub) { _devFlow.pages.push(buildMermaidFromTrace(sub, query || "")); });
             } else {
                 _devFlow.pages.push(buildMermaidFromTrace(trace, query || ""));

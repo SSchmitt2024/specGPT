@@ -203,6 +203,60 @@ def test_extract_citations_comma_separated_ids_still_split():
     assert all(c["hallucinated"] is False for c in cits)
 
 
+def test_extract_citations_salvages_id_from_prose_bracket():
+    """Flagged-answer bug: the model wrote prose inside the bracket
+    ("[§5.2.12.1 is not in context, but ...]") and the whole sentence became
+    the sidebar 'citation'. The parser must salvage just the leading id."""
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "[§5.2.12.1 is not in context, but the log page identity is defined "
+        "in the support requirements table below]",
+        [{"section_id": "2.4.1", "section_title": "X", "content_type": "prose"}],
+    )
+    assert len(cits) == 1, cits
+    assert cits[0]["section_id"] == "5.2.12.1"
+    assert cits[0]["hallucinated"] is True
+
+
+def test_extract_citations_drops_long_prose_bracket_without_id():
+    """A §-bracket holding a long sentence with no leading section id is prose,
+    not a citation - it must not reach the sidebar at all."""
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "[§this detail is not present in the provided context so no precise "
+        "definition or table can be given for the requested field here]",
+        [{"section_id": "2.4.1", "section_title": "X", "content_type": "prose"}],
+    )
+    assert cits == [], cits
+
+
+def test_extract_citations_records_cited_as_on_near_miss_resolution():
+    """When 'section 5.3' in prose resolves to the in-context descendant
+    5.3.2.1, the citation must carry cited_as='5.3' so the UI can tie the
+    inline text the user sees to the sidebar source."""
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "That requirement applies only in contexts defined in section 5.3, "
+        "which is not fully detailed here.",
+        [{"section_id": "5.3.2.1", "section_title": "PI and Write Commands",
+          "content_type": "prose", "pdf_pages": [139]}],
+    )
+    assert len(cits) == 1, cits
+    assert cits[0]["section_id"] == "5.3.2.1"
+    assert cits[0]["cited_as"] == "5.3"
+    assert cits[0]["hallucinated"] is False
+
+
+def test_extract_citations_exact_match_has_no_cited_as():
+    from src.pipeline.generator import _extract_citations
+    cits = _extract_citations(
+        "Defined in [§5.2.1].",
+        [{"section_id": "5.2.1", "section_title": "X", "content_type": "prose"}],
+    )
+    assert len(cits) == 1
+    assert "cited_as" not in cits[0]
+
+
 def test_extract_citations_title_match_is_case_and_space_insensitive():
     from src.pipeline.generator import _extract_citations
     ctx = [{"section_id": "5.2", "section_title": "Get Log Page",
@@ -1073,3 +1127,19 @@ if __name__ == "__main__":
 
     print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
     sys.exit(0 if not failures else 1)
+
+
+def test_hallucinated_section_ids_returns_only_fetchable_ids():
+    """Only id-like hallucinated cites are fetchable by section; figure/title
+    misses and resolved citations must be excluded (and order preserved)."""
+    from src.pipeline.orchestrator import _hallucinated_section_ids
+    cits = [
+        {"section_id": "8.1.6.3.2", "hallucinated": True},
+        {"section_id": "8.1.6.3.1.1", "hallucinated": True},
+        {"section_id": "8.1.6.2", "hallucinated": False},      # resolved
+        {"section_id": "Some Title Text", "hallucinated": True},  # not an id
+        {"section_id": "A.2.1", "hallucinated": True},          # appendix ok
+        {"section_id": "8.1.6.3.2", "hallucinated": True},      # dup
+    ]
+    assert _hallucinated_section_ids(cits) == ["8.1.6.3.2", "8.1.6.3.1.1", "A.2.1"]
+    assert _hallucinated_section_ids(None) == []

@@ -476,8 +476,20 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
                 if len(sub) > 1 and all(re.fullmatch(_ID, s) for s in sub):
                     for s in sub:
                         ordered_ids_with_pos.append((bm.start(), s))
-                else:
+                    continue
+                # The model sometimes writes prose inside the bracket
+                # ("[§5.2.12.1 is not in context, but the log page ...]").
+                # Taking the token verbatim would surface that whole sentence
+                # in the sidebar as a giant bogus citation. Salvage the
+                # leading section id when there is one; otherwise keep the
+                # token only if it's short enough to plausibly be an id or
+                # section title.
+                lead = re.match(r"(" + _BID + r")\s+\S", tok)
+                if lead:
+                    ordered_ids_with_pos.append((bm.start(), lead.group(1)))
+                elif len(tok) <= 80:
                     ordered_ids_with_pos.append((bm.start(), tok))
+                # else: prose masquerading as a tag — not a citation.
         else:
             for sid in re.findall(_BID, bm.group(0)):
                 ordered_ids_with_pos.append((bm.start(), sid.rstrip(".")))
@@ -504,7 +516,7 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
         seen_sections.add(key)
 
         if chunk is not None:
-            citations.append({
+            cite = {
                 "section_id": resolved_id,
                 "section_title": chunk.get("section_title", ""),
                 "content_type": chunk.get("content_type", "prose"),
@@ -515,7 +527,13 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
                 "spec_document": chunk.get("spec_document"),
                 "pdf_pages": chunk.get("pdf_pages") or [],
                 "hallucinated": False,
-            })
+            }
+            if section_id != resolved_id:
+                # What the answer actually wrote (e.g. "5.3" resolved to the
+                # in-context "5.3.2.1"), so the UI can linkify the inline text
+                # and the user can see why this source is in the sidebar.
+                cite["cited_as"] = section_id
+            citations.append(cite)
         else:
             citations.append({
                 "section_id": section_id,
