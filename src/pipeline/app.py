@@ -1959,7 +1959,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         var FALLBACK = {
                             fast:     { label: "Fast",     agentic: false, config: { vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, final_rerank_topk: 5, auto_gap_check: false } },
                             balanced: { label: "Balanced", agentic: false, config: {} },
-                            thorough: { label: "Thorough", agentic: true,  config: { vector_topk: 14, tsvector_topk: 14, bm25_topk: 14, final_rerank_topk: 10, agentic_recursive: true, agentic_targeted_fetch: true, agentic_max_iterations: 6 } }
+                            thorough: { label: "Thorough", agentic: true,  config: { vector_topk: 14, tsvector_topk: 14, bm25_topk: 14, final_rerank_topk: 10, agentic_recursive: true, agentic_targeted_fetch: true, agentic_max_iterations: 6, llm_model: "claude-sonnet-4-6", agentic_model: "claude-sonnet-4-6" } }
                         };
                         var PRESETS = FALLBACK, DEFAULT = "balanced";
                         function setInput(key, val) {
