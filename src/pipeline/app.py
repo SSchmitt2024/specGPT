@@ -2432,6 +2432,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (!selectEl) return;
             const byProvider = {};
             for (const m of MODEL_CATALOG) {
+                if (m.provider !== "Claude (Anthropic)") continue;
                 (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
             }
             // Stable provider order matching the catalog declaration.
@@ -2671,25 +2672,33 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         });
 
         // ─── Cost estimator ───────────────────────────────────────────────
-        // Rough, deliberately optimistic-side estimate so the user sees the
-        // approximate cost of the *next* query before running it. Updates
-        // live on every config change. Assumes the LLM call dominates cost;
-        // embedding + reranker + structured lookup are essentially free.
+        // Typical-case estimate of the *next* query, calibrated against real
+        // per-stage token counts in qa_log. Updates live on every config
+        // change. A worst-case figure (all iterations, max output) is shown
+        // alongside in the breakdown but the headline number is the typical
+        // case, since most agentic queries converge with 0-2 refinement
+        // passes and never come close to the configured maximums.
         //
-        // Token-budget assumptions (calibrated against typical NVMe queries):
-        //   • System prompt:    ~900 tokens (load-bearing instructions)
-        //   • User query:       ~60 tokens
-        //   • Avg chunk:        ~350 tokens (median observed; was 450 which over-estimated)
-        //   • Gap-analysis IO:  ~2200 in / ~400 out
-        //   • Targeted-fetch:   ~1200 in / ~250 out
-        // Numbers are coarse but consistent - the goal is "is this $0.01 or
-        // $0.50?", not three-decimal precision.
+        // Calibration notes (qa_log, n=48 queries):
+        //   • Support calls (query processor, gap analysis, follow-up
+        //     decomposition) always run on the cheap utility model
+        //     (src/llm/client DEFAULT_MODEL), not the selected models.
+        //   • Targeted fetch is a deterministic DB lookup, no LLM call.
+        //   • Median agentic query does 0 regeneration passes (verdict says
+        //     complete on the first try); mean is ~1.8. We bill 2 as typical.
+        //   • Real completion lengths sit far below the configured maximums:
+        //     ~400 tok for generation, ~330 tok per agentic regeneration.
         const COST_ASSUMPTIONS = {
-            sys_tokens: 900,
-            query_tokens: 60,
-            avg_chunk_tokens: 350,       // was 450 — median observed chunk size
-            gap_in: 2200, gap_out: 400,
-            tfetch_in: 1200, tfetch_out: 250,
+            support_price: {in: 0.15, out: 0.60}, // gpt-4o-mini utility model
+            qp_in: 550,     qp_out: 70,           // query processor
+            decomp_in: 550, decomp_out: 70,       // per follow-up decomposition
+            decomp_calls: 2,                      // avg follow-ups decomposed
+            gap_in: 1000,   gap_out: 130,         // gap-analysis verdict
+            base_prompt: 2200,                    // system prompt + query + scaffolding
+            avg_chunk_tokens: 450,                // effective per-chunk prompt cost
+            gen_out: 400,                         // typical generation output
+            regen_out: 330,                       // typical agentic regen output
+            typical_iters: 2,                     // refinement passes billed as typical
             embedding_price_per_1m: 0.02,
         };
 
@@ -2739,81 +2748,86 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const A = COST_ASSUMPTIONS;
             const regPrice = _modelPrice(cfg.llm_model,     {in: 3,  out: 15});
             const agPrice  = _modelPrice(cfg.agentic_model, {in: 15, out: 75});
+            const supPrice = A.support_price;
             const rows = [];
+            let worstExtra = 0; // worst-case dollars beyond the typical rows
 
-            // Embedding the query.
-            const embIn = cfg.query_tokens || A.query_tokens;
-            const embCost = (embIn / 1e6) * A.embedding_price_per_1m;
+            // Embedding the query (negligible, shown for completeness).
+            const embCost = (A.qp_in / 1e6) * A.embedding_price_per_1m;
             rows.push({
                 name: "Query embedding",
-                sub: `Voyage · ~${embIn} tok`,
+                sub: `Voyage · ~${A.qp_in} tok`,
                 value: embCost,
             });
 
+            // Query processor (classification + decomposition, utility model).
+            const qpCost = _llmCallCost(A.qp_in, A.qp_out, supPrice);
+            rows.push({
+                name: "Query processor",
+                sub: `utility model · ~${A.qp_in} in / ~${A.qp_out} out`,
+                value: qpCost,
+            });
+
             // First-pass generation (always runs).
-            const normalCtxBudget = 4000; // matches PipelineConfig.llm_max_context_tokens default
-            const normalCtxTok = Math.min(cfg.final_rerank_topk * A.avg_chunk_tokens, normalCtxBudget);
-            const normalIn  = A.sys_tokens + A.query_tokens + normalCtxTok;
-            const normalOut = 500; // typical output; max is llm_max_output_tokens (1024)
-            const normalCost = _llmCallCost(normalIn, normalOut, regPrice);
+            const normalIn  = A.base_prompt + cfg.final_rerank_topk * A.avg_chunk_tokens;
+            const normalCost = _llmCallCost(normalIn, A.gen_out, regPrice);
             rows.push({
                 name: "Generate (regular)",
-                sub: `${cfg.llm_model} · ${cfg.final_rerank_topk} chunks → ~${normalIn.toLocaleString()} in / ~${normalOut} out`,
+                sub: `${cfg.llm_model} · ${cfg.final_rerank_topk} chunks → ~${normalIn.toLocaleString()} in / ~${A.gen_out} out`,
                 value: normalCost,
             });
 
-            // Optional auto-gap-check (regular mode only - agentic loop has its own).
+            // Optional auto-gap-check (regular mode only - agentic has its own).
             if (cfg.auto_gap_check && !cfg.agentic) {
-                const gapCost = _llmCallCost(A.gap_in, A.gap_out, regPrice);
+                const gapCost = _llmCallCost(A.gap_in, A.gap_out, supPrice);
                 rows.push({
                     name: "Auto gap check",
-                    sub: `~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
+                    sub: `utility model · ~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
                     value: gapCost,
                 });
             }
 
-            // Agentic loop: gap-analysis + optional targeted-fetch + regenerate
-            // each iteration. Recursive multiplies by max_iterations (worst case).
+            // Agentic loop. Bill the typical number of refinement passes,
+            // not the configured maximum: most queries converge immediately.
+            // Targeted fetch is a free DB lookup so it gets no row.
             if (cfg.agentic) {
-                const iters = cfg.agentic_recursive ? Math.max(1, cfg.agentic_max_iterations) : 1;
-                const agCtxTok = Math.min(cfg.agentic_rerank_topk * A.avg_chunk_tokens, cfg.agentic_max_context_tokens);
-                const agIn  = A.sys_tokens + A.query_tokens + agCtxTok;
-                const agOut = cfg.agentic_max_output_tokens;
+                const maxIters = cfg.agentic_recursive ? Math.max(1, cfg.agentic_max_iterations) : 1;
+                const iters = Math.min(A.typical_iters, maxIters);
+                const agIn = A.base_prompt + Math.min(
+                    cfg.agentic_rerank_topk * A.avg_chunk_tokens,
+                    cfg.agentic_max_context_tokens
+                );
 
-                const gapCostOne   = _llmCallCost(A.gap_in, A.gap_out, regPrice);
-                const tfetchCostOne = cfg.agentic_targeted_fetch ? _llmCallCost(A.tfetch_in, A.tfetch_out, regPrice) : 0;
-                const regenCostOne = _llmCallCost(agIn, agOut, agPrice);
-                const perIter = gapCostOne + tfetchCostOne + regenCostOne;
-                const agTotal = perIter * iters;
+                const decompCalls = Math.min(A.decomp_calls, Math.max(1, cfg.agentic_max_followups));
+                const decompCost = _llmCallCost(A.decomp_in, A.decomp_out, supPrice) * decompCalls;
+                rows.push({
+                    name: "Follow-up decomposition",
+                    sub: `utility model · ~${decompCalls}× ~${A.decomp_in} in / ~${A.decomp_out} out`,
+                    value: decompCost,
+                });
 
+                const gapCostOne   = _llmCallCost(A.gap_in, A.gap_out, supPrice);
+                const regenCostOne = _llmCallCost(agIn, A.regen_out, agPrice);
                 rows.push({
                     name: "Agentic gap analysis",
-                    sub: `${iters}× ~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
+                    sub: `utility model · ~${iters}× ~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
                     value: gapCostOne * iters,
                 });
-                if (cfg.agentic_targeted_fetch) {
-                    rows.push({
-                        name: "Targeted-fetch parse",
-                        sub: `${iters}× ~${A.tfetch_in.toLocaleString()} in / ~${A.tfetch_out} out`,
-                        value: tfetchCostOne * iters,
-                    });
-                }
                 rows.push({
                     name: "Regenerate (agentic)",
-                    sub: `${cfg.agentic_model} · ${iters}× ${cfg.agentic_rerank_topk} chunks → ~${agIn.toLocaleString()} in / ~${agOut} out`,
+                    sub: `${cfg.agentic_model} · ~${iters}× ${cfg.agentic_rerank_topk} chunks → ~${agIn.toLocaleString()} in / ~${A.regen_out} out`,
                     value: regenCostOne * iters,
                 });
-                if (iters > 1) {
-                    rows.push({
-                        name: "Iterations",
-                        sub: `recursive · up to ${iters} passes`,
-                        value: null,
-                    });
-                }
+
+                // Worst case: every iteration runs and each regen emits the
+                // full configured output budget.
+                const regenWorstOne = _llmCallCost(agIn, cfg.agentic_max_output_tokens, agPrice);
+                worstExtra = (gapCostOne + regenWorstOne) * maxIters
+                           - (gapCostOne + regenCostOne) * iters;
             }
 
             const total = rows.reduce((s, r) => s + (typeof r.value === "number" ? r.value : 0), 0);
-            return { rows, total, cfg };
+            return { rows, total, worst: total + Math.max(0, worstExtra), cfg };
         }
 
         function renderCostEstimate() {
@@ -2836,6 +2850,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (cfg.agentic && cfg.agentic_recursive) ctxParts.push(`up to ${cfg.agentic_max_iterations}× iter`);
             ctxEl.textContent = " · " + ctxParts.join(" · ");
 
+            const worstRow = (est.worst - est.total) > 0.0005 ? `
+                <div class="cost-row">
+                    <div class="cost-row-name">Worst case<small>all ${est.cfg.agentic_max_iterations} iterations, max output</small></div>
+                    <div class="cost-row-value">${_fmtCostShort(est.worst)}</div>
+                </div>` : "";
             breakEl.innerHTML = est.rows.map(r => `
                 <div class="cost-row">
                     <div class="cost-row-name">${escapeHtml(r.name)}<small>${escapeHtml(r.sub)}</small></div>
@@ -2843,11 +2862,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 </div>
             `).join("") + `
                 <div class="cost-row cost-row-total">
-                    <div class="cost-row-name"><b>Total</b></div>
+                    <div class="cost-row-name"><b>Typical total</b></div>
                     <div class="cost-row-value">${_fmtCostShort(est.total)}</div>
                 </div>
+                ${worstRow}
                 <div class="cost-disclaimer">
-                    Typical-case estimate using median chunk size and average output length. Actual cost is usually within 20% of this figure. Worst-case (max output, large chunks) could be 2x higher. Embedding/rerank costs are negligible.
+                    Typical-case estimate calibrated from logged queries. Most agentic queries converge in 0-2 refinement passes, so the configured iteration and output maximums are rarely reached. Rerank and targeted-fetch lookups are free.
                 </div>
             `;
         }
@@ -5204,6 +5224,10 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (ov) ov.addEventListener("click", function (e) { if (e.target === ov) closeFlagModal(); });
             document.addEventListener("keydown", function (e) {
                 if (e.key === "Escape" && ov && !ov.hidden) closeFlagModal();
+                if (e.key === "Enter" && !e.shiftKey && ov && !ov.hidden) {
+                    e.preventDefault();
+                    submitFlag(document.getElementById("flag-reason").value.trim());
+                }
             });
         })();
 
