@@ -120,6 +120,42 @@ def test_extract_citations_flags_hallucinated_sections():
     assert cits[0]["hallucinated"] is True
 
 
+def test_extract_citations_section_plus_figure_in_one_bracket():
+    """The model sometimes combines a section and a figure ref in one bracket
+    ("Source: [§3.3.3.2.1, Figure 114]"). The § split treats the whole
+    comma-joined string as one token; it must recover the section id and drop
+    the figure ref (figures go via the figures payload) — NOT surface the
+    verbatim string as a hallucinated citation (the Figure-114 qa_log bug)."""
+    from src.pipeline.generator import _extract_citations
+    ctx = [{"section_id": "3.3.3.2.1",
+            "section_title": "Deallocated or Unwritten Logical Blocks",
+            "content_type": "prose"}]
+    cits = _extract_citations("Source: [§3.3.3.2.1, Figure 114]\n", ctx)
+    ids = [(c["section_id"], c["hallucinated"]) for c in cits]
+    assert ids == [("3.3.3.2.1", False)], ids
+
+    # Multiple sections mixed with a figure ref: all sections kept, in order.
+    ctx2 = ctx + [{"section_id": "5.3.2.2",
+                   "section_title": "Protection Information and Read Commands",
+                   "content_type": "prose"}]
+    cits = _extract_citations("Source: [§3.3.3.2.1, Figure 114, 5.3.2.2]\n", ctx2)
+    ids = [c["section_id"] for c in cits]
+    assert ids == ["3.3.3.2.1", "5.3.2.2"], ids
+
+
+def test_extract_citations_comma_title_in_bracket_still_resolves():
+    """Guard the original reason the § split avoids commas: a cited TITLE that
+    itself contains a comma must stay intact (its halves don't match _ID, so
+    the figure-drop sub-split must not tear it apart)."""
+    from src.pipeline.generator import _extract_citations
+    title = "Identify – Identify Namespace Data Structure, NVM Command Set"
+    ctx = [{"section_id": "", "section_title": title, "content_type": "table"}]
+    cits = _extract_citations(f"Source: [§{title}]\n", ctx)
+    assert len(cits) == 1
+    assert cits[0]["hallucinated"] is False
+    assert cits[0]["section_title"] == title
+
+
 def test_extract_citations_resolves_title_only_pages():
     """Spec 'pages' often carry no numeric section_id (e.g. "Persistent Event
     Log Page"); the context header renders them as "[i] § <title>" so the model

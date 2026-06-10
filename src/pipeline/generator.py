@@ -471,10 +471,17 @@ def _extract_citations(answer: str, context_chunks: list[dict]) -> list[dict]:
                 if _resolve(tok)[0] is not None:
                     ordered_ids_with_pos.append((bm.start(), tok))
                     continue
-                # Unresolved segment: maybe "§5.2, 5.3" put one § before a list.
+                # Unresolved segment: maybe "§5.2, 5.3" put one § before a
+                # list, or "§3.3.3.2.1, Figure 114" combined a section with a
+                # figure ref in one bracket. Drop figure segments (figures are
+                # surfaced via the separate figures payload, same as the
+                # standalone case above) and accept the remainder when every
+                # surviving segment is a clean section id. Titles containing
+                # commas don't match _ID, so they still fall through intact.
                 sub = [s.strip().rstrip(".") for s in tok.split(",") if s.strip()]
-                if len(sub) > 1 and all(re.fullmatch(_ID, s) for s in sub):
-                    for s in sub:
+                non_fig = [s for s in sub if not re.match(r"(?i)^fig(?:ure)?\b", s)]
+                if len(sub) > 1 and non_fig and all(re.fullmatch(_ID, s) for s in non_fig):
+                    for s in non_fig:
                         ordered_ids_with_pos.append((bm.start(), s))
                     continue
                 # The model sometimes writes prose inside the bracket
