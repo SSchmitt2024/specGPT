@@ -1872,10 +1872,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     <span class="picker-lbl">Spec</span>
                     <select id="global-spec-select"></select>
                 </label>
-                <label class="picker" title="Sets both the regular and agentic model at once. Shows Custom when they differ.">
-                    <span class="picker-lbl">Model</span>
-                    <select id="global-model-select"></select>
-                </label>
                 <form class="topbar-form" method="post" action="/logout">
                     <button type="submit" class="ghost-btn">Sign out</button>
                 </form>
@@ -2499,48 +2495,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (defaultId) selectEl.value = defaultId;
         }
 
-        // Render all three model selects from the same catalog.
+        // Render both model selects from the same catalog.
         populateModelSelect(document.getElementById("config-llm_model"),     "llm");
         populateModelSelect(document.getElementById("config-agentic_model"), "agentic");
-        populateModelSelect(document.getElementById("global-model-select"),  "llm");
-
-        // Top-right global picker: sets both LLMs at once. Fires a change
-        // event on each underlying select so all dependent UI (cost panel,
-        // model table) recomputes via existing listeners. When the two
-        // per-stage selects differ (the defaults do), the picker shows a
-        // "Custom (per stage)" placeholder instead of misreporting one of them.
-        (function _wireGlobalModelPicker() {
-            const globalEl = document.getElementById("global-model-select");
-            if (!globalEl) return;
-            const llmEl = document.getElementById("config-llm_model");
-            const agEl  = document.getElementById("config-agentic_model");
-            const mixed = document.createElement("option");
-            mixed.value = "__mixed__";
-            mixed.textContent = "Custom (per stage)";
-            mixed.disabled = true;
-            mixed.hidden = true;
-            globalEl.appendChild(mixed);
-            function syncFromPanels() {
-                if (!llmEl || !agEl) return;
-                globalEl.value = (llmEl.value === agEl.value) ? llmEl.value : "__mixed__";
-            }
-            // The agentic model-lock rewrites config-llm_model without firing
-            // change events, so it calls this hook directly.
-            window._syncGlobalModel = syncFromPanels;
-            globalEl.addEventListener("change", () => {
-                const id = globalEl.value;
-                if (id === "__mixed__") return;
-                for (const el of [llmEl, agEl]) {
-                    if (!el) continue;
-                    el.value = id;
-                    el.dispatchEvent(new Event("change", {bubbles: true}));
-                }
-            });
-            for (const el of [llmEl, agEl]) {
-                if (el) el.addEventListener("change", syncFromPanels);
-            }
-            syncFromPanels();
-        })();
 
         // ── Spec picker (Base vs PCIe Transport) ───────────────────────────
         // Scopes every query to one specification. Persisted in localStorage so
@@ -5891,9 +5848,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         }
                     }
                 });
-                if (typeof window._syncGlobalModel === "function") {
-                    try { window._syncGlobalModel(); } catch (e) {}
-                }
                 if (typeof renderCostEstimate === "function") {
                     try { renderCostEstimate(); } catch (e) {}
                 }

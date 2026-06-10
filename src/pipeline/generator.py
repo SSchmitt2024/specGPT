@@ -565,6 +565,17 @@ def _extract_text(response) -> str:
     return "".join(parts)
 
 
+# Newer Opus reasoning models reject the `temperature` sampling param with a
+# 400 ("`temperature` is deprecated for this model"). We omit it for these so
+# the whole request doesn't fail; the inline fallback in `_call_with_retry`
+# adapts if this list goes stale against a future model.
+_TEMPERATURE_DEPRECATED_PREFIXES = ("claude-opus-4-7", "claude-opus-4-8")
+
+
+def _model_supports_temperature(model: str) -> bool:
+    return not any(model.startswith(p) for p in _TEMPERATURE_DEPRECATED_PREFIXES)
+
+
 def _call_with_retry(
     client: Anthropic,
     *,
@@ -577,22 +588,40 @@ def _call_with_retry(
 ):
     """messages.create with exponential backoff on transient errors."""
     last_err: Exception | None = None
+    # Low temperature: this is a grounded spec-citation task, not creative
+    # writing. Keeps the model from improvising section numbers from memory
+    # (the main source of hallucinated cites) and makes answers consistent
+    # run-to-run. Newer models bake this in and forbid the param outright.
+    include_temperature = _model_supports_temperature(model)
     for attempt in range(max_retries):
         try:
-            return client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
-                timeout=timeout,
-                # Low temperature: this is a grounded spec-citation task, not
-                # creative writing. Keeps the model from improvising section
-                # numbers from memory (the main source of hallucinated cites)
-                # and makes answers/citations consistent run-to-run.
-                temperature=0.0,
-            )
-        except BadRequestError:
-            # 4xx that isn't transient — re-raise immediately.
+            kwargs: dict = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": messages,
+                "timeout": timeout,
+            }
+            if include_temperature:
+                kwargs["temperature"] = 0.0
+            return client.messages.create(**kwargs)
+        except BadRequestError as e:
+            # Adapt to models that deprecate `temperature` even if they're not
+            # in the prefix list above: drop it and retry once, in-place, so we
+            # don't consume the transient-retry budget.
+            if include_temperature and "temperature" in str(e).lower():
+                include_temperature = False
+                try:
+                    return client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        system=system,
+                        messages=messages,
+                        timeout=timeout,
+                    )
+                except BadRequestError:
+                    raise
+            # Any other 4xx that isn't transient — re-raise immediately.
             raise
         except (APITimeoutError, APIStatusError, APIError) as e:
             status = getattr(e, "status_code", None)

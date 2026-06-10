@@ -827,6 +827,47 @@ def test_generation_error_carries_cause_and_trace():
     assert err.retrieved_chunks == [{"id": "1"}]
 
 
+def test_model_supports_temperature_excludes_newer_opus():
+    from src.pipeline.generator import _model_supports_temperature
+    # Newer Opus reasoning models reject the `temperature` param (400).
+    assert _model_supports_temperature("claude-opus-4-7") is False
+    assert _model_supports_temperature("claude-opus-4-8") is False
+    # Sonnet/Haiku still accept it.
+    assert _model_supports_temperature("claude-sonnet-4-6") is True
+    assert _model_supports_temperature("claude-haiku-4-5-20251001") is True
+
+
+def test_call_with_retry_omits_temperature_for_deprecated_models():
+    from src.pipeline import generator
+
+    class _FakeClient:
+        def __init__(self):
+            self.messages = self
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()  # opaque stub; _call_with_retry doesn't inspect it
+
+    # Opus: temperature must NOT be sent, or the API 400s.
+    opus = _FakeClient()
+    generator._call_with_retry(
+        opus, model="claude-opus-4-7", system="sys",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=16, timeout=1.0, max_retries=1,
+    )
+    assert "temperature" not in opus.calls[0]
+
+    # Sonnet: temperature is still pinned to 0.0 for determinism.
+    sonnet = _FakeClient()
+    generator._call_with_retry(
+        sonnet, model="claude-sonnet-4-6", system="sys",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=16, timeout=1.0, max_retries=1,
+    )
+    assert sonnet.calls[0].get("temperature") == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Agentic targeted-fetch: requested-resources parsing
 
