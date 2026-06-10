@@ -1308,6 +1308,18 @@ def _run_stage5_and_finalize(
             )
             if ctx_sig == prev_ctx_sig:
                 stalled = True
+                # The kept answer is "incomplete" when it cites sections that
+                # were never retrieved or its own verdict says unanswered. A
+                # plain stall-break would hand the user an answer that defers
+                # to sources the loop tried and failed to fetch — instead, run
+                # ONE wrap-up generation over the same context with the
+                # final-answer instruction. The stall guard's "same input →
+                # same answer" premise doesn't apply: the prompt differs, so
+                # the model can commit to what the context supports rather
+                # than recommending unavailable sources.
+                answer_incomplete = bool(unfetched_cites) or (
+                    verdict is not None and not verdict.get("answered")
+                )
                 trace.append(
                     PipelineStage(
                         stage=f"agentic.stalled{suffix}",
@@ -1316,11 +1328,69 @@ def _run_stage5_and_finalize(
                                           "iteration; regenerate would reproduce the "
                                           "same answer",
                                 "context_unchanged": True,
+                                "answer_incomplete": answer_incomplete,
+                                "final_pass": answer_incomplete,
                                 "last_gap_reason": last_gap_reason,
                                 "context_size": len(reranked2)},
                         took_ms=0.0,
                     )
                 )
+                if answer_incomplete:
+                    start = time.time()
+                    try:
+                        answer2, citations2, used2, tokens2, _v = generator.generate(
+                            query, reranked2,
+                            model=config.agentic_model,
+                            max_context_tokens=config.agentic_max_context_tokens,
+                            max_tokens=config.agentic_max_output_tokens,
+                            context_is_final=True,
+                        )
+                        took_fp = time.time() - start
+                        if isinstance(tokens2, dict):
+                            llm_calls.append({
+                                "stage": f"agentic.final_regenerate{suffix}",
+                                "model": config.agentic_model,
+                                "prompt": int(tokens2.get("prompt", 0) or 0),
+                                "completion": int(tokens2.get("completion", 0) or 0),
+                                "stop_reason": tokens2.get("stop_reason"),
+                            })
+                            final_gen_call = {
+                                "model": config.agentic_model,
+                                "stop_reason": tokens2.get("stop_reason"),
+                            }
+                        trace.append(
+                            PipelineStage(
+                                stage=f"agentic.final_regenerate{suffix}",
+                                input={"chunk_count": len(reranked2),
+                                       "model": config.agentic_model,
+                                       "context_is_final": True,
+                                       "unfetched_cites": unfetched_cites,
+                                       "verdict": verdict},
+                                output={"answer_length": len(answer2),
+                                        "citation_count": len(citations2),
+                                        "tokens": tokens2},
+                                took_ms=took_fp * 1000,
+                            )
+                        )
+                        answer, citations, context_chunks, tokens_used = (
+                            answer2, citations2, used2, tokens2
+                        )
+                        deduplicated = expanded_pool
+                    except Exception as e:  # noqa: BLE001
+                        took_fp = time.time() - start
+                        logger.exception(
+                            "Agentic final regenerate failed after %.0fms: %s",
+                            took_fp * 1000, e)
+                        trace.append(
+                            PipelineStage(
+                                stage=f"agentic.final_regenerate{suffix}",
+                                input={"chunk_count": len(reranked2),
+                                       "model": config.agentic_model},
+                                output={"error_type": type(e).__name__,
+                                        "note": "kept prior answer"},
+                                took_ms=took_fp * 1000,
+                            )
+                        )
                 break
             prev_ctx_sig = ctx_sig
 

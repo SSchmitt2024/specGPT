@@ -4670,6 +4670,17 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 s.classList.toggle("hot", !!sec && s.getAttribute("data-sec") === sec);
             });
         }
+        /* Figure analog of setActiveSec: hovering a fig-chip (or a figure card
+           in the sidebar) highlights every chip/card for that figure, exactly
+           like section chips do. Matches on data-fig instead of data-sec. */
+        function setActiveFig(num) {
+            document.querySelectorAll(".fig-chip").forEach(function (c) {
+                c.classList.toggle("hot", !!num && c.getAttribute("data-fig") === num);
+            });
+            document.querySelectorAll(".src").forEach(function (s) {
+                s.classList.toggle("hot", !!num && s.getAttribute("data-fig") === num);
+            });
+        }
 
         /* ── citation preview popover ─────────────────────────────────────
            Clicking a section chip opens a small anchored popover showing the
@@ -5084,6 +5095,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             });
 
             root.querySelectorAll(".fig-chip").forEach(function (c) {
+                c.addEventListener("mouseenter", function () { setActiveFig(c.getAttribute("data-fig")); });
+                c.addEventListener("mouseleave", function () { setActiveFig(null); });
                 c.addEventListener("click", function () {
                     openFigurePdf(figMap[c.getAttribute("data-fig")]);
                 });
@@ -5128,8 +5141,14 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             box.classList.remove("hidden");
             list.querySelectorAll(".src").forEach(function (el, i) {
                 var s = sources[i];
-                el.addEventListener("mouseenter", function () { setActiveSec(el.getAttribute("data-sec")); });
-                el.addEventListener("mouseleave", function () { setActiveSec(null); });
+                el.addEventListener("mouseenter", function () {
+                    if (s.kind === "fig") setActiveFig(el.getAttribute("data-fig"));
+                    else setActiveSec(el.getAttribute("data-sec"));
+                });
+                el.addEventListener("mouseleave", function () {
+                    if (s.kind === "fig") setActiveFig(null);
+                    else setActiveSec(null);
+                });
                 el.addEventListener("click", function () {
                     if (s.kind === "fig") openFigurePdf(s.f);
                     else openCitationPdf(s.c);

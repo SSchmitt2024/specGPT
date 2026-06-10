@@ -400,6 +400,34 @@ def test_extract_text_concatenates_text_blocks_and_skips_tool_use():
     assert _extract_text(r) == "hello world"
 
 
+def test_generate_context_is_final_appends_final_pass_instruction(monkeypatch):
+    """The agentic loop's stall wrap-up calls generate(context_is_final=True);
+    that must inject FINAL_PASS_INSTRUCTION into the system prompt (and the
+    default path must NOT carry it), or the wrap-up pass degenerates into the
+    exact regenerate the stall guard proved pointless."""
+    from types import SimpleNamespace
+    from src.pipeline import generator
+
+    captured = {}
+
+    def fake_call(client, *, system, **kwargs):
+        captured["system"] = system
+        block = SimpleNamespace(type="text", text="answer text [§1.1]")
+        usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+        return SimpleNamespace(content=[block], stop_reason="end_turn", usage=usage)
+
+    monkeypatch.setattr(generator, "Anthropic", lambda: None)
+    monkeypatch.setattr(generator, "_call_with_retry", fake_call)
+    chunks = [{"id": "a", "text_raw": "hello", "content_type": "prose",
+               "section_id": "1.1", "section_title": "Intro"}]
+
+    generator.generate("q", chunks, context_is_final=True)
+    assert "FINAL ANSWER MODE" in captured["system"]
+
+    generator.generate("q", chunks)
+    assert "FINAL ANSWER MODE" not in captured["system"]
+
+
 # ---------------------------------------------------------------------------
 # bm25_index
 

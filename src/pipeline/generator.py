@@ -163,6 +163,22 @@ VERDICT_INSTRUCTION = (
 )
 
 
+# Appended to the system prompt for the agentic loop's wrap-up pass: the loop
+# has stopped fetching (stalled or out of iterations) while the current answer
+# still defers to sources it never saw. Same context, different instruction —
+# the model must commit to the best answer the context supports instead of
+# telling the user more sources are needed.
+FINAL_PASS_INSTRUCTION = (
+    "\n\nFINAL ANSWER MODE: Retrieval is finished; the context above is the "
+    "complete and final set of sources available for this question. Write the "
+    "best complete answer that context supports. Do NOT reference, defer to, "
+    "or recommend consulting sections or figures that are not present in the "
+    "context headers above, and do NOT say that more sources are needed or "
+    "would help. Where the context genuinely lacks a fact, state explicitly "
+    "what is missing (rule 5) and move on."
+)
+
+
 def _split_verdict(text: str) -> tuple[str, dict | None]:
     """Split a trailing ``@@VERDICT@@{...}`` sentinel off the answer.
 
@@ -884,6 +900,7 @@ def generate(
     timeout: float = DEFAULT_REQUEST_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     emit_verdict: bool = False,
+    context_is_final: bool = False,
 ) -> tuple[str, list[dict], list[dict], dict, dict | None]:
     """
     Generate an answer using Claude Sonnet from retrieved context.
@@ -899,6 +916,10 @@ def generate(
         max_tokens: maximum completion tokens.
         timeout: per-request timeout in seconds.
         max_retries: retry budget for transient (5xx, 429, timeout) failures.
+        context_is_final: appends FINAL_PASS_INSTRUCTION — tells the model no
+            further retrieval will happen, so it must answer from the given
+            context without deferring to unavailable sources. Used by the
+            agentic loop's wrap-up pass after a stall / iteration cap.
 
     Returns:
         ``(answer, citations, used_chunks, tokens_used, verdict)`` where ``answer``
@@ -940,6 +961,8 @@ def generate(
     # The user query goes in the user message, never inside the system prompt,
     # to keep injection surface inside the context fence.
     full_system_prompt = system_prompt.format(context=context_text)
+    if context_is_final:
+        full_system_prompt += FINAL_PASS_INSTRUCTION
     if emit_verdict:
         full_system_prompt += VERDICT_INSTRUCTION
 
