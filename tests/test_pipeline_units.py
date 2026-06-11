@@ -428,6 +428,38 @@ def test_generate_context_is_final_appends_final_pass_instruction(monkeypatch):
     assert "FINAL ANSWER MODE" not in captured["system"]
 
 
+def test_generate_synthesizes_not_answered_verdict_on_max_tokens(monkeypatch):
+    """A max_tokens cutoff eats the trailing @@VERDICT@@ line. The generator
+    must synthesize answered=false instead of returning verdict=None, or the
+    agentic loop treats the truncated answer as complete (no wrap-up pass,
+    silent convergence). A clean stop with no verdict stays None."""
+    from types import SimpleNamespace
+    from src.pipeline import generator
+
+    state = {"stop_reason": "max_tokens"}
+
+    def fake_call(client, *, system, **kwargs):
+        block = SimpleNamespace(type="text", text="truncated answer [§1.1]")
+        usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+        return SimpleNamespace(content=[block], stop_reason=state["stop_reason"],
+                               usage=usage)
+
+    monkeypatch.setattr(generator, "Anthropic", lambda: None)
+    monkeypatch.setattr(generator, "_call_with_retry", fake_call)
+    chunks = [{"id": "a", "text_raw": "hello", "content_type": "prose",
+               "section_id": "1.1", "section_title": "Intro"}]
+
+    _, _, _, _, verdict = generator.generate("q", chunks, emit_verdict=True)
+    assert verdict is not None
+    assert verdict["answered"] is False
+    assert verdict["truncated"] is True
+
+    # Clean stop without a verdict line: still None (model just didn't emit one).
+    state["stop_reason"] = "end_turn"
+    _, _, _, _, verdict = generator.generate("q", chunks, emit_verdict=True)
+    assert verdict is None
+
+
 # ---------------------------------------------------------------------------
 # bm25_index
 

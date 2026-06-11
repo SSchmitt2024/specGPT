@@ -611,8 +611,8 @@ PRESETS: dict[str, dict] = {
         "label": "Thorough",
         "agentic": True,
         "config": {
-            "agentic_model": "claude-opus-4-7",
-            "llm_model": "claude-opus-4-7",
+            "agentic_model": "claude-sonnet-4-6",
+            "llm_model": "claude-sonnet-4-6",
             "llm_max_output_tokens": 2048,
             "vector_topk": 8,
             "tsvector_topk": 8,

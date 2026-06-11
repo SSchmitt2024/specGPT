@@ -1024,6 +1024,17 @@ def generate(
     verdict: dict | None = None
     if emit_verdict:
         answer, verdict = _split_verdict(answer)
+        if verdict is None and tokens_used.get("stop_reason") == "max_tokens":
+            # The verdict trails the answer, so a max_tokens cutoff eats it —
+            # and an answer truncated mid-stream is by definition incomplete.
+            # Without this, the agentic loop sees verdict=None and treats the
+            # truncated answer as fine (no wrap-up pass, silent convergence).
+            verdict = {
+                "answered": False,
+                "context_has_answer": True,
+                "missing": "",
+                "truncated": True,
+            }
 
     # Step 5: Extract citations
     citations = _extract_citations(answer, used_chunks)

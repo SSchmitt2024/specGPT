@@ -1,6 +1,8 @@
 # specGPT Pipeline Failure Backlog
 # Source: qa_log (67 rows), flagged_answers (3), recent commits, PIPELINE_DESIGN_CHOICES.md
 # Diagnosed: 2026-06-11
+# STATUS: BUGs 1-4 fixed in PR #16 (fix/agentic-loop-convergence, merged 2026-06-11).
+# Remaining: see Secondary Observations.
 
 ## Summary
 
@@ -115,9 +117,11 @@ be treated as unresolvable rather than blocking convergence forever.
   it's not in the _PINNED set, which is fine for append-mode but means an expansion
   chunk in the pool can't survive the next rerank.
 
-- Verdict parse returned null once (flag 19 iter0, Opus). The @@VERDICT@@ block trails
+- [DONE] Verdict parse returned null once (flag 19 iter0, Opus). The @@VERDICT@@ block trails
   the answer, so a max_tokens truncation eats it; worth checking stop_reason when
-  verdict is null and the answer is long.
+  verdict is null and the answer is long. (Fixed: generate() now synthesizes an
+  answered=false verdict when emit_verdict + stop_reason=max_tokens + no verdict line,
+  so the agentic loop treats truncated answers as incomplete.)
 
 - qa_log id 86 is user error, not pipeline: an NVMe PKAS question asked with spec=pcie.
   A cross-spec "did you mean" hint would catch it, but it's not a pipeline failure.
