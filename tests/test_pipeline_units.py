@@ -856,6 +856,46 @@ def test_pin_structured_hits_preserves_structured_order():
     assert [c["chunk_id"] for c in out] == ["s1", "s2", "h1"]
 
 
+def test_pin_structured_hits_pins_agentic_fetches():
+    from src.pipeline.orchestrator import _pin_structured_hits
+    # Gap-requested figure/section fetches score poorly against the original
+    # prose query, but were fetched to fill a KNOWN gap — they must survive
+    # the budget cut. Fuzzy section fallbacks are speculative and must not.
+    pre = [
+        {"chunk_id": "h1", "method": "rrf"},
+        {"chunk_id": "agentic_fetch:base:fig632", "method": "agentic_fetch_figure"},
+        {"chunk_id": "8.1.6.3.1.1__c0", "method": "agentic_fetch_section"},
+        {"chunk_id": "fuzzy1", "method": "agentic_fetch_section_fuzzy"},
+    ]
+    ranked = [
+        {"chunk_id": "h1", "prior_method": "rrf", "rerank_score": 0.9},
+        {"chunk_id": "fuzzy1", "prior_method": "agentic_fetch_section_fuzzy",
+         "rerank_score": 0.5},
+        {"chunk_id": "agentic_fetch:base:fig632",
+         "prior_method": "agentic_fetch_figure", "rerank_score": 0.1},
+        {"chunk_id": "8.1.6.3.1.1__c0",
+         "prior_method": "agentic_fetch_section", "rerank_score": 0.05},
+    ]
+    out = _pin_structured_hits(ranked, pre, budget=3)
+    ids = [c["chunk_id"] for c in out]
+    # Both exact fetches pinned (pool order), then top semantic; fuzzy cut.
+    assert ids == ["agentic_fetch:base:fig632", "8.1.6.3.1.1__c0", "h1"]
+
+
+def test_pin_structured_hits_structured_ahead_of_agentic():
+    from src.pipeline.orchestrator import _pin_structured_hits
+    pre = [
+        {"chunk_id": "f1", "method": "agentic_fetch_figure"},
+        {"chunk_id": "s1", "method": "structured_lookup"},
+    ]
+    ranked = [
+        {"chunk_id": "f1", "prior_method": "agentic_fetch_figure", "rerank_score": 0.8},
+        {"chunk_id": "s1", "prior_method": "structured_lookup", "rerank_score": 0.2},
+    ]
+    out = _pin_structured_hits(ranked, pre, budget=5)
+    assert [c["chunk_id"] for c in out] == ["s1", "f1"]
+
+
 def test_pin_structured_hits_noop_without_structured():
     from src.pipeline.orchestrator import _pin_structured_hits
     pre = [{"chunk_id": "h1", "method": "rrf"}, {"chunk_id": "h2", "method": "rrf"}]
@@ -1249,6 +1289,79 @@ def test_resolve_requested_resources_all_mode_probes_each_corpus(monkeypatch):
     )
     assert sorted(c["spec"] for c in out) == ["base", "pcie"]
     assert len({c["id"] for c in out}) == 2  # spec-prefixed ids stay distinct
+
+
+def test_resolve_requested_resources_sections_use_direct_fetch(monkeypatch):
+    """Requested sections resolve via direct section_id lookup, tagged
+    agentic_fetch_section. The text-search fallback only fires when the
+    direct fetch finds nothing, and is tagged _fuzzy so it never gets
+    pinned past the reranker."""
+    from src.pipeline import orchestrator as orch
+
+    monkeypatch.setattr(orch.retriever, "load_tables_by_figure", lambda spec: {})
+    monkeypatch.setattr(orch.retriever, "load_field_index", lambda spec: {})
+
+    def fake_fetch(sid, top_k=3, spec=None):
+        if sid == "8.1.6.3.1.1":
+            return [{"id": "8.1.6.3.1.1__c0", "section_id": "8.1.6.3.1.1",
+                     "score": 1.0, "method": "section_fetch"}]
+        return []
+
+    monkeypatch.setattr(orch.search, "fetch_section_chunks", fake_fetch)
+    monkeypatch.setattr(
+        orch.search, "tsvector_search",
+        lambda q, top_k=3, filter=None: [
+            {"id": "cites_it__c0", "section_id": "9.9", "score": 0.1,
+             "method": "tsvector"}],
+    )
+
+    out = orch._resolve_requested_resources(
+        {"figures": [], "fields": [], "sections": ["8.1.6.3.1.1", "0.0.0"]},
+        spec="base",
+    )
+    by_id = {c["id"]: c for c in out}
+    assert by_id["8.1.6.3.1.1__c0"]["method"] == "agentic_fetch_section"
+    assert by_id["cites_it__c0"]["method"] == "agentic_fetch_section_fuzzy"
+
+
+def test_expand_referenced_figures_fetches_missing_only(monkeypatch):
+    """1-hop figure expansion pulls tables for figures the context cites but
+    doesn't contain: present figures are skipped, missing ones fetched
+    most-referenced-first under the cap, and results are tagged
+    figure_ref_expansion."""
+    from src.pipeline import orchestrator as orch
+
+    context = [
+        {"id": "8.1.6.2.2__c0", "figure_number": None,
+         "text_raw": "refer to Figure 630 and Figure 632; see Figure 285"},
+        {"id": "8.1.6.2__c2", "figure_number": None,
+         "text_raw": "the response frame (refer to Figure 630 and Figure 631)"},
+        {"id": "fig285__", "figure_number": "285", "text_raw": "AUS field table"},
+    ]
+
+    def fake_resolve(requested, *, enable_section_fallback=True, spec="base"):
+        assert requested["sections"] == [] and requested["fields"] == []
+        return [{"id": f"agentic_fetch:base:fig{f}", "figure_number": f,
+                 "method": "agentic_fetch_figure"} for f in requested["figures"]]
+
+    monkeypatch.setattr(orch, "_resolve_requested_resources", fake_resolve)
+    out = orch._expand_referenced_figures(context, spec="base", cap=2)
+    figs = [c["figure_number"] for c in out]
+    # 285 already present; 630 referenced by two chunks ranks first; cap=2
+    # keeps the lowest-numbered of the once-referenced (631 vs 632).
+    assert figs == ["630", "631"]
+    assert all(c["method"] == "figure_ref_expansion" for c in out)
+
+
+def test_expand_referenced_figures_noop_when_satisfied(monkeypatch):
+    from src.pipeline import orchestrator as orch
+    context = [{"id": "a", "figure_number": "630", "text_raw": "Figure 630 layout"}]
+    monkeypatch.setattr(
+        orch, "_resolve_requested_resources",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+    assert orch._expand_referenced_figures(context, spec="base", cap=6) == []
+    assert orch._expand_referenced_figures(context, spec="base", cap=0) == []
 
 
 def test_structured_lookup_all_specs_merges_and_stamps_spec(monkeypatch):

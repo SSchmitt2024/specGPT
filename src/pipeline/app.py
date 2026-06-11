@@ -4365,6 +4365,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             "hybrid_search.total":          {t: "Hybrid search (total)",         s: "End-to-end time across all retrieval branches",           g: "normal"},
             "result_dedup":                 {t: "Deduplicate combined pool",     s: "Merge structured + hybrid chunks, drop duplicates",        g: "normal"},
             "final_rerank":                 {t: "Rerank",                        s: "Score each chunk against the query (Voyage rerank-2-lite)", g: "normal"},
+            "figure_ref_expansion":         {t: "Pull referenced figures",       s: "Fetch data-structure tables the context cites but doesn't contain", g: "normal"},
+            "agentic.figure_ref_expansion": {t: "Pull referenced figures",       s: "Fetch data-structure tables the context cites but doesn't contain", g: "agentic"},
             "generation":                   {t: "Generate answer",               s: "Synthesize the answer with citations (Claude)",            g: "normal"},
             "agentic.gap_analysis":         {t: "Agentic gap analysis",          s: "Does the answer fully cover the question?",                g: "agentic"},
             "agentic.targeted_fetch":       {t: "Targeted fetch",                s: "Pull figures, fields, or sections the model named",        g: "agentic"},

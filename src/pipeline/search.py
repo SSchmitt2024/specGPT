@@ -290,6 +290,45 @@ def tsvector_search(
     return [_shape(r, r.get("rank", 0.0), "tsvector") for r in rows]
 
 
+def fetch_section_chunks(
+    section_id: str,
+    top_k: int = 3,
+    spec: str | None = None,
+) -> list[dict]:
+    """Direct lookup of chunks by section id (the section itself plus its
+    subsections), bypassing text search entirely.
+
+    A section's body text does not contain its own dotted id, so a tsvector
+    query like ``"8.1.6.3.1.1"`` matches chunks that merely *cite* the id and
+    misses the section itself. This fetch is the deterministic path for
+    "give me section X": exact id match or ``X.<child>`` descendants, in
+    document order.
+    """
+    sid = (section_id or "").strip().rstrip(".")
+    if not sid:
+        return []
+
+    cols = ("id,section_id,section_title,content_type,text_raw,pdf_pages,"
+            "figure_number,has_normative,spec,spec_document")
+    try:
+        q = (
+            supabase_client().table("spec_chunks")
+            .select(cols)
+            .or_(f"section_id.eq.{sid},section_id.like.{sid}.%")
+            .order("section_id")
+            .order("chunk_index")
+            .limit(top_k)
+        )
+        if spec:
+            q = q.eq("spec", spec)
+        resp = _retry(lambda: q.execute(), label="supabase.spec_chunks.section_fetch")
+    except Exception as e:  # noqa: BLE001
+        logger.error("fetch_section_chunks failed: %s", e)
+        return []
+
+    return [_shape(r, 1.0, "section_fetch") for r in (resp.data or [])]
+
+
 # ---------------------------------------------------------------------------
 # 3. True Okapi BM25 (client-side, via rank_bm25)
 #

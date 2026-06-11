@@ -7,7 +7,7 @@ The pipeline runs in two phases:
 - **Phase 1** turns the PDF into a structured corpus (sections, tables, fields, definitions) and adds a semantic layer (LLM-summarized cards + a relationship graph).
 - **Phase 2** chunks that corpus, embeds it, indexes it in Supabase, and (in progress) serves it through a small FastAPI backend to a React frontend.
 
-Every JSON artifact lives in `data/`. Every Python module lives in `src/`. The frontend lives in `frontend/`.
+Every JSON artifact lives in `data/` (per-corpus: root = base NVMe, plus `data/command/` and `data/pcie/`). Phase-1 parsers and the runtime live in `src/`; Phase-2 build scripts live in `scripts/`. There is **no separate `frontend/` directory** — the UI is HTML embedded in `src/pipeline/app.py` (`FRONTEND_HTML`).
 
 ---
 
@@ -118,7 +118,7 @@ flowchart LR
     prosej[(prose.json)]
     tabj[(tables.json)]
 
-    cardsj --> CH[pipeline/chunker.py]
+    cardsj --> CH[scripts/chunker.py]
     prosej --> CH
     CH    --> cpj[(chunks_prose.json)]
 
@@ -128,13 +128,13 @@ flowchart LR
 
     Voy([Voyage AI<br/>voyage-3-lite, 1024d])
 
-    cpj --> EM[pipeline/embedder.py]
+    cpj --> EM[scripts/embedder.py]
     ctj --> EM
     Voy -. embed batch .-> EM
     EM  --> cej[(chunks_embedded.json)]
 
     SB([Supabase<br/>spec_chunks<br/>pgvector + tsvector])
-    cej --> IX[pipeline/indexer.py]
+    cej --> IX[scripts/indexer.py]
     IX  --> SB
 
     classDef art fill:#0f1a2a,stroke:#5b8cc7,color:#cde,stroke-width:1px;
@@ -147,10 +147,10 @@ flowchart LR
 
 **What each module does:**
 
-- `pipeline/chunker.py` — flattens prose paragraphs into ~500-word overlapping chunks, prepends the section's card summary to every chunk so the embedding sees enough context, tracks which `pdf_pages` each chunk spans.
-- `pipeline/table_serializer.py` — renders each table to plain text (`Figure N — caption`, headers, rows joined by `|`), prepends the card summary, one chunk per table.
-- `pipeline/embedder.py` — batches all enriched chunks into Voyage AI (`voyage-3-lite`, 1024 dims, batch=128), enforces a per-run budget cap, writes vectors back onto each chunk record.
-- `pipeline/indexer.py` — upserts each chunk into Supabase `spec_chunks` (vector + raw text + metadata: section_id, content_type, pdf_pages, has_normative, figure_number, etc.).
+- `scripts/chunker.py` — flattens prose paragraphs into ~500-word overlapping chunks, prepends the section's card summary to every chunk so the embedding sees enough context, tracks which `pdf_pages` each chunk spans.
+- `src/pipeline/table_serializer.py` — renders each table to plain text (`Figure N, caption`, headers, rows joined by `|`), prepends the card summary, one chunk per table. (Shared with the runtime.)
+- `scripts/embedder.py` — batches all enriched chunks into Voyage AI (`voyage-3-lite`, 1024 dims, batch=128), enforces a per-run budget cap, writes vectors back onto each chunk record.
+- `scripts/indexer.py` — upserts each chunk into Supabase `spec_chunks` (vector + raw text + metadata: section_id, content_type, pdf_pages, has_normative, figure_number, spec, etc.).
 
 ---
 
@@ -160,39 +160,30 @@ flowchart LR
 flowchart LR
     U((User))
 
-    subgraph Frontend [frontend/src]
-        SB[SearchBar.jsx]
-        AP[App.jsx]
-        AN[Answer.jsx]
-        SR[Sources.jsx]
-        AC[api.js]
+    subgraph App [src/pipeline/app.py — FastAPI, single file]
+        FE[embedded HTML UI<br/>FRONTEND_HTML]
+        AU[auth.py<br/>session-cookie gate]
+        OR[orchestrator.py<br/>orchestrate]
     end
 
-    BE[/"backend (TBD)<br/>src/pipeline/app.py<br/>FastAPI"/]
     DB([Supabase<br/>spec_chunks])
-    LL([Anthropic Claude<br/>Sonnet generate / Haiku light])
+    LL([LLM provider<br/>Anthropic / OpenAI / Gemini])
 
-    U  --> SB
-    SB --> AP
-    AP --> AC
-    AC -. POST /api/query .-> BE
-    BE -. vector + BM25<br/>+ rerank .-> DB
-    BE -. generate w/ citations .-> LL
-    BE --> AC
-    AC --> AP
-    AP --> AN
-    AP --> SR
+    U  --> FE
+    FE -. POST /api/query<br/>+ /api/query/stream SSE .-> OR
+    AU -. gate .-> OR
+    OR -. vector + BM25 + RRF<br/>+ cross-encoder rerank .-> DB
+    OR -. generate w/ bracket-tag citations .-> LL
+    OR --> FE
 
     classDef ui fill:#1e2a14,stroke:#a0a050,color:#fec,stroke-width:1px;
     classDef ext fill:#2a141e,stroke:#c75b8c,color:#fcd,stroke-width:1px;
-    classDef tbd fill:#2a2614,stroke:#c79b5b,color:#fed,stroke-width:1px,stroke-dasharray: 5 3;
-    class SB,AP,AN,SR,AC ui;
+    class FE,AU,OR ui;
     class DB,LL ext;
-    class BE tbd;
     class U ext;
 ```
 
-**Status:** the frontend skeleton is wired to call `POST /api/query` and render `{answer, citations, confidence, sources[]}`. Vite dev server proxies `/api/*` to `localhost:8000`. The backend at `src/pipeline/app.py` does **not** exist yet — that's the next build step. It will own hybrid retrieval, optional graph expansion via `relationships_merged.json`, rerank, and Claude-generated answers with section-cited sources.
+**Status:** implemented and serving. `src/pipeline/app.py` is a single-file FastAPI app whose UI is HTML embedded in `FRONTEND_HTML` (no Vite/React app, no `frontend/` dir). It owns the full runtime: query decomposition, structured field/table lookup, hybrid retrieval (vector + BM25/tsvector), RRF merge, cross-encoder rerank, and LLM-generated answers with bracket-tag section citations. It is **multi-corpus** (NVMe base + Command Set + PCIe, with a `spec="all"` merge mode) and supports an optional **agentic** gap-analysis loop. The runtime reads from Supabase, not from `data/`. Run with `python -m src.pipeline.app`; see `RUNNING_THE_APP.md`. The actual stage wiring lives in `orchestrator.py::orchestrate`.
 
 ---
 
@@ -219,9 +210,9 @@ flowchart LR
 
 ---
 
-## Notes / known wiring gaps
+## Notes / current state
 
-- **`pdf_page` vs `printed_page` on chunks.** `chunker.py:68` and `table_serializer.py:89` collect `pdf_page` from the source records, but human-facing citations want `printed_page` (= `pdf_page - PAGE_OFFSET`). Source records have both, so this is a one-line fix once citations matter.
-- **`definitions.json` is parsed but unused.** No downstream consumer reads it yet. Likely lives as a definition-lookup tool the backend can call.
-- **`relationships_merged.json` is built but unused.** Graph-expanded retrieval (per `BUILD_PLAN_FINAL.md`) is the natural consumer.
-- **No backend exists yet.** `frontend/src/api.js` describes the contract it expects; building `src/pipeline/app.py` is the gating Phase 2 task.
+- **Backend is live.** `src/pipeline/app.py` + `orchestrator.py` implement the full runtime (see Phase 2B). This doc's diagrams describe the data lineage; the authoritative runtime behavior is in the code, and `RUNNING_THE_APP.md` covers how to run it.
+- **Multi-corpus.** Three specs are ingested (NVMe base, Command Set, PCIe), each with its own `data/<spec>/` artifact set and Supabase rows tagged by `spec`. `spec="all"` runs a per-corpus merge. Adding a corpus: see `docs/ADDING_A_SPEC.md` (and register it in `CONCRETE_SPEC_IDS` + `AVAILABLE_SPECS`).
+- **Citations** deep-link the official PDF via `#page=N`; `pdf_pages` are 0-indexed, so the human page is `+1`. Citation format is bracket tags — the generation prompt in `generator.py` and the parser (`_extract_citations`) must stay in sync.
+- **`relationships_merged.json`** (graph-expanded retrieval) and **`definitions.json`** remain available as enrichment artifacts; check the retrieval code for current usage rather than trusting this note.

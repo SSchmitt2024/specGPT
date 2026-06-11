@@ -116,15 +116,30 @@ class PipelineConfig:
     # Query decomposition parameters
     max_subqueries: int = 3
 
+    # Deterministic 1-hop figure expansion: after reranking, scan the context
+    # chunks for "Figure N" references and direct-fetch any referenced table
+    # not already in context. Spec prose constantly defers to its data
+    # structures ("...the CDP Request Data Frame (refer to Figure 630)"), and
+    # neither semantic search nor the gap analyser reliably pulls those
+    # layouts in. Expansion chunks are appended AFTER the ranked hits, so the
+    # generator's context-token budget includes them only when room remains —
+    # they can never crowd out a ranked chunk. No LLM cost; one cached table
+    # load per query.
+    expand_figure_refs: bool = True
+    figure_ref_expansion_cap: int = 6
+
     # Generation parameters
     llm_model: str = "claude-sonnet-4-6"
     llm_max_context_tokens: int = 4000
-    llm_max_output_tokens: int = 1024
+    # 2048: procedural answers with tables were hitting stop_reason=max_tokens
+    # at 1024, truncating the first pass — and gap analysis then chases gaps
+    # that are really just the cut-off tail.
+    llm_max_output_tokens: int = 2048
 
     # Agentic-mode parameters (only used when orchestrate(..., agentic=True))
     agentic_model: str = "claude-opus-4-7"
     agentic_max_context_tokens: int = 16000
-    agentic_max_output_tokens: int = 2048
+    agentic_max_output_tokens: int = 3072
     agentic_max_followups: int = 3   # cap LLM-generated follow-up queries
     agentic_rerank_topk: int = 14    # top-k after re-rerank (~2× normal)
 
@@ -245,18 +260,31 @@ def _pin_structured_hits(
     the top semantic hits. Pinned hits are never truncated, and the budget is
     floored at ``budget`` so pinning never shrinks the context below the
     configured size.
+
+    Agentic targeted fetches (exact figure/field/section pulls requested by
+    the gap analyser) are pinned for the same reason: they were fetched to
+    fill a *known* gap, but a byte-layout table scores poorly against the
+    original prose query, so the cross-encoder cut discarded them every
+    iteration — the loop stalled re-requesting chunks the reranker kept
+    vetoing. Fuzzy section fallbacks (``agentic_fetch_section_fuzzy``) are
+    speculative and stay subject to semantic ranking.
     """
+    _PINNED = {"structured_lookup", "agentic_fetch_figure",
+               "agentic_fetch_field", "agentic_fetch_section"}
+
     def _key(c: dict):
         return c.get("chunk_id") or c.get("id")
 
     order = {
         _key(c): i
         for i, c in enumerate(pre_rerank_pool)
-        if c.get("method") == "structured_lookup"
+        if c.get("method") in _PINNED
     }
-    pinned = [c for c in ranked if c.get("prior_method") == "structured_lookup"]
-    pinned.sort(key=lambda c: order.get(_key(c), 1_000_000))
-    rest = [c for c in ranked if c.get("prior_method") != "structured_lookup"]
+    pinned = [c for c in ranked if c.get("prior_method") in _PINNED]
+    # Structured hits stay ahead of agentic fetches; ties keep pool order.
+    pinned.sort(key=lambda c: (c.get("prior_method") != "structured_lookup",
+                               order.get(_key(c), 1_000_000)))
+    rest = [c for c in ranked if c.get("prior_method") not in _PINNED]
     budget = max(budget, len(pinned))
     return (pinned + rest)[:budget]
 
@@ -447,6 +475,9 @@ PRESETS: dict[str, dict] = {
         "config": {
             "agentic_model": "claude-sonnet-4-6",
             "llm_model": "claude-haiku-4-5-20251001",
+            # Fast keeps the lean output budget; quick lookups don't need
+            # long procedural answers and this keeps cost/latency flat.
+            "llm_max_output_tokens": 1024,
             "vector_topk": 6,
             "tsvector_topk": 6,
             "bm25_topk": 6,
@@ -474,6 +505,7 @@ PRESETS: dict[str, dict] = {
         "config": {
             "agentic_model": "claude-opus-4-7",
             "llm_model": "claude-sonnet-4-6",
+            "llm_max_output_tokens": 2048,
             "vector_topk": 5,
             "tsvector_topk": 5,
             "bm25_topk": 5,
@@ -485,7 +517,7 @@ PRESETS: dict[str, dict] = {
             "agentic_max_followups": 3,
             "agentic_rerank_topk": 14,
             "agentic_max_context_tokens": 16000,
-            "agentic_max_output_tokens": 2048,
+            "agentic_max_output_tokens": 3072,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
             "agentic_max_iterations": 4,
@@ -504,6 +536,7 @@ PRESETS: dict[str, dict] = {
         "config": {
             "agentic_model": "claude-opus-4-7",
             "llm_model": "claude-opus-4-7",
+            "llm_max_output_tokens": 2048,
             "vector_topk": 8,
             "tsvector_topk": 8,
             "bm25_topk": 8,
@@ -515,7 +548,7 @@ PRESETS: dict[str, dict] = {
             "agentic_max_followups": 3,
             "agentic_rerank_topk": 14,
             "agentic_max_context_tokens": 16000,
-            "agentic_max_output_tokens": 2048,
+            "agentic_max_output_tokens": 3072,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
             "agentic_max_iterations": 4,
@@ -824,28 +857,96 @@ def _resolve_requested_resources(
                 if ch:
                     chunks.append(ch)
 
-    # ── Sections: fall back to tsvector search keyed on the section id ──
+    # ── Sections: direct lookup by section id ───────────────────────────
+    # fetch_section_chunks queries section_id directly (exact + descendants).
+    # The old tsvector path used the dotted id as the *query text*, which a
+    # section's own body never contains — it returned chunks that cite the
+    # id instead of the section itself, so requested sections never arrived.
     if enable_section_fallback:
+        fetch_spec = None if spec == ALL_SPECS else spec
         sec_filter = {} if spec == ALL_SPECS else {"spec": spec}
         for sid in requested.get("sections") or []:
             try:
-                hits = search.tsvector_search(sid, top_k=3,
-                                              filter={"section_prefix": sid, **sec_filter})
+                hits = search.fetch_section_chunks(sid, top_k=3, spec=fetch_spec)
             except Exception:
                 hits = []
+            method = "agentic_fetch_section"
             if not hits:
+                # The id may be slightly wrong or hallucinated; fall back to
+                # text search for chunks that at least reference it. Tagged
+                # _fuzzy so downstream pinning only trusts exact fetches.
                 try:
                     hits = search.tsvector_search(f"Section {sid}", top_k=3,
                                                   filter=sec_filter)
                 except Exception:
                     hits = []
+                method = "agentic_fetch_section_fuzzy"
             for h in hits:
                 h = dict(h)
-                h["method"] = "agentic_fetch_section"
+                h["method"] = method
                 h["score"] = max(float(h.get("score") or 0.0), 0.9)
                 chunks.append(h)
 
     return chunks
+
+
+# "Figure 630" / "Figures 630" — the way spec prose cites its data structures.
+_FIGURE_REF_RE = re.compile(r"\bFigures?\s+(\d{1,4})\b")
+
+
+def _expand_referenced_figures(
+    context_chunks: list[dict],
+    *,
+    spec: str,
+    cap: int,
+) -> list[dict]:
+    """Deterministic 1-hop expansion: fetch the tables for figures the context
+    chunks reference but the context does not contain.
+
+    Spec prose defers detail to its data structures ("...the CDP Request Data
+    Frame (refer to Figure 630)"); an answer assembled from the prose alone
+    describes a layout it never saw. Returned chunks are tagged
+    ``figure_ref_expansion`` and meant to be APPENDED after the ranked
+    context, so the generator's token budget decides whether they fit — they
+    never displace a ranked hit. Most-referenced figures first, capped at
+    ``cap``.
+    """
+    if cap <= 0 or not context_chunks:
+        return []
+    present = {
+        str(c.get("figure_number")).strip().lstrip("0") or "0"
+        for c in context_chunks
+        if c.get("figure_number")
+    }
+    counts: dict[str, int] = {}
+    for c in context_chunks:
+        for fig in set(_FIGURE_REF_RE.findall(c.get("text_raw") or "")):
+            key = fig.lstrip("0") or "0"
+            if key not in present:
+                counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return []
+    wanted = sorted(counts, key=lambda f: (-counts[f], int(f)))[:cap]
+    try:
+        fetched = _resolve_requested_resources(
+            {"figures": wanted, "fields": [], "sections": []},
+            enable_section_fallback=False,
+            spec=spec,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("figure-ref expansion failed: %s", e)
+        return []
+    seen_ids = {c.get("id") or c.get("chunk_id") for c in context_chunks}
+    out: list[dict] = []
+    for ch in fetched:
+        cid = ch.get("id") or ch.get("chunk_id")
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        ch = dict(ch)
+        ch["method"] = "figure_ref_expansion"
+        out.append(ch)
+    return out
 
 
 def _structured_lookup_all_specs(
@@ -1296,6 +1397,32 @@ def _run_stage5_and_finalize(
                     took_ms=took_rr2 * 1000,
                 )
             )
+
+            # Same deterministic figure expansion as the first pass, on the
+            # refreshed context. Runs before the stall signature below, so an
+            # expansion that changes the context counts as progress.
+            if config.expand_figure_refs:
+                start = time.time()
+                fig_expansion2 = _expand_referenced_figures(
+                    reranked2, spec=config.spec,
+                    cap=config.figure_ref_expansion_cap,
+                )
+                reranked2 = reranked2 + fig_expansion2
+                trace.append(
+                    PipelineStage(
+                        stage=f"agentic.figure_ref_expansion{suffix}",
+                        input={"context_count": len(reranked2) - len(fig_expansion2),
+                               "cap": config.figure_ref_expansion_cap},
+                        output={"added_count": len(fig_expansion2),
+                                "added": [
+                                    {"id": c.get("id"),
+                                     "figure_number": c.get("figure_number"),
+                                     "section_title": c.get("section_title")}
+                                    for c in fig_expansion2
+                                ]},
+                        took_ms=(time.time() - start) * 1000,
+                    )
+                )
 
             # Stall guard: compare this iteration's reranked context to the last
             # one. Identical -> regenerate can only reproduce the prior answer,
@@ -1859,6 +1986,29 @@ def orchestrate(
             took_ms=took_rerank * 1000,
         )
     )
+
+    if config.expand_figure_refs:
+        start = time.time()
+        fig_expansion = _expand_referenced_figures(
+            retrieved_chunks, spec=config.spec,
+            cap=config.figure_ref_expansion_cap,
+        )
+        retrieved_chunks = retrieved_chunks + fig_expansion
+        trace.append(
+            PipelineStage(
+                stage="figure_ref_expansion",
+                input={"context_count": len(retrieved_chunks) - len(fig_expansion),
+                       "cap": config.figure_ref_expansion_cap},
+                output={"added_count": len(fig_expansion),
+                        "added": [
+                            {"id": c.get("id"),
+                             "figure_number": c.get("figure_number"),
+                             "section_title": c.get("section_title")}
+                            for c in fig_expansion
+                        ]},
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
 
     # -------------------------------------------------------------------------
     # Stage 4: Context Assembly + Generation (Sonnet with strict system prompt)
