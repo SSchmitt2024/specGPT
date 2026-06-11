@@ -1,110 +1,135 @@
+# specGPT Pipeline Failure Backlog
+# Source: qa_log (67 rows), flagged_answers (3), recent commits, PIPELINE_DESIGN_CHOICES.md
+# Diagnosed: 2026-06-11
 
-Agentic should just go until gap analysis reveals no more data needed
+## Summary
 
-RAG is good about answering questions about information, not great about commands
+All three flags and the worst qa_log rows share one signature: the model correctly names
+exactly what's missing (figure layouts, sub-sections), and the agentic loop fails to act
+on that information. It's not a data problem — figures 630, 631, 632, 633, and 642 all
+exist in data/tables.json and the chunk index. The failures are four interacting logic
+gaps in orchestrator.py's agentic loop, plus one already-half-fixed retrieval gap.
 
-In recursed cycle, structure lookup should happen as well
+---
 
-Look into having a different type of pipeline if the query is asking about a command
+## Data Inputs
 
+- 3 flags (all 2026-06-10, all the PKAS-unfreeze query family, base spec, agentic):
+  missing Figure 630/632 layouts; loop stalls while the model says context is incomplete.
+- 67 qa_log rows: 11 contain "context does not contain / not retrieved" language,
+  7 have hallucinated citations. Recurring shape: answer cites or names a specific
+  section/figure as needed but absent (e.g. id 4: "section 5.2.26.1.2 referenced but
+  not included", id 82: "DLFEAT field... not present in retrieved context").
+- Commits: the last 5 days are mostly patches to this exact area (verdict + stall
+  detector in bfce2ae, citation parser fixes, and cbcc018 adding figure-ref expansion
+  + structured lookup backup).
 
-========================================================================
-PIPELINE INEFFICIENCY AUDIT (ranked most -> least significant)
-========================================================================
-Three layers: live query path, web layer (app.py), offline corpus build.
+---
 
---- TIER 0: dominant, system-wide ---
-[DONE] 1. Global 6.5s LLM pacing lock serializes every Gemini call process-wide
-   (llm/client.py:48,76). Live: balanced query = 2 paced calls; agentic
-   "thorough" ~25 calls = ~160s of pure sleep. Build: ~1,600 serial calls
-   = ~2.9 HOURS of pure time.sleep() per full rebuild. Concurrency makes it
-   worse (all users serialize 6.5s apart). FIX: per-provider token-bucket
-   rate limiter at real RPM + run independent calls concurrently. This is
-   the only change that materially moves both build time and agentic latency.
+## Root Causes (ranked by impact)
 
---- TIER 1: critical (live latency / event-loop blocking) ---
-[DONE] 2. Retrieval runs fully sequentially inside orchestrate() (orchestrator.py:
-   294-330). Up to 12 serial network round-trips (vector+tsvector+bm25 x
-   sub-queries); structured vs hybrid also serial. FIX: ThreadPoolExecutor
-   over (method x sub-query); run structured + hybrid concurrently.
-3. Voyage embeds one sub-query per API call (search.py:228). FIX: batch all
-   sub-queries into one embed call.
-4. All Supabase admin I/O blocks the event loop (app.py:910,936,953,972,992,
-   1009) - six async endpoints call sync .execute() directly. FIX: wrap in
-   asyncio.to_thread (query endpoints already do this; admin ones don't).
-5. verify_password (scrypt ~100ms) blocks event loop in async login()
-   (app.py:470). FIX: asyncio.to_thread.
-6. Build rewrites entire growing output file + os.fsync after EVERY LLM call
-   (generate_cards.py:475, extract_relationships.py:226) - ~1.6GB rewrites
-   + sync flush stall per call. FIX: checkpoint every N=10-50 calls.
+### BUG 1 — First-wins dedup blocks pin promotion [HIGHEST PRIORITY]
+**File:** orchestrator.py:1361
+**Symptoms:** False stalls; figures fetched but never pinned; loop declares "context
+unchanged" while the answer remains incomplete.
 
---- TIER 2: high (wasted compute / cost / memory) ---
-[PARTIALLY DONE - ttl_cache added for retrievers] 7. [MISSING] No result/embedding/rerank caching anywhere - identical queries
-   redo all work. FIX: embedding cache + semantic/exact query->answer cache
-   w/ TTL + memoize structured_lookup.
-8. [MISSING] No confidence short-circuit - HIGH-confidence structured lookups
-   still run full hybrid+rerank+gap-check (orchestrator.py:1221-1471).
-9. auto_gap_check=True adds a paced Gemini call to EVERY default query
-   (orchestrator.py:136,1042). FIX: default off / compute lazily.
-10. BM25 scores entire multi-spec corpus then filters by spec post-hoc
-    (bm25_index.py:169-185). FIX: partition index per spec.
-11. Agentic loop re-reranks the whole growing pool every iteration
-    (orchestrator.py:942-950). FIX: cache rerank scores; score only new chunks.
-12. Refine cache stores full chunk dicts incl. multi-KB text_raw, no TTL
-    (app.py:232-250,546) - up to ~32MB held indefinitely. FIX: store only
-    needed fields + TTLCache.
-13. Duplicate find_tables() over ~760 pages in build (prose.py:201 re-runs
-    tables.py:799) = ~15-38s wasted. FIX: tables.py emits table_bboxes.json
-    sidecar.
-14. Anthropic() re-instantiated per generation (generator.py:760) - loses
-    connection pooling. FIX: module-level singleton.
-15. Per-request rebuilds in web layer: static PipelineConfig() each call
-    (app.py:827,843,847); client always sends debug:true so full trace is
-    built+asdict-serialized every request when DEBUG_PIPELINE=1
-    (app.py:514,3997). FIX: cache static responses; request trace only on
-    panel open.
-16. reconcile.py:97 compiles regex inside _normalize_name() (~30-180k calls/
-    run). FIX: pre-compile suffix patterns at module load.
+The agentic merge at orchestrator.py:1361 dedups `expanded_pool + extra_chunks` keeping
+the *first* copy. A chunk first seen via hybrid search keeps method='rrf' forever. When
+the targeted fetch later re-fetches the same chunk id with a pinnable method
+(agentic_fetch_*), the new copy is silently dropped, so _pin_structured_hits
+(orchestrator.py:272) never pins it, and the cross-encoder keeps cutting it (byte-layout
+tables score poorly against prose queries).
 
---- TIER 3: medium ---
-17. Trace objects always built even when debug=False (orchestrator.py:1084).
-18. /api/flags fetches full pipeline_trace JSONB per row on panel open
-    (~20MB/200 rows); flag submit ships whole trace (app.py:932,900).
-19. Frontend re-parses markdown ~333x/answer during typewriter animation
-    (app.py:4046). Animate plain text, render once on done.
-20. Mermaid viz rendered into hidden container then re-rendered on open
-    (twice) (app.py:4591).
-21. tables.py collapses each row twice (~4,500 calls, tables.py:239); ~1,700
-    extra page.get_text() by calling per-table not per-page (tables.py:374,839).
-22. enum_tables.py iterates all 717 tables 5x (once per concept,
-    enum_tables.py:231). Single bucketing pass suffices.
-23. deep_sections._is_known_title O(candidates x TOC) ~720k comparisons
-    (deep_sections.py:257). Use a dict.
-24. relationships.extract_from_table re-scans raw_text (superset of row
-    descriptions already scanned) (relationships.py:366).
-25. prose._extract_normative compiles 3 regexes per sentence (prose.py:613).
-    Use one combined \b(shall|should|may)\b.
-26. sorted(processed) every build iteration - O(N^2 log N)
-    (generate_cards.py:473, extract_relationships.py:223).
-27. prose.py opens the PDF twice (once just for page_count, prose.py:647).
-28. Crude len//4 token estimate wastes context budget (generator.py:139).
+Hard evidence in flag 19: fig630__ was retrieved by follow-up hybrid search in iter1
+(BM25 score 25.8, vector 0.77) and entered the pool as 'rrf'; fig632__ was
+targeted-fetched in iter2 with a pinnable method — yet the loop declared "reranked
+context unchanged" and stalled.
 
---- TIER 4: low ---
-_login_html() regenerated per request + in-body import (app.py:338,340);
-os.getenv("TRUST_PROXY_HEADERS") per request (app.py:300); renderCostEstimate
-fires per keystroke no debounce (app.py:2742); _dump_model reflection per SSE
-close (app.py:569); reconcile/fields multi-pass loops + list.index() header
-lookups (reconcile.py:144, fields.py:293); 250KB FRONTEND_HTML constant blocks
-ETag caching; BM25 cold-start (no warmup); _supabase_available() re-reads .env
-when env var absent (retriever.py:122).
+Fix shape: on dedup collision, promote the kept chunk's method if the incoming copy's
+method is pinnable.
 
---- MISSING TECHNIQUES (gaps) ---
-- Concurrent retrieval (#2); caching layer (#7); token-bucket rate limiting
-  vs fixed global sleep (#1); confidence-gated early exit (#8); batched
-  embeddings (#3) + incremental rerank scoring (#11); resumable/checkpointed
-  build (#6) + content-hash card caching to skip unchanged sections.
+---
 
-BOTTOM LINE: fixing #1 (rate-limiter+concurrency), #2 (parallel retrieval),
-and #7 (caching) addresses the overwhelming majority of latency and cost.
-(Update: #1, #2, and parts of #7 have been completed via perf-optimizations PR)
+### BUG 2 — verdict.missing field never fed back into retrieval
+**File:** orchestrator.py:667, 1223
+**Symptoms:** Model names the exact missing figures/sections; cheap gap-analyzer
+re-derives a worse list from a truncated answer; named resources never fetched.
 
+_agentic_gap_analysis (orchestrator.py:667, called at 1223) receives only the query,
+section titles, hallucinated cites, and answer[:1500] — the verdict is parsed and then
+used only as a boolean stop signal at line 1208. The strong model enumerates the shopping
+list; the cheap gap-analyzer re-derives a worse one from a truncated answer.
+
+Flag 19 evidence: iter1 regenerate verdict said verbatim:
+  missing: "Figure 630/631/632/642 layouts, DHK derivation (8.1.6.3.1.1),
+            Random Nonce Request (8.1.6.3.2)"
+The iter2 gap analysis requested none of fig630/631/642 and not 8.1.6.3.2.
+
+Related: the 1500-char truncation at orchestrator.py:698 hides "missing information"
+caveats these answers put at the *end*.
+
+Fix shape: feed verdict.missing into the next iteration's requested_resources.
+_parse_requested_resources could almost consume it directly as it's already structured
+text naming figures/sections.
+
+---
+
+### BUG 3 — Convergence check ignores verdict.missing; answered=true with non-empty missing wrongly converges
+**File:** orchestrator.py:1208
+**Symptoms:** "It stops while admitting it lacks context" (flags 20, 21).
+
+Line 1208: `if verdict.get("answered") and not unfetched_cites: converged`
+Flag 20's verdict was answered=true, missing="Byte-level layout of Figures 632/633" —
+a self-contradiction the loop accepts. It only kept iterating because of an unrelated
+hallucinated cite, then stalled (bug 1) and ran the context_is_final wrap-up, producing
+exactly the flagged behavior: an answer that admits incompleteness while fetchable
+figures sat unfetched.
+
+Fix shape: a non-empty missing field that names concrete figure/section ids should block
+convergence and seed the next fetch (which is bug 2's fix).
+
+---
+
+### BUG 4 — Hallucinated-cite fetching has no memory and no "unfetchable" escape
+**File:** orchestrator.py (agentic loop, unfetched_cites logic)
+**Symptoms:** Same cite chased every iteration; loop can only exit via stall.
+
+Flag 20 chased 8.1.6.3.1.1 in both iterations; fetch_section_chunks returned the parent
+8.1.6.3.1__c0 both times, the regenerated answer still cited 8.1.6.3.1.1, so
+unfetched_cites stayed non-empty, convergence stayed blocked, and the only exit was the
+stall. Every iteration of every flag also re-fetched fig285 even though it was already
+in context.
+
+Fix shape: per-request "already tried" set; a cite that survives a fetch attempt should
+be treated as unresolvable rather than blocking convergence forever.
+
+---
+
+## Secondary Observations
+
+- Figure-ref expansion (_expand_referenced_figures, committed yesterday in cbcc018)
+  directly targets flag 21's complaint (prose says "refer to Figure 630" and the layout
+  never arrives) — all three flags predate it. Two caveats: its fetched chunks get id
+  agentic_fetch:<spec>:figN while the indexed copy of the same table is figN__, so the
+  dedup pool can hold both (duplicate context, and bug 1's collision in reverse); and
+  it's not in the _PINNED set, which is fine for append-mode but means an expansion
+  chunk in the pool can't survive the next rerank.
+
+- Verdict parse returned null once (flag 19 iter0, Opus). The @@VERDICT@@ block trails
+  the answer, so a max_tokens truncation eats it; worth checking stop_reason when
+  verdict is null and the answer is long.
+
+- qa_log id 86 is user error, not pipeline: an NVMe PKAS question asked with spec=pcie.
+  A cross-spec "did you mean" hint would catch it, but it's not a pipeline failure.
+
+- Non-agentic rows (ids 4, 5, 38) that name a missing section are working as designed —
+  the gap_hint fires and waits for the user to click refine.
+
+---
+
+## Fix Priority Order
+
+1. BUG 1 — method promotion on dedup collision (orchestrator.py:1361)
+2. BUG 2 — feed verdict.missing into next iteration's requested_resources (orchestrator.py:1223)
+3. BUG 3 — block convergence when verdict.missing names concrete resources (orchestrator.py:1208)
+4. BUG 4 — attempted-fetch set + unresolvable-cite escape hatch (agentic loop)

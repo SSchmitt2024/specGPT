@@ -1330,13 +1330,15 @@ a { color: var(--accent); text-decoration: none; }
   letter-spacing:-0.01em; outline:none; padding:8px 0; min-width:0; resize:none; overflow:hidden;
   line-height:1.5; min-height:36px; max-height:200px; }
 .composer textarea::placeholder { color:var(--t-faint); }
-.ask-btn { height:42px; padding:0 20px; border-radius:9px; border:1px solid var(--ink); background:var(--ink);
-  color:var(--surface); font-size:14px; font-weight:600; letter-spacing:-0.01em; display:inline-flex;
-  align-items:center; gap:8px; transition:transform .08s, filter .14s, opacity .14s; flex:none; }
+.ask-btn { box-sizing:border-box; width:130px; height:56px; padding:0; border-radius:9px; border:1px solid var(--ink);
+  background:var(--ink); color:var(--surface); font-size:14px; font-weight:600; letter-spacing:-0.01em;
+  display:inline-flex; align-items:center; justify-content:center; gap:10px;
+  transition:filter .14s, opacity .14s; flex:none; }
 .ask-btn:hover { filter:brightness(1.18); }
-.ask-btn:active { transform:translateY(1px); }
 .ask-btn:disabled { opacity:.4; cursor:not-allowed; filter:none; }
-.ask-btn svg { width:15px; height:15px; }
+.ask-btn svg { width:15px; height:15px; flex:none; }
+.ask-btn-inner { display:flex; flex-direction:column; align-items:center; gap:1px; width:46px; }
+.ask-spec-label { font-size:10px; font-weight:400; opacity:0.6; letter-spacing:0.02em; }
 
 /* control strip */
 .controls { display:flex; align-items:center; gap:8px; margin-top:13px; padding-top:13px;
@@ -1889,7 +1891,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                placeholder="Ask about the NVMe spec...  e.g. What does CIRN indicate?"></textarea>
                     </div>
                     <button id="search-btn" class="ask-btn">
-                        Ask
+                        <span class="ask-btn-inner">Ask<span id="ask-spec-label" class="ask-spec-label">Base</span></span>
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
                     </button>
                 </div>
@@ -2512,6 +2514,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         (function _wireSpecPicker() {
             const el = document.getElementById("global-spec-select");
             if (!el) return;
+            const _specShortNames = { base: "Base", pcie: "PCIe", command: "Cmd-Set", all: "All" };
+            function _updateAskSpecLabel(specId) {
+                const lbl = document.getElementById("ask-spec-label");
+                if (lbl) lbl.textContent = _specShortNames[specId] || specId;
+            }
             fetch("/api/specs")
                 .then((r) => (r.ok ? r.json() : null))
                 .then((data) => {
@@ -2524,11 +2531,14 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     el.value = (saved && data.specs.some((s) => s.id === saved))
                         ? saved
                         : (data.default || "base");
+                    _updateAskSpecLabel(el.value);
                 })
                 .catch(() => {});
             el.addEventListener("change", () => {
                 localStorage.setItem("specgpt_spec", el.value);
+                _updateAskSpecLabel(el.value);
             });
+            _updateAskSpecLabel(localStorage.getItem("specgpt_spec") || "base");
         })();
 
         // Overlay the model selectors onto `_modelsData` so the model panel +
