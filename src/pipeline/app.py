@@ -44,6 +44,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -107,6 +108,7 @@ from src.pipeline.orchestrator import (
     PRESETS,
     DEFAULT_PRESET,
 )
+from src.pipeline.retriever import load_field_index
 
 
 def _generation_error_detail(e: GenerationError, request_id: str, *, include_trace: bool) -> dict:
@@ -1011,6 +1013,84 @@ async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
     }
 
 
+# ── Field-acronym definitions (answer popovers) ────────────────────────────
+# Backs the clickable acronym chips in the rendered answer: the UI fetches the
+# definable-term list once per spec, marks matching inline-code tokens, and
+# resolves a clicked term against /api/define. Both reads come from the
+# in-process field index cache (retriever.load_field_index), so after warmup
+# there is no per-click DB round-trip.
+
+# A field-index key that reads as a numeric/hex literal (bare number, 0x1F,
+# 3FH) is never a definable acronym - drop it server-side so the UI can't
+# mark hex values in answers as clickable terms.
+_LITERAL_TERM_RE = re.compile(r"^(?:0X[0-9A-F]+|[0-9A-F]+H|[0-9]+)$")
+
+
+def _define_specs(spec: str) -> tuple[str, ...]:
+    if spec not in _VALID_SPEC_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown spec: {spec!r}")
+    return CONCRETE_SPEC_IDS if spec == ALL_SPECS else (spec,)
+
+
+@lru_cache(maxsize=8)
+def _definable_terms(spec: str) -> tuple[str, ...]:
+    terms: set[str] = set()
+    for s in _define_specs(spec):
+        try:
+            index = load_field_index(s)
+        except Exception:  # noqa: BLE001 - a corpus without lookup data just contributes nothing
+            continue
+        for name in index:
+            name = str(name).strip().upper()
+            if name and not _LITERAL_TERM_RE.match(name):
+                terms.add(name)
+    return tuple(sorted(terms))
+
+
+def _truncate_definition(text: str | None, limit: int = 700) -> str | None:
+    if not text:
+        return None
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return text[: cut if cut > 0 else limit].rstrip() + "…"
+
+
+@app.get("/api/define/terms")
+async def define_terms_endpoint(spec: str = "base", _: bool = Depends(require_auth)) -> dict:
+    """All field acronyms with a known definition, for client-side marking."""
+    return {"spec": spec, "terms": list(_definable_terms(spec))}
+
+
+@app.get("/api/define")
+async def define_endpoint(term: str, spec: str = "base", _: bool = Depends(require_auth)) -> dict:
+    """Resolve one acronym to its field definition(s) for the popover."""
+    term_n = term.strip().upper()
+    if not term_n or len(term_n) > 32:
+        raise HTTPException(status_code=400, detail="bad term")
+    matches: list[dict] = []
+    for s in _define_specs(spec):
+        try:
+            records = load_field_index(s).get(term_n) or []
+        except Exception:  # noqa: BLE001
+            continue
+        for rec in records:
+            matches.append({
+                "spec": s,
+                "full_name": rec.get("full_name"),
+                "description": _truncate_definition(rec.get("description")),
+                "section_id": rec.get("section_id"),
+                "figure_number": rec.get("parent_figure"),
+                "parent_caption": rec.get("parent_caption"),
+                "offset": rec.get("offset"),
+                "offset_type": rec.get("offset_type"),
+            })
+            if len(matches) >= 4:
+                return {"term": term_n, "matches": matches}
+    return {"term": term_n, "matches": matches}
+
+
 @app.post("/api/flag-answer")
 async def flag_answer_endpoint(
     req: FlagAnswerRequest,
@@ -1460,6 +1540,9 @@ a { color: var(--accent); text-decoration: none; }
   padding:1px 5px; border-radius:5px; color:var(--accent-ink); }
 .answer-text pre { background:var(--subtle); border:1px solid var(--border); border-radius:var(--radius-xs); padding:12px 14px; overflow:auto; margin:0 0 14px; }
 .answer-text pre code { background:transparent; border:0; padding:0; }
+/* inline-code acronyms with a known field definition: click for a popover */
+.answer-text code.def-term { cursor:pointer; border-bottom:1px dashed var(--accent-bd); }
+.answer-text code.def-term:hover { background:var(--accent-soft); border-color:var(--accent-bd); }
 .answer-text blockquote { margin:0 0 14px; padding:10px 16px; background:var(--warn-soft); border-left:3px solid var(--warn);
   border-radius:0 var(--radius-xs) var(--radius-xs) 0; color:var(--t-muted); font-size:.95em; }
 .answer-text blockquote p { margin:0; }
@@ -4765,6 +4848,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (!_citePop) return;
             if (_citePop.contains(e.target)) return;
             if (e.target.closest && e.target.closest(".cite-chip")) return;
+            // def-term clicks open their own popover (handler below); letting
+            // this dismiss run too would close it in the same click.
+            if (e.target.closest && e.target.closest("code.def-term")) return;
             closeCitePop();
         });
         document.addEventListener("keydown", function (e) {
@@ -4974,6 +5060,130 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 }
             }
         }
+
+        /* ── field-acronym definition popovers ────────────────────────────
+           The model already code-formats spec acronyms (AUS, PKAS, CDPALG).
+           After an answer renders, inline-code tokens that match a known
+           field acronym (/api/define/terms, fetched once per spec) get a
+           dashed underline; clicking one shows the field's full name +
+           description in a cite-pop style popover (/api/define, cached).
+           Only acronym-shaped tokens are eligible: uppercase alphanumerics
+           starting with a letter. Hex/bit literals ("0x1F", "3Fh", '1',
+           "257:256") never match, so values stay plain code. */
+        var _defTerms = {};   // spec → Set of acronyms, or an array of waiting callbacks while fetching
+        var _defCache = {};   // spec + "|" + term → matches array
+        function _ensureDefTerms(spec, cb) {
+            var have = _defTerms[spec];
+            if (have instanceof Set) { cb(have); return; }
+            if (Array.isArray(have)) { have.push(cb); return; }  // fetch already in flight
+            _defTerms[spec] = [cb];
+            fetch("/api/define/terms?spec=" + encodeURIComponent(spec))
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (data) {
+                    var waiting = _defTerms[spec];
+                    var set = new Set((data && data.terms) || []);
+                    _defTerms[spec] = set;
+                    (Array.isArray(waiting) ? waiting : []).forEach(function (fn) { fn(set); });
+                })
+                .catch(function () { delete _defTerms[spec]; });
+        }
+        function markDefinableTerms(root, spec) {
+            if (!root || !spec) return;
+            _ensureDefTerms(spec, function (terms) {
+                if (!terms.size) return;
+                root.querySelectorAll("code").forEach(function (c) {
+                    if (c.closest("pre") || c.classList.contains("def-term")) return;
+                    var t = (c.textContent || "").trim();
+                    if (!/^[A-Z][A-Z0-9]{1,11}$/.test(t)) return;
+                    if (!terms.has(t)) return;
+                    c.classList.add("def-term");
+                    c.setAttribute("tabindex", "0");
+                    c.setAttribute("data-term", t);
+                    c.setAttribute("data-spec", spec);
+                });
+            });
+        }
+        function renderDefPop(el, term, matches) {
+            closeCitePop();
+            var pop = document.createElement("div");
+            pop.className = "cite-pop";
+
+            var m = (matches && matches.length) ? matches[0] : null;
+            var title = document.createElement("div");
+            title.className = "cite-pop-title";
+            var acr = document.createElement("span");
+            acr.className = "mono";
+            acr.textContent = term;
+            title.appendChild(acr);
+            if (m && m.full_name) {
+                title.appendChild(document.createTextNode("  " + m.full_name));
+            }
+            pop.appendChild(title);
+
+            var body = document.createElement("div");
+            body.className = "cite-pop-body";
+            body.textContent = (m && m.description) || "No definition found in the field index.";
+            pop.appendChild(body);
+
+            if (m) {
+                var foot = document.createElement("div");
+                foot.className = "cite-pop-foot";
+                var ctx = document.createElement("span");
+                ctx.className = "cite-pop-page";
+                var bits = [];
+                if (m.spec) {
+                    var sd = (window._specData || []).filter(function (s) { return s.id === m.spec; })[0];
+                    bits.push((sd && sd.label) || m.spec);
+                }
+                if (m.figure_number) bits.push("Figure " + m.figure_number);
+                if (m.offset) bits.push((m.offset_type === "bits" ? "bits " : "offset ") + m.offset);
+                if (matches.length > 1) bits.push("+" + (matches.length - 1) + " more context" + (matches.length > 2 ? "s" : ""));
+                ctx.textContent = bits.join(" \\u00b7 ");
+                foot.appendChild(ctx);
+                pop.appendChild(foot);
+            }
+
+            document.body.appendChild(pop);
+            pop._defFor = el;   // lets a second click on the same term toggle it shut
+            _citePop = pop;
+            // Anchor under the token, clamped to the viewport (same as cite-pop).
+            var r = el.getBoundingClientRect();
+            var left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+            var top = r.bottom + 8;
+            if (top + pop.offsetHeight > window.innerHeight - 8) {
+                top = Math.max(8, r.top - pop.offsetHeight - 8);
+            }
+            pop.style.left = left + "px";
+            pop.style.top = top + "px";
+        }
+        function showDefPop(el) {
+            var term = el.getAttribute("data-term");
+            var spec = el.getAttribute("data-spec") || "base";
+            if (!term) return;
+            var key = spec + "|" + term;
+            if (_defCache[key]) { renderDefPop(el, term, _defCache[key]); return; }
+            fetch("/api/define?term=" + encodeURIComponent(term) + "&spec=" + encodeURIComponent(spec))
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (data) {
+                    if (!data) return;
+                    _defCache[key] = data.matches || [];
+                    renderDefPop(el, term, _defCache[key]);
+                })
+                .catch(function () {});
+        }
+        document.addEventListener("click", function (e) {
+            var el = e.target.closest && e.target.closest("code.def-term");
+            if (!el) return;
+            // Clicking the term whose popover is already open toggles it shut
+            // (the dismiss handler skips def-term clicks, so do it here).
+            if (_citePop && _citePop._defFor === el) { closeCitePop(); return; }
+            showDefPop(el);
+        });
+        document.addEventListener("keydown", function (e) {
+            if (e.key !== "Enter") return;
+            var el = e.target && e.target.closest && e.target.closest("code.def-term");
+            if (el) showDefPop(el);
+        });
 
         /* ── citations click handling ─────────────────────────────────────── */
         /* Resolve a spec id to its official nvmexpress.org PDF URL (delivered by
@@ -5233,6 +5443,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         linkifyCitations(answerEl, data.citations, data.figures);
                         linkifyFigures(answerEl, data.figures);
                         styleBlockAttributions(answerEl);
+                        markDefinableTerms(answerEl, (data.config && data.config.spec) || window.getSelectedSpec());
                     }
                 });
             } else {

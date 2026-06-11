@@ -1515,6 +1515,62 @@ def test_all_specs_option_registered():
 
 
 # ---------------------------------------------------------------------------
+# /api/define helpers (field-acronym definition popovers)
+
+def test_definable_terms_drops_literal_lookalikes(monkeypatch):
+    """Field-index keys that read as numeric/hex literals must never reach the
+    UI's definable-term set, so hex values in answers stay plain code."""
+    from src.pipeline import app as app_mod
+    fake = {"NSSES": [], "aus": [], "0X1F": [], "3FH": [], "42": [], " ": []}
+    monkeypatch.setattr(app_mod, "load_field_index", lambda spec: fake)
+    app_mod._definable_terms.cache_clear()
+    try:
+        assert app_mod._definable_terms("base") == ("AUS", "NSSES")
+    finally:
+        app_mod._definable_terms.cache_clear()
+
+
+def test_definable_terms_all_specs_merges(monkeypatch):
+    from src.pipeline import app as app_mod
+    from src.pipeline.orchestrator import ALL_SPECS, CONCRETE_SPEC_IDS
+    seen: list[str] = []
+
+    def fake_index(spec):
+        seen.append(spec)
+        return {f"T{spec.upper()}": []}
+
+    monkeypatch.setattr(app_mod, "load_field_index", fake_index)
+    app_mod._definable_terms.cache_clear()
+    try:
+        terms = app_mod._definable_terms(ALL_SPECS)
+        assert seen == list(CONCRETE_SPEC_IDS)
+        assert terms == tuple(sorted(f"T{s.upper()}" for s in CONCRETE_SPEC_IDS))
+    finally:
+        app_mod._definable_terms.cache_clear()
+
+
+def test_define_specs_rejects_unknown_spec():
+    from fastapi import HTTPException
+    from src.pipeline import app as app_mod
+    try:
+        app_mod._define_specs("bogus")
+        assert False, "expected HTTPException"
+    except HTTPException as e:
+        assert e.status_code == 400
+
+
+def test_truncate_definition_word_boundary_and_whitespace():
+    from src.pipeline import app as app_mod
+    assert app_mod._truncate_definition(None) is None
+    assert app_mod._truncate_definition("  a\n b  ") == "a b"
+    long = "word " * 200  # 1000 chars
+    out = app_mod._truncate_definition(long, limit=50)
+    assert out.endswith("…")
+    assert len(out) <= 51
+    assert not out[:-1].endswith(" ")  # cut on a word boundary, no trailing space
+
+
+# ---------------------------------------------------------------------------
 # Allow `python tests/test_pipeline_units.py` (no pytest) to validate fast.
 
 if __name__ == "__main__":
