@@ -239,6 +239,14 @@ def _entity_list_to_dict(entities: list) -> list[dict]:
     ]
 
 
+# Methods whose chunks survive the cross-encoder cut in _pin_structured_hits.
+# Shared with the agentic pool merge: a chunk re-fetched under one of these
+# methods must keep (or gain) pinnable status even if an earlier hybrid-search
+# copy of the same chunk is the one retained by dedup.
+_PINNED_METHODS = {"structured_lookup", "agentic_fetch_figure",
+                   "agentic_fetch_field", "agentic_fetch_section"}
+
+
 def _pin_structured_hits(
     ranked: list[dict],
     pre_rerank_pool: list[dict],
@@ -269,8 +277,7 @@ def _pin_structured_hits(
     vetoing. Fuzzy section fallbacks (``agentic_fetch_section_fuzzy``) are
     speculative and stay subject to semantic ranking.
     """
-    _PINNED = {"structured_lookup", "agentic_fetch_figure",
-               "agentic_fetch_field", "agentic_fetch_section"}
+    _PINNED = _PINNED_METHODS
 
     def _key(c: dict):
         return c.get("chunk_id") or c.get("id")
@@ -287,6 +294,76 @@ def _pin_structured_hits(
     rest = [c for c in ranked if c.get("prior_method") not in _PINNED]
     budget = max(budget, len(pinned))
     return (pinned + rest)[:budget]
+
+
+def _merge_agentic_pool(
+    expanded_pool: list[dict],
+    extra_chunks: list[dict],
+) -> list[dict]:
+    """Merge newly fetched chunks into the accumulated agentic pool.
+
+    First-wins dedup by chunk id, with one crucial exception: when a chunk
+    already in the pool (typically retrieved by hybrid search, method='rrf')
+    is re-fetched by a targeted agentic fetch, the KEPT copy's method is
+    promoted to the pinnable one. Without the promotion, the new copy is
+    silently dropped, _pin_structured_hits never pins the chunk, and the
+    cross-encoder keeps cutting it (byte-layout tables score poorly against
+    prose queries) — the loop stalls re-requesting a chunk it already holds.
+
+    Synthetic agentic table chunks (id ``agentic_fetch:<spec>:figN``) never
+    share an id with the indexed copy of the same table (``figN__...``), so
+    they are additionally matched by (spec, figure number): when the indexed
+    copy is already in the pool, the kept copy is promoted and the synthetic
+    duplicate is skipped instead of doubling the context. Indexed chunks are
+    never dropped by figure identity (a figure may span several indexed
+    chunks; only synthetic copies are redundant).
+    """
+    def _cid(c: dict):
+        cid = c.get("id") or c.get("chunk_id")
+        if not cid:
+            cid = ("__no_id__", c.get("section_id"),
+                   c.get("figure_number"), c.get("content_type"),
+                   (c.get("text_raw") or "")[:120])
+        return cid
+
+    def _fig_keys(c: dict) -> list[tuple]:
+        fig = c.get("figure_number")
+        if not fig or c.get("content_type") != "table":
+            return []
+        fig = str(fig).strip().lstrip("0") or "0"
+        return [(c.get("spec") or None, fig), (None, fig)]
+
+    def _promote(kept: dict, incoming: dict) -> None:
+        if (incoming.get("method") in _PINNED_METHODS
+                and kept.get("method") not in _PINNED_METHODS):
+            kept["method"] = incoming["method"]
+            kept["score"] = max(float(kept.get("score") or 0.0),
+                                float(incoming.get("score") or 0.0))
+
+    kept_by_cid: dict = {}
+    indexed_by_fig: dict = {}
+    merged: list[dict] = []
+    for chunk in expanded_pool + extra_chunks:
+        cid = _cid(chunk)
+        kept = kept_by_cid.get(cid)
+        if kept is not None:
+            _promote(kept, chunk)
+            continue
+        synthetic = isinstance(cid, str) and cid.startswith("agentic_fetch:")
+        if synthetic:
+            indexed = next(
+                (indexed_by_fig[k] for k in _fig_keys(chunk) if k in indexed_by_fig),
+                None,
+            )
+            if indexed is not None:
+                _promote(indexed, chunk)
+                continue
+        kept_by_cid[cid] = chunk
+        merged.append(chunk)
+        if not synthetic:
+            for k in _fig_keys(chunk):
+                indexed_by_fig.setdefault(k, chunk)
+    return merged
 
 
 def _result_summary(results: list[dict], limit: int = 5) -> list[dict]:
@@ -664,6 +741,42 @@ def _parse_requested_resources(parsed: object) -> dict[str, list[str]]:
     return out
 
 
+# "Figure 630", "Figures 630/631/632", "Figures 630, 631 and 642" — the way
+# the verdict's free-text `missing` field names fetchable layouts.
+_MISSING_FIG_RE = re.compile(
+    r"\bfigures?\s+(\d{1,4}(?:\s*(?:/|,|and|&)\s*\d{1,4})*)", re.IGNORECASE)
+# Dotted section ids ("8.1.6.3.1.1") and appendix ids ("B.2.1"), bare or
+# parenthesized, matching the shapes _hallucinated_section_ids accepts.
+_MISSING_SEC_RE = re.compile(r"\b(\d+(?:\.\d+)+|[A-Z](?:\.\d+)+)\b")
+
+
+def _resources_from_missing(missing: str) -> dict[str, list[str]]:
+    """Parse the verdict's free-text ``missing`` field into the same
+    {figures, fields, sections} shape as _parse_requested_resources.
+
+    The strong model that wrote the answer enumerates exactly what it lacks
+    ("Figure 630/631/632/642 layouts, DHK derivation (8.1.6.3.1.1)") — this
+    turns that shopping list into fetchable resource ids so the next
+    iteration's targeted fetch can act on it directly, instead of relying on
+    the cheap gap-analyser to re-derive a worse list from the answer text.
+    Only concrete, fetchable ids are returned; vague prose yields nothing.
+    """
+    out = {"figures": [], "fields": [], "sections": []}
+    if not missing or not isinstance(missing, str):
+        return out
+    for group in _MISSING_FIG_RE.findall(missing):
+        for fig in re.findall(r"\d{1,4}", group):
+            fig = fig.lstrip("0") or "0"
+            if fig not in out["figures"]:
+                out["figures"].append(fig)
+    for sid in _MISSING_SEC_RE.findall(missing):
+        if sid not in out["sections"]:
+            out["sections"].append(sid)
+    out["figures"] = out["figures"][:8]
+    out["sections"] = out["sections"][:5]
+    return out
+
+
 def _agentic_gap_analysis(
     *,
     query: str,
@@ -671,6 +784,7 @@ def _agentic_gap_analysis(
     used_chunks: list[dict],
     citations: list[dict],
     max_followups: int,
+    verdict_missing: str = "",
 ) -> tuple[list[str], str, dict[str, list[str]], dict | None]:
     """Ask the classifier LLM if follow-up retrieval is needed.
 
@@ -691,11 +805,26 @@ def _agentic_gap_analysis(
             f"  - Section {c.get('section_id')}" for c in halluc
         )
 
+    missing_block = ""
+    if verdict_missing:
+        missing_block = (
+            "\nThe answerer's own self-assessment says the context is missing:\n"
+            f"  {verdict_missing[:300]}\n"
+        )
+
+    # Keep the answer's tail visible: "missing information" caveats tend to
+    # land at the END of long answers, and a plain head-truncation hid them.
+    ans = answer or ""
+    if len(ans) <= 1800:
+        excerpt = ans
+    else:
+        excerpt = ans[:1200] + "\n[... middle truncated ...]\n" + ans[-600:]
+
     user_prompt = (
         f"Original question:\n  {query}\n\n"
         f"Retrieved sections fed to the answerer:\n{used_titles}\n"
-        f"{halluc_block}\n"
-        f"Answer (first 1500 chars):\n<<<\n{(answer or '')[:1500]}\n>>>\n"
+        f"{halluc_block}{missing_block}\n"
+        f"Answer (excerpt):\n<<<\n{excerpt}\n>>>\n"
     )
 
     try:
@@ -1186,6 +1315,13 @@ def _run_stage5_and_finalize(
         # sees the answer text + section titles). Seeded from the first pass;
         # refreshed after each regenerate. None -> fall back to gap-analysis.
         verdict: dict | None = first_pass_verdict
+        # Fetch memory across iterations: every (kind, id) handed to the
+        # targeted fetch is recorded here. A resource that survives a fetch
+        # attempt (the cite/missing mention persists after we pulled what we
+        # could) is unresolvable — re-requesting it every iteration just
+        # blocks convergence until the stall guard fires. Attempted resources
+        # are excluded from later fetches AND from the convergence blockers.
+        attempted_fetches: set[tuple[str, str]] = set()
 
         for iteration in range(max_iters):
             suffix = f".iter{iteration}" if config.agentic_recursive else ""
@@ -1205,13 +1341,39 @@ def _run_stage5_and_finalize(
                 _hallucinated_section_ids(citations)
                 if config.agentic_targeted_fetch else []
             )
-            if verdict is not None and verdict.get("answered") and not unfetched_cites:
+            # A cite already chased by a previous targeted fetch is
+            # unresolvable (the fetch pulled what the corpus has and the cite
+            # persisted) — it must not block convergence forever.
+            blocking_cites = [
+                s for s in unfetched_cites
+                if ("sections", s) not in attempted_fetches
+            ]
+            # An "answered" verdict with a non-empty missing field naming
+            # concrete figures/sections is a self-contradiction — those are
+            # fetchable gaps, so they block convergence and seed the next
+            # targeted fetch. Vague missing text ("more detail") parses to
+            # nothing and converges as before. Resources already attempted
+            # don't block (same unresolvable rule as cites).
+            missing_resources = (
+                _resources_from_missing(str(verdict.get("missing") or ""))
+                if verdict is not None and config.agentic_targeted_fetch
+                else {"figures": [], "fields": [], "sections": []}
+            )
+            blocking_missing = {
+                kind: [v for v in vals if (kind, v) not in attempted_fetches]
+                for kind, vals in missing_resources.items()
+            }
+            if (verdict is not None and verdict.get("answered")
+                    and not blocking_cites
+                    and not any(blocking_missing.values())):
                 converged = True
+                unresolvable = [s for s in unfetched_cites if s not in blocking_cites]
                 trace.append(
                     PipelineStage(
                         stage=f"agentic.verdict_converged{suffix}",
                         input={"iteration": iteration},
                         output={"verdict": verdict,
+                                "unresolvable_cites": unresolvable,
                                 "note": "generator self-assessment marked the answer "
                                         "complete; stopping refinement"},
                         took_ms=0.0,
@@ -1226,6 +1388,7 @@ def _run_stage5_and_finalize(
                 used_chunks=context_chunks,
                 citations=citations,
                 max_followups=config.agentic_max_followups,
+                verdict_missing=str((verdict or {}).get("missing") or ""),
             )
             took_gap = time.time() - start
             if gap_call:
@@ -1234,11 +1397,26 @@ def _run_stage5_and_finalize(
             targeted_requested = (
                 requested if config.agentic_targeted_fetch else {"figures": [], "fields": [], "sections": []}
             )
+            # The verdict's missing field is the strong model's own shopping
+            # list — fetch what it names even if the gap-analyser didn't ask.
+            for kind, vals in blocking_missing.items():
+                for v in vals:
+                    if v not in targeted_requested[kind]:
+                        targeted_requested[kind].append(v)
             # Sections the answer cited but we never retrieved are gaps by
             # definition — fetch them even if the gap-analyser didn't ask.
-            for sid in unfetched_cites:
+            for sid in blocking_cites:
                 if sid not in targeted_requested["sections"]:
                     targeted_requested["sections"].append(sid)
+            # Drop resources already chased in a previous iteration (the
+            # fetch ran; re-fetching can't add anything), then record the
+            # rest so the next iteration treats them as attempted.
+            dropped_attempted = 0
+            for kind, vals in targeted_requested.items():
+                kept_vals = [v for v in vals if (kind, v) not in attempted_fetches]
+                dropped_attempted += len(vals) - len(kept_vals)
+                targeted_requested[kind] = kept_vals
+                attempted_fetches.update((kind, v) for v in kept_vals)
             gap_has_work = bool(followups) or any(targeted_requested.values())
             trace.append(
                 PipelineStage(
@@ -1256,8 +1434,18 @@ def _run_stage5_and_finalize(
             )
 
             if not gap_has_work:
-                converged = True
-                break
+                answer_incomplete = bool(unfetched_cites) or (
+                    verdict is not None and not verdict.get("answered")
+                )
+                if not (answer_incomplete and dropped_attempted):
+                    converged = True
+                    break
+                # The answer is still incomplete but every named resource was
+                # already chased in a previous iteration. Converging here
+                # would keep an answer that defers to sources the loop tried
+                # and failed to fetch; instead fall through with an empty
+                # fetch — the unchanged context trips the stall guard below,
+                # which runs the one context_is_final wrap-up pass.
 
             extra_chunks: list[dict] = []
 
@@ -1356,18 +1544,7 @@ def _run_stage5_and_finalize(
                 extra_chunks.extend(fq_chunks)
 
             start = time.time()
-            seen2: set = set()
-            merged_pool: list[dict] = []
-            for chunk in expanded_pool + extra_chunks:
-                cid = chunk.get("id") or chunk.get("chunk_id")
-                if not cid:
-                    cid = ("__no_id__", chunk.get("section_id"),
-                           chunk.get("figure_number"), chunk.get("content_type"),
-                           (chunk.get("text_raw") or "")[:120])
-                if cid not in seen2:
-                    seen2.add(cid)
-                    merged_pool.append(chunk)
-            expanded_pool = merged_pool
+            expanded_pool = _merge_agentic_pool(expanded_pool, extra_chunks)
             took_merge = time.time() - start
 
             start = time.time()

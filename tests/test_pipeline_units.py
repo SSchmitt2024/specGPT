@@ -908,6 +908,83 @@ def test_pin_structured_hits_noop_without_structured():
 
 
 # ---------------------------------------------------------------------------
+# agentic pool merge: dedup collisions promote pinnable methods
+
+def test_merge_agentic_pool_promotes_method_on_id_collision():
+    from src.pipeline.orchestrator import _merge_agentic_pool
+    pool = [{"id": "fig630__c0", "content_type": "table",
+             "figure_number": "630", "method": "rrf", "score": 0.5}]
+    extra = [{"id": "fig630__c0", "content_type": "table",
+              "figure_number": "630", "method": "agentic_fetch_section",
+              "score": 0.9}]
+    out = _merge_agentic_pool(pool, extra)
+    assert len(out) == 1
+    assert out[0]["method"] == "agentic_fetch_section"
+    assert out[0]["score"] == 0.9
+
+
+def test_merge_agentic_pool_synthetic_figure_promotes_indexed_copy():
+    from src.pipeline.orchestrator import _merge_agentic_pool
+    pool = [{"id": "fig632__c0", "content_type": "table", "spec": "base",
+             "figure_number": "632", "method": "rrf", "score": 0.4}]
+    extra = [{"id": "agentic_fetch:base:fig632",
+              "chunk_id": "agentic_fetch:base:fig632",
+              "content_type": "table", "spec": "base",
+              "figure_number": "632", "method": "agentic_fetch_figure",
+              "score": 1.0}]
+    out = _merge_agentic_pool(pool, extra)
+    assert len(out) == 1
+    assert out[0]["id"] == "fig632__c0"
+    assert out[0]["method"] == "agentic_fetch_figure"
+
+
+def test_merge_agentic_pool_never_collapses_indexed_chunks():
+    from src.pipeline.orchestrator import _merge_agentic_pool
+    pool = [{"id": "fig630__c0", "content_type": "table",
+             "figure_number": "630", "method": "rrf", "score": 0.4}]
+    extra = [{"id": "fig630__c1", "content_type": "table",
+              "figure_number": "630", "method": "rrf", "score": 0.4}]
+    out = _merge_agentic_pool(pool, extra)
+    assert [c["id"] for c in out] == ["fig630__c0", "fig630__c1"]
+
+
+def test_merge_agentic_pool_keeps_pinned_method_over_rrf_refetch():
+    from src.pipeline.orchestrator import _merge_agentic_pool
+    pool = [{"id": "s1", "method": "structured_lookup", "score": 1.0}]
+    extra = [{"id": "s1", "method": "rrf", "score": 0.3}]
+    out = _merge_agentic_pool(pool, extra)
+    assert len(out) == 1
+    assert out[0]["method"] == "structured_lookup"
+
+
+# ---------------------------------------------------------------------------
+# verdict.missing -> fetchable resources
+
+def test_resources_from_missing_parses_figures_and_sections():
+    from src.pipeline.orchestrator import _resources_from_missing
+    out = _resources_from_missing(
+        "Figure 630/631/632/642 layouts, DHK derivation (8.1.6.3.1.1), "
+        "Random Nonce Request (8.1.6.3.2)"
+    )
+    assert out["figures"] == ["630", "631", "632", "642"]
+    assert out["sections"] == ["8.1.6.3.1.1", "8.1.6.3.2"]
+
+
+def test_resources_from_missing_parses_comma_and_lists():
+    from src.pipeline.orchestrator import _resources_from_missing
+    out = _resources_from_missing("Byte-level layout of Figures 632, 633")
+    assert out["figures"] == ["632", "633"]
+    assert out["sections"] == []
+
+
+def test_resources_from_missing_vague_text_yields_nothing():
+    from src.pipeline.orchestrator import _resources_from_missing
+    for vague in ["", "needs more detail on key management", None]:
+        out = _resources_from_missing(vague)
+        assert not any(out.values()), f"should be empty for {vague!r}: {out}"
+
+
+# ---------------------------------------------------------------------------
 # search guards
 
 def test_is_empty_query_catches_punctuation_and_whitespace():
