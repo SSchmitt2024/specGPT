@@ -1574,7 +1574,7 @@ a { color: var(--accent); text-decoration: none; }
 .sources-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:11px; padding:0 2px; }
 .sources-head h3 { font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--t-subtle); font-weight:600; white-space:nowrap; }
 .sources-count { font-size:11px; color:var(--t-faint); font-family:var(--mono); }
-.src-list { display:flex; flex-direction:column; gap:8px; }
+.src-list { display:flex; flex-direction:column; gap:8px; max-height:520px; overflow-y:auto; padding-right:4px; }
 .src { display:block; text-align:left; width:100%; background:var(--surface); border:1px solid var(--border);
   border-radius:var(--radius-sm); padding:11px 12px; transition:all .14s; box-shadow:var(--shadow-sm); cursor:default; }
 .src:hover, .src.hot { border-color:var(--accent-bd); box-shadow:var(--shadow-sm), 0 0 0 3px var(--accent-soft); transform:translateY(-1px); }
