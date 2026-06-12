@@ -2,8 +2,7 @@
 # Source: qa_log (67 rows), flagged_answers (3), recent commits, PIPELINE_DESIGN_CHOICES.md
 # Diagnosed: 2026-06-11
 # STATUS: BUGs 1-4 fixed in PR #16 (fix/agentic-loop-convergence, merged 2026-06-11).
-# Remaining: see Secondary Observations.
-
+# Remaining: see Secs
 ## Summary
 
 All three flags and the worst qa_log rows share one signature: the model correctly names
