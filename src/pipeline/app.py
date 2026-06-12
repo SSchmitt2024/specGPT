@@ -108,7 +108,7 @@ from src.pipeline.orchestrator import (
     PRESETS,
     DEFAULT_PRESET,
 )
-from src.pipeline.retriever import load_field_index
+from src.pipeline.retriever import load_field_index, load_tables_by_figure
 
 
 def _generation_error_detail(e: GenerationError, request_id: str, *, include_trace: bool) -> dict:
@@ -1011,6 +1011,19 @@ async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
             "note": "Agentic mode only",
         },
     }
+
+
+@app.get("/api/figure/{spec}/{figure_number}")
+async def render_figure_endpoint(spec: str, figure_number: str, _: bool = Depends(require_auth)) -> dict:
+    """Parsed table JSON for one figure, for the in-app figure render popup."""
+    for s in _define_specs(spec):
+        try:
+            table = load_tables_by_figure(s).get(figure_number)
+        except Exception:  # noqa: BLE001 - a corpus without table data just contributes nothing
+            continue
+        if table:
+            return table
+    raise HTTPException(status_code=404, detail="Figure not found")
 
 
 # ── Field-acronym definitions (answer popovers) ────────────────────────────
@@ -4844,6 +4857,75 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             pop.style.left = left + "px";
             pop.style.top = top + "px";
         }
+        function showFigPop(chip, f) {
+            closeCitePop();
+            if (!chip || !f) return;
+            var pop = document.createElement("div");
+            pop.className = "cite-pop";
+
+            var title = document.createElement("div");
+            title.className = "cite-pop-title";
+            var sid = document.createElement("span");
+            sid.className = "mono";
+            sid.textContent = "Figure " + String(f.figure_number || "");
+            title.appendChild(sid);
+            if (f.caption) {
+                title.appendChild(document.createTextNode("  " + f.caption));
+            }
+            pop.appendChild(title);
+
+            var foot = document.createElement("div");
+            foot.className = "cite-pop-foot";
+            var page = document.createElement("span");
+            page.className = "cite-pop-page";
+            if (f.pdf_pages && f.pdf_pages.length > 0) {
+                var p0 = parseInt(f.pdf_pages[0], 10);
+                if (!isNaN(p0)) page.textContent = "p. " + (p0 + 1);
+            }
+            foot.appendChild(page);
+
+            var actions = document.createElement("div");
+            actions.className = "cite-pop-actions";
+            actions.style.display = "flex";
+            actions.style.gap = "6px";
+
+            var renderBtn = document.createElement("button");
+            renderBtn.type = "button";
+            renderBtn.className = "cite-pop-open";
+            renderBtn.textContent = "Render";
+            renderBtn.addEventListener("click", function (e) {
+                e.stopPropagation();
+                openFigureRenderPopup(f);
+                closeCitePop();
+            });
+            actions.appendChild(renderBtn);
+
+            if (pdfPageJumpSupported()) {
+                var btn = document.createElement("button");
+                btn.type = "button";
+                btn.className = "cite-pop-open";
+                btn.textContent = "Open PDF";
+                btn.addEventListener("click", function (e) {
+                    e.stopPropagation();
+                    openFigurePdf(f);
+                });
+                actions.appendChild(btn);
+            }
+            foot.appendChild(actions);
+            pop.appendChild(foot);
+
+            document.body.appendChild(pop);
+            _citePop = pop;
+            // Anchor under the chip, clamped to the viewport.
+            var r = chip.getBoundingClientRect();
+            var left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+            var top = r.bottom + 8;
+            if (top + pop.offsetHeight > window.innerHeight - 8) {
+                top = Math.max(8, r.top - pop.offsetHeight - 8);
+            }
+            pop.style.left = left + "px";
+            pop.style.top = top + "px";
+        }
         document.addEventListener("click", function (e) {
             if (!_citePop) return;
             if (_citePop.contains(e.target)) return;
@@ -5105,29 +5187,52 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         }
         function renderDefPop(el, term, matches) {
             closeCitePop();
-            var pop = document.createElement("div");
-            pop.className = "cite-pop";
-
             var m = (matches && matches.length) ? matches[0] : null;
-            var title = document.createElement("div");
-            title.className = "cite-pop-title";
-            var acr = document.createElement("span");
-            acr.className = "mono";
-            acr.textContent = term;
-            title.appendChild(acr);
-            if (m && m.full_name) {
-                title.appendChild(document.createTextNode("  " + m.full_name));
-            }
-            pop.appendChild(title);
+            const key = "def-" + term;
+            const existing = _stagePopups.find(function(p) { return p.key === key; });
+            if (existing) { _raisePopup(existing); return; }
 
-            var body = document.createElement("div");
-            body.className = "cite-pop-body";
+            const pop = document.createElement("div");
+            pop.className = "stage-popup";
+            pop.setAttribute("role", "dialog");
+            pop.style.width = "420px";
+
+            const header = document.createElement("div");
+            header.className = "stage-popup-header";
+
+            const titleEl = document.createElement("span");
+            titleEl.className = "stage-popup-title";
+            titleEl.innerHTML = "<span class='mono'>" + escapeHtml(term) + "</span>" + (m && m.full_name ? "  " + escapeHtml(m.full_name) : "");
+
+            const actions = document.createElement("div");
+            actions.className = "stage-popup-actions";
+
+            const closeAllBtn = document.createElement("button");
+            closeAllBtn.type = "button";
+            closeAllBtn.className = "stage-popup-close-all";
+            closeAllBtn.textContent = "Close all";
+
+            const closeBtn = document.createElement("button");
+            closeBtn.type = "button";
+            closeBtn.className = "stage-popup-close";
+            closeBtn.setAttribute("data-tip", "Close this");
+            closeBtn.innerHTML = "&#x2715;";
+
+            actions.appendChild(closeAllBtn);
+            actions.appendChild(closeBtn);
+            header.appendChild(titleEl);
+            header.appendChild(actions);
+
+            const body = document.createElement("div");
+            body.className = "stage-popup-body";
             body.textContent = (m && m.description) || "No definition found in the field index.";
-            pop.appendChild(body);
 
             if (m) {
                 var foot = document.createElement("div");
                 foot.className = "cite-pop-foot";
+                foot.style.marginTop = "12px";
+                foot.style.borderTop = "1px solid var(--border)";
+                foot.style.paddingTop = "8px";
                 var ctx = document.createElement("span");
                 ctx.className = "cite-pop-page";
                 var bits = [];
@@ -5138,23 +5243,42 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 if (m.figure_number) bits.push("Figure " + m.figure_number);
                 if (m.offset) bits.push((m.offset_type === "bits" ? "bits " : "offset ") + m.offset);
                 if (matches.length > 1) bits.push("+" + (matches.length - 1) + " more context" + (matches.length > 2 ? "s" : ""));
-                ctx.textContent = bits.join(" \\u00b7 ");
+                ctx.textContent = bits.join(" \u00b7 ");
                 foot.appendChild(ctx);
-                pop.appendChild(foot);
+                body.appendChild(foot);
             }
 
+            pop.appendChild(header);
+            pop.appendChild(body);
             document.body.appendChild(pop);
-            pop._defFor = el;   // lets a second click on the same term toggle it shut
-            _citePop = pop;
-            // Anchor under the token, clamped to the viewport (same as cite-pop).
+
             var r = el.getBoundingClientRect();
-            var left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+            var left = Math.max(8, Math.min(r.left, window.innerWidth - 420 - 8));
             var top = r.bottom + 8;
             if (top + pop.offsetHeight > window.innerHeight - 8) {
                 top = Math.max(8, r.top - pop.offsetHeight - 8);
             }
             pop.style.left = left + "px";
             pop.style.top = top + "px";
+
+            const rec = {el: pop, key};
+            _stagePopups.push(rec);
+
+            closeBtn.addEventListener("click", function(ev) { ev.stopPropagation(); closeStagePopup(rec); });
+            closeAllBtn.addEventListener("click", function(ev) { ev.stopPropagation(); closeAllStagePopups(); });
+            closeBtn.addEventListener("mouseenter", function() { _showPopupTip(closeBtn); });
+            closeBtn.addEventListener("mouseleave", _hidePopupTip);
+            closeBtn.addEventListener("focus", function() { _showPopupTip(closeBtn); });
+            closeBtn.addEventListener("blur", _hidePopupTip);
+            pop.addEventListener("mousedown", function() { _raisePopup(rec); });
+            _makePopupDraggable(pop, header);
+            _raisePopup(rec);
+
+            while (_stagePopups.length > STAGE_POPUP_CAP) {
+                const oldest = _stagePopups.shift();
+                if (oldest.el && oldest.el.parentNode) oldest.el.parentNode.removeChild(oldest.el);
+            }
+            _updatePopupMultiState();
         }
         function showDefPop(el) {
             var term = el.getAttribute("data-term");
@@ -5174,9 +5298,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         document.addEventListener("click", function (e) {
             var el = e.target.closest && e.target.closest("code.def-term");
             if (!el) return;
-            // Clicking the term whose popover is already open toggles it shut
-            // (the dismiss handler skips def-term clicks, so do it here).
-            if (_citePop && _citePop._defFor === el) { closeCitePop(); return; }
             showDefPop(el);
         });
         document.addEventListener("keydown", function (e) {
@@ -5243,6 +5364,162 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 if (!isNaN(p0)) url += "#page=" + (p0 + 1);
             }
             openInNewTab(url);
+        }
+
+        async function openFigureRenderPopup(f) {
+            if (!f) return;
+            var specId = f.spec
+                || (window._specData && window._specData[0] && window._specData[0].id)
+                || "base";
+            var num = encodeURIComponent(String(f.figure_number || "").trim());
+            var s = encodeURIComponent(specId);
+            
+            try {
+                var res = await fetch("/api/figure/" + s + "/" + num);
+                if (!res.ok) {
+                    var text = await res.text();
+                    alert("Could not load figure: " + text);
+                    return;
+                }
+                var table = await res.json();
+                
+                const figNum = String(f.figure_number || "").trim();
+                const key = "fig-" + specId + "-" + figNum;
+                const existing = _stagePopups.find(function(p) { return p.key === key; });
+                if (existing) { _raisePopup(existing); return; }
+
+                const el = document.createElement("div");
+                el.className = "stage-popup";
+                el.setAttribute("role", "dialog");
+                el.style.width = "auto";
+                el.style.maxWidth = "90vw";
+                el.style.maxHeight = "90vh";
+
+                const header = document.createElement("div");
+                header.className = "stage-popup-header";
+
+                const titleEl = document.createElement("span");
+                titleEl.className = "stage-popup-title";
+                titleEl.textContent = "Figure " + figNum + (table.caption ? " — " + table.caption : "");
+
+                const actions = document.createElement("div");
+                actions.className = "stage-popup-actions";
+
+                const closeAllBtn = document.createElement("button");
+                closeAllBtn.type = "button";
+                closeAllBtn.className = "stage-popup-close-all";
+                closeAllBtn.textContent = "Close all";
+
+                const closeBtn = document.createElement("button");
+                closeBtn.type = "button";
+                closeBtn.className = "stage-popup-close";
+                closeBtn.setAttribute("data-tip", "Close this");
+                closeBtn.innerHTML = "&#x2715;";
+
+                actions.appendChild(closeAllBtn);
+                actions.appendChild(closeBtn);
+                header.appendChild(titleEl);
+                header.appendChild(actions);
+
+                const body = document.createElement("div");
+                body.className = "stage-popup-body";
+                body.style.padding = "0";
+                
+                let hhtml = "";
+                if (table.headers && table.rows) {
+                    let hasAcronyms = false;
+                    const newRows = table.rows.map(function(r) {
+                        let newR = r.slice();
+                        let extracted = "";
+                        for (let i = 0; i < newR.length; i++) {
+                            let cell = String(newR[i]);
+                            // Look for "Name (ACRONYM): Description" in any cell
+                            let m = cell.match(/^([^\\n:(]{1,100}?)\\(([^)\\n]{1,30})\\)\\s*:(.*)$/s);
+                            if (m) {
+                                extracted = m[2].trim();
+                                newR[i] = m[1].trim() + ":" + m[3];
+                                hasAcronyms = true;
+                                break;
+                            }
+                        }
+                        return [extracted].concat(newR);
+                    });
+                    
+                    if (hasAcronyms) {
+                        table.headers = ["Symbol"].concat(table.headers);
+                        table.rows = newRows;
+                    }
+                }
+
+                if (table.headers && table.headers.length) {
+                    hhtml = "<thead><tr>" + table.headers.map(function(h) { return "<th>" + escapeHtml(h) + "</th>"; }).join("") + "</tr></thead>";
+                }
+                let bhtml = "<tbody>";
+                
+                function renderCellContent(c) {
+                    c = String(c);
+                    if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+                        try { return DOMPurify.sanitize(marked.parse(c)); } catch (e) {}
+                    }
+                    return escapeHtml(c);
+                }
+
+                if (table.rows && table.rows.length) {
+                    table.rows.forEach(function(r) {
+                        bhtml += "<tr>" + r.map(function(c) { return "<td>" + renderCellContent(c) + "</td>"; }).join("") + "</tr>";
+                    });
+                }
+                bhtml += "</tbody>";
+                
+                body.innerHTML = `
+                <div style="padding: 16px;">
+                    <style>
+                        .fig-rendered-table { border-collapse: collapse; font-size: 13px; width: 100%; font-family: var(--sans); }
+                        .fig-rendered-table th, .fig-rendered-table td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+                        .fig-rendered-table th { background: var(--surface-2); font-weight: 600; color: var(--t-muted); }
+                        .fig-rendered-table p { margin: 0 0 8px 0; }
+                        .fig-rendered-table p:last-child { margin: 0; }
+                        .fig-rendered-table table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12px; }
+                        .fig-rendered-table table th, .fig-rendered-table table td { border: 1px solid var(--border); padding: 4px 6px; }
+                    </style>
+                    <table class="fig-rendered-table">${hhtml}${bhtml}</table>
+                </div>
+                `;
+
+                el.appendChild(header);
+                el.appendChild(body);
+                document.body.appendChild(el);
+
+                const w = el.offsetWidth || 480;
+                const h = el.offsetHeight || 300;
+                const off = _stagePopups.length * 14;
+                const baseX = window.innerWidth / 2 - w / 2 + off;
+                const baseY = 90 + off;
+                el.style.left = Math.max(8, Math.min(baseX, window.innerWidth  - w - 8)) + "px";
+                el.style.top  = Math.max(8, Math.min(baseY, window.innerHeight - h - 8)) + "px";
+
+                const rec = {el, key};
+                _stagePopups.push(rec);
+
+                closeBtn.addEventListener("click", function(ev) { ev.stopPropagation(); closeStagePopup(rec); });
+                closeAllBtn.addEventListener("click", function(ev) { ev.stopPropagation(); closeAllStagePopups(); });
+                closeBtn.addEventListener("mouseenter", function() { _showPopupTip(closeBtn); });
+                closeBtn.addEventListener("mouseleave", _hidePopupTip);
+                closeBtn.addEventListener("focus", function() { _showPopupTip(closeBtn); });
+                closeBtn.addEventListener("blur", _hidePopupTip);
+                el.addEventListener("mousedown", function() { _raisePopup(rec); });
+                _makePopupDraggable(el, header);
+                _raisePopup(rec);
+
+                while (_stagePopups.length > STAGE_POPUP_CAP) {
+                    const oldest = _stagePopups.shift();
+                    if (oldest.el && oldest.el.parentNode) oldest.el.parentNode.removeChild(oldest.el);
+                }
+                _updatePopupMultiState();
+
+            } catch (e) {
+                alert("Error rendering figure: " + e.message);
+            }
         }
 
         /* Open the official spec PDF at a figure's page (same 0-indexed → +1
@@ -5320,7 +5597,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 c.addEventListener("mouseenter", function () { setActiveFig(c.getAttribute("data-fig")); });
                 c.addEventListener("mouseleave", function () { setActiveFig(null); });
                 c.addEventListener("click", function () {
-                    openFigurePdf(figMap[c.getAttribute("data-fig")]);
+                    showFigPop(c, figMap[c.getAttribute("data-fig")]);
                 });
             });
         }
