@@ -5162,8 +5162,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             fetch("/api/define/terms?spec=" + encodeURIComponent(spec))
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .then(function (data) {
+                    // A non-ok response must not cache an empty set, or one
+                    // transient failure disables popovers for the session.
+                    if (!data) { delete _defTerms[spec]; return; }
                     var waiting = _defTerms[spec];
-                    var set = new Set((data && data.terms) || []);
+                    var set = new Set(data.terms || []);
                     _defTerms[spec] = set;
                     (Array.isArray(waiting) ? waiting : []).forEach(function (fn) { fn(set); });
                 })
@@ -5377,8 +5380,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             try {
                 var res = await fetch("/api/figure/" + s + "/" + num);
                 if (!res.ok) {
-                    var text = await res.text();
-                    alert("Could not load figure: " + text);
+                    var msg = "HTTP " + res.status;
+                    try { msg = (await res.json()).detail || msg; } catch (e) {}
+                    alert("Could not load figure: " + msg);
                     return;
                 }
                 var table = await res.json();
