@@ -1691,6 +1691,7 @@ def _run_stage5_and_finalize(
                                 input={"chunk_count": len(reranked2),
                                        "model": config.agentic_model},
                                 output={"error_type": type(e).__name__,
+                                        "error": str(e)[:500],
                                         "note": "kept prior answer"},
                                 took_ms=took_fp * 1000,
                             )
@@ -1755,7 +1756,10 @@ def _run_stage5_and_finalize(
                         stage=f"agentic.regenerate{suffix}",
                         input={"chunk_count": len(reranked2),
                                "model": config.agentic_model},
+                        # Record the API message, not just the class: a swallowed
+                        # BadRequestError with no message is undiagnosable later.
                         output={"error_type": type(e).__name__,
+                                "error": str(e)[:500],
                                 "note": "kept prior answer"},
                         took_ms=took_g2 * 1000,
                     )

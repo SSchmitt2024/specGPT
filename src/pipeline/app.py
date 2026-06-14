@@ -526,6 +526,26 @@ async def logout() -> Response:
     return resp
 
 
+# A figure-reference span in answer prose: "Figure 328", "Figures 630 and 631",
+# "Fig. 632", "Figures 630, 631, and 632". Captures the trailing number list so
+# every figure in a list/pair is recognised, not just the one right after the
+# "Figure(s)" keyword. Kept permissive on the connectors the LLM uses.
+_ANSWER_FIG_REF_RE = re.compile(
+    r"\bFig(?:ure)?s?\.?\s+(\d{1,4}(?:(?:\s*(?:,|and|&|/|or)\s*)+\d{1,4})*)",
+    re.IGNORECASE,
+)
+
+
+def _referenced_figure_numbers(answer: str) -> set[str]:
+    """Normalised figure numbers the answer text references, across singular,
+    plural, abbreviated, and comma/and-separated list phrasings."""
+    out: set[str] = set()
+    for m in _ANSWER_FIG_REF_RE.finditer(answer or ""):
+        for num in re.findall(r"\d{1,4}", m.group(1)):
+            out.add(num.lstrip("0") or "0")
+    return out
+
+
 def _figures_from_sources(result: dict) -> list[dict]:
     """Slim, deduped list of figures the answer actually CITES, so the UI can
     link inline "Figure N" mentions to the PDF and list them in the sidebar.
@@ -535,6 +555,7 @@ def _figures_from_sources(result: dict) -> list[dict]:
     sources = result.get("sources") or []
     answer = result.get("answer") or ""
     default_spec = (result.get("config") or {}).get("spec")
+    referenced = _referenced_figure_numbers(answer)
     seen: set[str] = set()
     figures: list[dict] = []
     for ch in sources:
@@ -547,10 +568,10 @@ def _figures_from_sources(result: dict) -> list[dict]:
         pages = ch.get("pdf_pages") or []
         if not pages:
             continue
-        # Only surface figures the answer references ("Figure 328", "[Figure
-        # 328]", "[§Figure 328]") - not every figure that happened to be
-        # retrieved - so chips and the sidebar reflect what was actually cited.
-        if not re.search(r"Figure\s+" + re.escape(fn) + r"\b", answer, re.IGNORECASE):
+        # Only surface figures the answer references ("Figure 328", "Figures 630
+        # and 631", "Fig. 632") - not every figure that happened to be retrieved
+        # - so chips and the sidebar reflect what was actually cited.
+        if (fn.lstrip("0") or "0") not in referenced:
             continue
         seen.add(fn)
         figures.append({
