@@ -976,6 +976,7 @@ def generate(
     *,
     model: str = DEFAULT_MODEL,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    figure_reserve_tokens: int = DEFAULT_FIGURE_RESERVE_TOKENS,
     system_prompt: str | None = None,
     max_tokens: int = 1024,
     timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -1026,6 +1027,7 @@ def generate(
         query,
         context_chunks,
         max_context_tokens=max_context_tokens,
+        figure_reserve_tokens=figure_reserve_tokens,
     )
 
     # If every retrieved chunk overflowed the token budget, used_chunks is

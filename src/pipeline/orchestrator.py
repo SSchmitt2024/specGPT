@@ -127,6 +127,12 @@ class PipelineConfig:
     # load per query.
     expand_figure_refs: bool = True
     figure_ref_expansion_cap: int = 6
+    # Additive context headroom (tokens) reserved exclusively for the referenced
+    # figure tables expand_figure_refs / agentic fetches pull in, so a
+    # prose-saturated context can't starve them out of the model's view. Applies
+    # ON TOP OF llm_max_context_tokens / agentic_max_context_tokens; 0 disables
+    # it. See generator.assemble_context.
+    figure_reserve_tokens: int = 3000
 
     # Generation parameters
     llm_model: str = "claude-sonnet-4-6"
@@ -555,6 +561,8 @@ PRESETS: dict[str, dict] = {
             # Fast keeps the lean output budget; quick lookups don't need
             # long procedural answers and this keeps cost/latency flat.
             "llm_max_output_tokens": 1024,
+            # Leaner figure reserve to match Fast's flat cost/latency profile.
+            "figure_reserve_tokens": 1500,
             "vector_topk": 6,
             "tsvector_topk": 6,
             "bm25_topk": 6,
@@ -583,6 +591,8 @@ PRESETS: dict[str, dict] = {
             "agentic_model": "claude-opus-4-7",
             "llm_model": "claude-sonnet-4-6",
             "llm_max_output_tokens": 2048,
+            # Keep in sync with the PipelineConfig default (Balanced IS default).
+            "figure_reserve_tokens": 3000,
             "vector_topk": 5,
             "tsvector_topk": 5,
             "bm25_topk": 5,
@@ -614,6 +624,8 @@ PRESETS: dict[str, dict] = {
             "agentic_model": "claude-sonnet-4-6",
             "llm_model": "claude-sonnet-4-6",
             "llm_max_output_tokens": 2048,
+            # Full figure reserve — Thorough optimises for completeness.
+            "figure_reserve_tokens": 3000,
             "vector_topk": 8,
             "tsvector_topk": 8,
             "bm25_topk": 8,
@@ -1646,6 +1658,7 @@ def _run_stage5_and_finalize(
                             query, reranked2,
                             model=config.agentic_model,
                             max_context_tokens=config.agentic_max_context_tokens,
+                            figure_reserve_tokens=config.figure_reserve_tokens,
                             max_tokens=config.agentic_max_output_tokens,
                             context_is_final=True,
                         )
@@ -1705,6 +1718,7 @@ def _run_stage5_and_finalize(
                     query, reranked2,
                     model=config.agentic_model,
                     max_context_tokens=config.agentic_max_context_tokens,
+                    figure_reserve_tokens=config.figure_reserve_tokens,
                     max_tokens=config.agentic_max_output_tokens,
                     emit_verdict=True,
                 )
@@ -2201,6 +2215,7 @@ def orchestrate(
             retrieved_chunks,
             model=config.llm_model,
             max_context_tokens=config.llm_max_context_tokens,
+            figure_reserve_tokens=config.figure_reserve_tokens,
             max_tokens=config.llm_max_output_tokens,
             # Only the agentic loop consumes the completeness verdict; skip the
             # extra instruction/tokens when the loop won't run.
