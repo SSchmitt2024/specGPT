@@ -47,8 +47,37 @@ logger = logging.getLogger(__name__)
 # Model defaults
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
+# Additive headroom (on top of DEFAULT_MAX_CONTEXT_TOKENS) reserved for the
+# deferred figure tables the prose references, so a prose-saturated context
+# can't starve them out of the model's view. Sized to fit a full
+# figure_ref_expansion batch (cap ~6) of figures each trimmed to
+# DEFAULT_FIGURE_TRIM_TOKENS (6 * 450 = 2700, with slack).
+DEFAULT_FIGURE_RESERVE_TOKENS = 3000
+# Per-figure trim cap inside the reserve. A reserved figure only needs to be
+# SEEN and identifiable so the model can cite "[Figure N]" and describe it; the
+# header + caption + first rows of a byte-layout table do that. A tight cap lets
+# the whole referenced batch fit instead of one 25k-token table evicting the
+# rest. Deep full-table detail is the agentic loop's job (16k budget).
+DEFAULT_FIGURE_TRIM_TOKENS = 450
 DEFAULT_REQUEST_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 3
+
+# Methods that mark a chunk as a deferred figure pull (the figure tables the
+# prose points at, fetched after ranking). These get the assemble_context
+# figure reserve. Kept in sync with orchestrator._PINNED_METHODS for figures.
+_FIGURE_RESERVE_METHODS = {"figure_ref_expansion", "agentic_fetch_figure"}
+
+
+def _is_reserved_figure(chunk: dict) -> bool:
+    """True if the chunk is a deferred figure pull eligible for the reserve.
+
+    Checks both ``method`` (first-pass figure_ref_expansion, appended after the
+    rerank) and ``prior_method`` (agentic figure fetches, which pass through the
+    reranker that stamps the pre-rerank method onto ``prior_method``)."""
+    return (
+        chunk.get("method") in _FIGURE_RESERVE_METHODS
+        or chunk.get("prior_method") in _FIGURE_RESERVE_METHODS
+    )
 
 # DeepThought is UNH's on-prem OpenAI-compatible LLM gateway. The dropdown
 # value "deepthought" is the public model id used by the UI; the underlying
@@ -285,16 +314,30 @@ def assemble_context(
     context_chunks: list[dict],
     *,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    figure_reserve_tokens: int = DEFAULT_FIGURE_RESERVE_TOKENS,
 ) -> tuple[str, list[dict]]:
     """
     Assemble context from chunks, respecting token budget.
 
     Large tables are trimmed; chunks are included in order until budget is hit.
 
+    Referenced-figure chunks (deferred figure tables the prose points at, pulled
+    in by ``_expand_referenced_figures`` / ``agentic_fetch_figure``) get a
+    SEPARATE additive ``figure_reserve_tokens`` budget. The runtime appends them
+    to the tail of the chunk list, so on a tight prose-heavy budget the in-order
+    fill would exhaust ``max_context_tokens`` before reaching them and the model
+    would reference "Figure 632" while never seeing the table — it cannot cite
+    what it never received. The reserve is headroom on top of the prose budget,
+    so figures never displace a ranked prose hit and prose never starves the
+    figures the answer depends on.
+
     Args:
         query: the user's question (for context setting).
         context_chunks: retrieved/ranked chunks from retrieval stage.
-        max_context_tokens: token budget for context.
+        max_context_tokens: token budget for the ranked (prose-first) context.
+        figure_reserve_tokens: additional budget reserved for referenced-figure
+            chunks so they survive a prose-saturated context. Set to 0 to
+            disable the reserve (pre-fix behaviour).
 
     Returns:
         (formatted_context, used_chunks) where formatted_context is ready for
@@ -302,26 +345,38 @@ def assemble_context(
     """
     used_chunks: list[dict] = []
     context_lines: list[str] = []
-    total_tokens = 0
-    chunk_no = 0
+    seen_ids: set = set()
+    # chunk_no is shared so fence numbering stays contiguous across both passes.
+    counter = {"n": 0}
 
-    for chunk in context_chunks:
-        # Trim large tables
-        trimmed = _trim_table_chunk(chunk, max_tokens=max_context_tokens // 3)
+    def _admit(chunk: dict, *, running_tokens: int, budget: int,
+               trim_tokens: int) -> int | None:
+        """Emit one chunk if it fits under ``budget``. Returns the new running
+        token total, or None if it was skipped (didn't fit, empty, or dup)."""
+        cid = chunk.get("id")
+        # Dedup across the two passes by chunk id, falling back to object
+        # identity so an id-less chunk processed in both passes isn't emitted
+        # twice (both passes iterate the same context_chunks objects).
+        dedup_key = cid if cid is not None else id(chunk)
+        if dedup_key in seen_ids:
+            return None
+        trimmed = _trim_table_chunk(chunk, max_tokens=trim_tokens)
         chunk_text = trimmed.get("text_raw", "")
+        # Skip empty-bodied chunks: a fenced header with no body grounds nothing
+        # and just invites the model to cite an empty figure.
+        if not chunk_text.strip():
+            return None
         chunk_tokens = _estimate_tokens(chunk_text)
-
-        # Skip oversized chunks instead of breaking — lower-ranked chunks that
-        # fit the remaining budget are still useful for grounding the answer.
-        if total_tokens + chunk_tokens > max_context_tokens:
-            continue
+        if running_tokens + chunk_tokens > budget:
+            return None
 
         section_id = chunk.get("section_id") or ""
         section_title = chunk.get("section_title") or ""
         figure_number = chunk.get("figure_number")
         content_type = chunk.get("content_type", "prose")
 
-        chunk_no += 1
+        counter["n"] += 1
+        chunk_no = counter["n"]
         # The header carries the citable identifier the model must copy verbatim.
         # Prefer the section number; for a numberless figure/table present its
         # "Figure N" - a clean, stable tag - so the model cites "[Figure N]"
@@ -344,7 +399,7 @@ def assemble_context(
         context_lines.append("")  # blank line between sections
 
         used_chunks.append({
-            "id": chunk.get("id"),
+            "id": cid,
             "section_id": section_id,
             "section_title": section_title,
             "content_type": content_type,
@@ -358,8 +413,34 @@ def assemble_context(
             "figure_number": chunk.get("figure_number"),
             "tokens_used": chunk_tokens,
         })
+        seen_ids.add(dedup_key)
+        return running_tokens + chunk_tokens
 
-        total_tokens += chunk_tokens
+    # Pass 1: every chunk in rank order fills the main budget (generous trim),
+    # skipping (not breaking on) oversized chunks so lower-ranked hits that
+    # still fit are kept. Figures that fit here — e.g. agentic figures pinned to
+    # the front on the big agentic budget — keep their full detail.
+    total_tokens = 0
+    for chunk in context_chunks:
+        nt = _admit(chunk, running_tokens=total_tokens, budget=max_context_tokens,
+                    trim_tokens=max_context_tokens // 3)
+        if nt is not None:
+            total_tokens = nt
+
+    # Pass 2: rescue referenced figures Pass 1 could not fit (the tail-appended
+    # figure_ref_expansion batch starved by a prose-saturated budget). They get
+    # their own additive reserve and a tight per-figure trim so the whole batch
+    # fits rather than one oversized table evicting the rest. _admit dedups via
+    # seen_ids, so figures already placed in Pass 1 are not re-emitted.
+    if figure_reserve_tokens > 0:
+        fig_tokens = 0
+        for chunk in context_chunks:
+            if not _is_reserved_figure(chunk):
+                continue
+            nt = _admit(chunk, running_tokens=fig_tokens, budget=figure_reserve_tokens,
+                        trim_tokens=DEFAULT_FIGURE_TRIM_TOKENS)
+            if nt is not None:
+                fig_tokens = nt
 
     formatted_context = "\n".join(context_lines).strip()
     return formatted_context, used_chunks
@@ -895,6 +976,7 @@ def generate(
     *,
     model: str = DEFAULT_MODEL,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    figure_reserve_tokens: int = DEFAULT_FIGURE_RESERVE_TOKENS,
     system_prompt: str | None = None,
     max_tokens: int = 1024,
     timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -945,6 +1027,7 @@ def generate(
         query,
         context_chunks,
         max_context_tokens=max_context_tokens,
+        figure_reserve_tokens=figure_reserve_tokens,
     )
 
     # If every retrieved chunk overflowed the token budget, used_chunks is

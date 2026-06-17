@@ -526,6 +526,26 @@ async def logout() -> Response:
     return resp
 
 
+# A figure-reference span in answer prose: "Figure 328", "Figures 630 and 631",
+# "Fig. 632", "Figures 630, 631, and 632". Captures the trailing number list so
+# every figure in a list/pair is recognised, not just the one right after the
+# "Figure(s)" keyword. Kept permissive on the connectors the LLM uses.
+_ANSWER_FIG_REF_RE = re.compile(
+    r"\bFig(?:ure)?s?\.?\s+(\d{1,4}(?:(?:\s*(?:,|and|&|/|or)\s*)+\d{1,4})*)",
+    re.IGNORECASE,
+)
+
+
+def _referenced_figure_numbers(answer: str) -> set[str]:
+    """Normalised figure numbers the answer text references, across singular,
+    plural, abbreviated, and comma/and-separated list phrasings."""
+    out: set[str] = set()
+    for m in _ANSWER_FIG_REF_RE.finditer(answer or ""):
+        for num in re.findall(r"\d{1,4}", m.group(1)):
+            out.add(num.lstrip("0") or "0")
+    return out
+
+
 def _figures_from_sources(result: dict) -> list[dict]:
     """Slim, deduped list of figures the answer actually CITES, so the UI can
     link inline "Figure N" mentions to the PDF and list them in the sidebar.
@@ -535,6 +555,7 @@ def _figures_from_sources(result: dict) -> list[dict]:
     sources = result.get("sources") or []
     answer = result.get("answer") or ""
     default_spec = (result.get("config") or {}).get("spec")
+    referenced = _referenced_figure_numbers(answer)
     seen: set[str] = set()
     figures: list[dict] = []
     for ch in sources:
@@ -547,10 +568,10 @@ def _figures_from_sources(result: dict) -> list[dict]:
         pages = ch.get("pdf_pages") or []
         if not pages:
             continue
-        # Only surface figures the answer references ("Figure 328", "[Figure
-        # 328]", "[§Figure 328]") - not every figure that happened to be
-        # retrieved - so chips and the sidebar reflect what was actually cited.
-        if not re.search(r"Figure\s+" + re.escape(fn) + r"\b", answer, re.IGNORECASE):
+        # Only surface figures the answer references ("Figure 328", "Figures 630
+        # and 631", "Fig. 632") - not every figure that happened to be retrieved
+        # - so chips and the sidebar reflect what was actually cited.
+        if (fn.lstrip("0") or "0") not in referenced:
             continue
         seen.add(fn)
         figures.append({
@@ -2048,6 +2069,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                     <input type="number" id="config-agentic_max_context_tokens" value="16000">
                                     <input type="number" id="config-agentic_max_output_tokens" value="2048">
                                     <input type="checkbox" id="config-agentic_targeted_fetch" checked>
+                                    <input type="number" id="config-figure_reserve_tokens" value="3000">
                                 </div>
                             </div>
                         </div>
@@ -2067,9 +2089,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         // purpose so the global picker (synced on each change, last
                         // one wins) ends up displaying the regular model.
                         var FALLBACK = {
-                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-haiku-4-5-20251001", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1 } },
-                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "claude-opus-4-7", llm_model: "claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4 } },
-                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-sonnet-4-6", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4 } }
+                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-haiku-4-5-20251001", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
+                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "claude-opus-4-7", llm_model: "claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
+                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-sonnet-4-6", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
                         };
                         var PRESETS = FALLBACK, DEFAULT = "balanced";
                         // True while apply() is programmatically writing inputs, so the
@@ -2807,6 +2829,10 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         //     complete on the first try); mean is ~1.8. We bill 2 as typical.
         //   • Real completion lengths sit far below the configured maximums:
         //     ~400 tok for generation, ~330 tok per agentic regeneration.
+        //   • Figure reserve (figure_reserve_tokens) is additive context that
+        //     only fills when the answer references figures. We bill ~1.5
+        //     trimmed figure tables as typical per generation pass; worst case
+        //     is the full configured reserve.
         const COST_ASSUMPTIONS = {
             support_price: {in: 0.15, out: 0.60}, // gpt-4o-mini utility model
             qp_in: 550,     qp_out: 70,           // query processor
@@ -2818,6 +2844,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             gen_out: 400,                         // typical generation output
             regen_out: 330,                       // typical agentic regen output
             typical_iters: 2,                     // refinement passes billed as typical
+            fig_typical_count: 1.5,               // referenced figures typically pulled into the reserve
             embedding_price_per_1m: 0.02,
         };
 
@@ -2860,6 +2887,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_targeted_fetch:     chk("config-agentic_targeted_fetch"),
                 agentic_recursive:          chk("config-agentic_recursive"),
                 agentic_max_iterations:     num("config-agentic_max_iterations", 4),
+                figure_reserve_tokens:      num("config-figure_reserve_tokens", 3000),
             };
         }
 
@@ -2869,7 +2897,15 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const agPrice  = _modelPrice(cfg.agentic_model, {in: 15, out: 75});
             const supPrice = A.support_price;
             const rows = [];
-            let worstExtra = 0; // worst-case dollars beyond the typical rows
+            // Figure reserve: additive context that fills only when the answer
+            // references figures. Bill ~1.5 trimmed figures as typical per gen
+            // pass; worst case is the full configured reserve.
+            const figReserve = Math.max(0, cfg.figure_reserve_tokens || 0);
+            const figTypical = Math.min(A.fig_typical_count * A.avg_chunk_tokens, figReserve);
+            const figWorstExtraTok = figReserve - figTypical;
+            // First-pass generation always runs, so its figure worst-case is
+            // always in play.
+            let worstExtra = _llmCallCost(figWorstExtraTok, 0, regPrice);
 
             // Embedding the query (negligible, shown for completeness).
             const embCost = (A.qp_in / 1e6) * A.embedding_price_per_1m;
@@ -2888,7 +2924,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             });
 
             // First-pass generation (always runs).
-            const normalIn  = A.base_prompt + cfg.final_rerank_topk * A.avg_chunk_tokens;
+            const normalIn  = A.base_prompt + cfg.final_rerank_topk * A.avg_chunk_tokens + figTypical;
             const normalCost = _llmCallCost(normalIn, A.gen_out, regPrice);
             rows.push({
                 name: "Generate (regular)",
@@ -2915,7 +2951,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 const agIn = A.base_prompt + Math.min(
                     cfg.agentic_rerank_topk * A.avg_chunk_tokens,
                     cfg.agentic_max_context_tokens
-                );
+                ) + figTypical;
 
                 const decompCalls = Math.min(A.decomp_calls, Math.max(1, cfg.agentic_max_followups));
                 const decompCost = _llmCallCost(A.decomp_in, A.decomp_out, supPrice) * decompCalls;
@@ -2940,9 +2976,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 
                 // Worst case: every iteration runs and each regen emits the
                 // full configured output budget.
-                const regenWorstOne = _llmCallCost(agIn, cfg.agentic_max_output_tokens, agPrice);
-                worstExtra = (gapCostOne + regenWorstOne) * maxIters
-                           - (gapCostOne + regenCostOne) * iters;
+                const regenWorstOne = _llmCallCost(agIn + figWorstExtraTok, cfg.agentic_max_output_tokens, agPrice);
+                worstExtra += (gapCostOne + regenWorstOne) * maxIters
+                            - (gapCostOne + regenCostOne) * iters;
             }
 
             const total = rows.reduce((s, r) => s + (typeof r.value === "number" ? r.value : 0), 0);
@@ -4359,6 +4395,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
                 auto_gap_check: document.getElementById("config-auto_gap_check").checked,
+                figure_reserve_tokens: (function () {
+                    var el = document.getElementById("config-figure_reserve_tokens");
+                    var n = el ? parseInt(el.value, 10) : NaN;
+                    return isNaN(n) ? 3000 : n;
+                })(),
             };
 
             // Show loading
@@ -4720,6 +4761,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
                 auto_gap_check: document.getElementById("config-auto_gap_check").checked,
+                figure_reserve_tokens: (function () {
+                    var el = document.getElementById("config-figure_reserve_tokens");
+                    var n = el ? parseInt(el.value, 10) : NaN;
+                    return isNaN(n) ? 3000 : n;
+                })(),
             };
 
             errorDiv.classList.add("hidden");

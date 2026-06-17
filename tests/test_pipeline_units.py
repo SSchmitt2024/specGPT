@@ -376,6 +376,51 @@ def test_assemble_context_continues_past_oversized_chunks():
     assert len(used) == 1 and used[0]["section_id"] == "2"
 
 
+def test_assemble_context_reserve_keeps_tail_figure_past_saturated_budget():
+    """Regression: a referenced figure appended to the tail used to be starved
+    when ranked prose saturated max_context_tokens, so the answer cited
+    "[Figure N]" the model never received. The additive figure reserve must
+    keep it; with the reserve disabled it must drop (proving the reserve is the
+    fix, not coincidental headroom)."""
+    from src.pipeline.generator import assemble_context
+    prose = [
+        {"id": f"p{i}", "text_raw": "word " * 120, "content_type": "prose",
+         "section_id": f"1.{i}", "section_title": "Prose"}
+        for i in range(5)  # ~600 tokens total, saturates a 200-token budget
+    ]
+    # Figure body is larger than max_context_tokens, so it can only ever land
+    # via the reserve (never sneaks into leftover main budget). 60 short rows.
+    figure = {"id": "fig632",
+              "text_raw": "Bytes Description\n" + ("00:00 CDP frame field\n" * 60),
+              "content_type": "table", "figure_number": "632",
+              "section_title": "CDP Unfreeze Request", "method": "figure_ref_expansion"}
+    chunks = prose + [figure]
+
+    # With reserve: the figure survives even though prose filled the main budget.
+    _ctx, used = assemble_context("q", chunks, max_context_tokens=200,
+                                  figure_reserve_tokens=800)
+    assert any(c.get("figure_number") == "632" for c in used), "figure dropped despite reserve"
+
+    # Reserve disabled -> pre-fix behaviour: the figure is starved out entirely.
+    _ctx0, used0 = assemble_context("q", chunks, max_context_tokens=200,
+                                    figure_reserve_tokens=0)
+    assert not any(c.get("figure_number") == "632" for c in used0), "reserve=0 should drop the figure"
+
+
+def test_assemble_context_skips_empty_text_chunks():
+    """Empty content blocks ground nothing and trip the LLM's 400 BadRequest;
+    they must never be emitted."""
+    from src.pipeline.generator import assemble_context
+    chunks = [
+        {"id": "empty", "text_raw": "   ", "content_type": "table",
+         "figure_number": "999", "section_title": "Blank", "method": "figure_ref_expansion"},
+        {"id": "real", "text_raw": "real content here", "content_type": "prose",
+         "section_id": "1", "section_title": "Real"},
+    ]
+    _ctx, used = assemble_context("q", chunks, max_context_tokens=4000)
+    assert [c["id"] for c in used] == ["real"]
+
+
 def test_assemble_context_wraps_chunks_in_fences():
     from src.pipeline.generator import assemble_context, _CHUNK_FENCE
     chunks = [{"id": "a", "text_raw": "hello", "content_type": "prose",
@@ -1568,6 +1613,45 @@ def test_truncate_definition_word_boundary_and_whitespace():
     assert out.endswith("…")
     assert len(out) <= 51
     assert not out[:-1].endswith(" ")  # cut on a word boundary, no trailing space
+
+
+def test_referenced_figure_numbers_handles_plural_abbrev_and_lists():
+    """The figure chips gate matches the answer's prose; it must recognise the
+    plural / abbreviated / list phrasings the LLM actually uses, not just the
+    singular "Figure N" — otherwise figures pulled into context still produce no
+    chip. Must NOT match a number inside an unrelated word like 'configure'."""
+    import os
+    os.environ.setdefault("APP_PASSWORD", "test")
+    os.environ.setdefault("SESSION_SECRET", "x" * 32)
+    from src.pipeline.app import _referenced_figure_numbers as ref
+    assert ref("see Figure 630") == {"630"}
+    assert ref("Figures 632 and 633 are the frames") == {"632", "633"}
+    assert ref("refer to Fig. 630") == {"630"}
+    assert ref("shown in Figures 630, 631, and 632") == {"630", "631", "632"}
+    assert ref("the configure 630 setting") == set()
+    assert ref("byte 630 of the field") == set()
+
+
+def test_figures_from_sources_surfaces_plural_referenced_figure():
+    """Regression: a figure in sources (with pages) referenced via the plural
+    'Figures 632 and 633' must surface as a chip; one not referenced at all
+    must not."""
+    import os
+    os.environ.setdefault("APP_PASSWORD", "test")
+    os.environ.setdefault("SESSION_SECRET", "x" * 32)
+    from src.pipeline.app import _figures_from_sources
+    result = {
+        "answer": "The unfreeze uses Figures 632 and 633 for request and response.",
+        "config": {"spec": "base"},
+        "sources": [
+            {"figure_number": "632", "pdf_pages": [563], "section_title": "Req"},
+            {"figure_number": "633", "pdf_pages": [564], "section_title": "Resp"},
+            {"figure_number": "999", "pdf_pages": [1], "section_title": "Unref"},
+            {"figure_number": "650", "pdf_pages": [], "section_title": "NoPage"},
+        ],
+    }
+    figs = {f["figure_number"] for f in _figures_from_sources(result)}
+    assert figs == {"632", "633"}  # 999 not referenced; 650 has no page
 
 
 # ---------------------------------------------------------------------------
