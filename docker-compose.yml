@@ -1,0 +1,43 @@
+# VM deployment for specGPT.
+#
+#   1. Put your secrets in a .env file in this directory (copy .env.example).
+#      Required: APP_PASSWORD, SESSION_SECRET, SUPABASE_URL, SUPABASE_KEY,
+#      VOYAGE_API_KEY, DEEPTHOUGHT_API_KEY. The VM must be able to reach
+#      Supabase, Voyage, and UNH DeepThought (campus network / GlobalProtect).
+#   2. docker compose up -d --build
+#   3. Browse to http://<VM-IP>:8000
+#
+# Stop:    docker compose down
+# Logs:    docker compose logs -f
+# Update:  git pull && docker compose up -d --build
+
+services:
+  specgpt:
+    build: .
+    container_name: specgpt
+    # Loads every KEY=value from the .env file in this directory as a real
+    # environment variable inside the container.
+    env_file: .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      # The VM is served over plain http://<VM-IP>:8000. Login cookies use the
+      # Secure flag by default, which browsers drop over plain HTTP (login would
+      # silently fail). 0 lets login work directly. Set to 1 if you put an HTTPS
+      # reverse proxy (Caddy/nginx) in front.
+      COOKIE_SECURE: "0"
+    ports:
+      - "8000:8000"            # reachable at http://<VM-IP>:8000
+    restart: unless-stopped    # survive crashes and VM reboots
+    healthcheck:
+      # Python (already in the image) instead of curl, which isn't in slim.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"        # cap log disk usage on the VM
+        max-file: "3"
