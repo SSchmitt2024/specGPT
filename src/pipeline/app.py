@@ -1019,17 +1019,17 @@ async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
         },
         "llm": {
             "model": cfg.llm_model,
-            "provider": "UNH DeepThought",
-            "price_per_1m_input": 0.0,
-            "price_per_1m_output": 0.0,
-            "note": "Standard queries (UNH-hosted)",
+            "provider": "Anthropic",
+            "price_per_1m_input": 3.0,
+            "price_per_1m_output": 15.0,
+            "note": "Standard queries",
         },
         "agentic_llm": {
             "model": cfg.agentic_model,
-            "provider": "UNH DeepThought",
-            "price_per_1m_input": 0.0,
-            "price_per_1m_output": 0.0,
-            "note": "Agentic mode only (UNH-hosted)",
+            "provider": "Anthropic",
+            "price_per_1m_input": 15.0,
+            "price_per_1m_output": 75.0,
+            "note": "Agentic mode only",
         },
     }
 
@@ -2031,10 +2031,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                     <input type="number" id="config-final_rerank_topk" value="10" min="1" max="20" title="How many top-ranked sections are sent to the model. More = better coverage, higher cost.">
                                 </div>
                                 <div class="config-item">
-                                    <label>Sub-queries</label>
-                                    <input type="number" id="config-max_subqueries" value="3" min="1" max="5" title="Max focused sub-questions a relational/procedural query is split into before retrieval. More = wider coverage, higher cost.">
-                                </div>
-                                <div class="config-item">
                                     <label title="After answering, a cheap model checks for gaps and offers agentic refinement when coverage looks thin"><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
                                 </div>
                             </div>
@@ -2049,6 +2045,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                 <input type="number" id="config-bm25_topk" value="5">
                                 <input type="number" id="config-rrf_k" value="60">
                                 <input type="number" id="config-rrf_output_topk" value="20">
+                                <input type="number" id="config-max_subqueries" value="3">
                             </div>
 
                             <div class="config-section-label">Agentic refinement</div>
@@ -2092,9 +2089,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         // purpose so the global picker (synced on each change, last
                         // one wins) ends up displaying the regular model.
                         var FALLBACK = {
-                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
-                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
-                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
+                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-haiku-4-5-20251001", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
+                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "claude-opus-4-7", llm_model: "claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
+                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "claude-sonnet-4-6", llm_model: "claude-sonnet-4-6", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
                         };
                         var PRESETS = FALLBACK, DEFAULT = "balanced";
                         // True while apply() is programmatically writing inputs, so the
@@ -2543,18 +2540,26 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         //   label       - short display name
         //   defaultFor  - which select(s) default to this model
         //   tags        - additional tags surfaced in the label
-        // DeepThought (UNH on-prem gateway) is the only generation backend.
-        // All models are UNH-hosted, so in/out price is 0 (the cost chip reads
-        // these). Ids match generator.DEEPTHOUGHT_MODELS; keep the two in sync.
-        // speed is a rough relative rank (1=fastest) for the "fastest" tag only.
         const MODEL_CATALOG = [
-            // Claude via DeepThought's AWS Bedrock route - best citation fidelity
-            {id: "deepthought-claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "DeepThought (Bedrock)", in: 0.0, out: 0.0, speed: 5, tags: ["most capable"], defaultFor: ["llm", "agentic"]},
-            {id: "deepthought-claude-sonnet-4-5", label: "Claude Sonnet 4.5", provider: "DeepThought (Bedrock)", in: 0.0, out: 0.0, speed: 5, tags: []},
-            {id: "deepthought-claude-sonnet-4",   label: "Claude Sonnet 4",   provider: "DeepThought (Bedrock)", in: 0.0, out: 0.0, speed: 5, tags: []},
-            // Open-weight models on UNH's own GPUs (free local compute)
-            {id: "deepthought-llama-3.3-70b",        label: "Llama 3.3 70B",        provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 4, tags: []},
-            {id: "deepthought-qwen3-30b",            label: "Qwen3 30B Instruct",   provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 3, tags: []},
+            // Gemini (Google) - cheapest → most expensive
+            {id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite", provider: "Gemini (Google)", in: 0.075, out: 0.30,  speed: 1, tags: []},
+            {id: "gemini-2.0-flash",      label: "Gemini 2.0 Flash",      provider: "Gemini (Google)", in: 0.10,  out: 0.40,  speed: 2, tags: []},
+            {id: "gemini-2.5-flash",      label: "Gemini 2.5 Flash",      provider: "Gemini (Google)", in: 0.15,  out: 0.60,  speed: 3, tags: []},
+            {id: "gemini-2.5-pro",        label: "Gemini 2.5 Pro",        provider: "Gemini (Google)", in: 1.25,  out: 10.0,  speed: 7, tags: ["most capable"]},
+            // Claude (Anthropic)
+            {id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  provider: "Claude (Anthropic)", in: 1.0,  out: 5.0,   speed: 1, tags: []},
+            {id: "claude-sonnet-4-5",         label: "Claude Sonnet 4.5", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: []},
+            {id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", provider: "Claude (Anthropic)", in: 3.0,  out: 15.0,  speed: 4, tags: [], defaultFor: ["llm"]},
+            {id: "claude-opus-4-7",           label: "Claude Opus 4.7",   provider: "Claude (Anthropic)", in: 15.0, out: 75.0,  speed: 8, tags: ["most capable"], defaultFor: ["agentic"]},
+            // OpenAI
+            {id: "gpt-4o-mini",  label: "GPT-4o mini",  provider: "OpenAI", in: 0.15, out: 0.60,  speed: 1, tags: []},
+            {id: "gpt-4o",       label: "GPT-4o",       provider: "OpenAI", in: 2.50, out: 10.0,  speed: 3, tags: []},
+            {id: "gpt-4.1-mini", label: "GPT-4.1 mini", provider: "OpenAI", in: 0.40, out: 1.60,  speed: 2, tags: []},
+            {id: "gpt-4.1",      label: "GPT-4.1",      provider: "OpenAI", in: 2.00, out: 8.00,  speed: 4, tags: []},
+            {id: "gpt-5-mini",   label: "GPT-5 mini",   provider: "OpenAI", in: 0.25, out: 2.00,  speed: 2, tags: []},
+            {id: "gpt-5",        label: "GPT-5",        provider: "OpenAI", in: 1.25, out: 10.0,  speed: 6, tags: ["most capable"]},
+            // UNH
+            {id: "deepthought", label: "DeepThought", provider: "UNH Models", in: 0.0, out: 0.0, speed: 5, tags: ["free"]},
         ];
 
         // Tag the per-provider cheapest (by input price) and fastest (by speed
@@ -2587,7 +2592,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (!selectEl) return;
             const byProvider = {};
             for (const m of MODEL_CATALOG) {
-                if (!m.provider || !m.provider.startsWith("DeepThought")) continue;
+                if (m.provider !== "Claude (Anthropic)") continue;
                 (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
             }
             // Stable provider order matching the catalog declaration (only included providers).
@@ -2658,13 +2663,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         // cost calc reflect whatever the user picked. No-op until both the
         // /api/models response and the selectors are in the DOM.
         function _modelProvider(id) {
-            // DeepThought is the only generation backend; every model id is
-            // UNH-hosted. (gemini/gpt branches kept harmless for legacy ids.)
-            if (!id) return "UNH DeepThought";
-            if (id.startsWith("deepthought")) return "UNH DeepThought";
+            if (!id) return "Anthropic";
             if (id.startsWith("gemini-")) return "Google";
             if (id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) return "OpenAI";
-            return "UNH DeepThought";
+            if (id === "deepthought") return "DeepThought";
+            return "Anthropic";
         }
 
         function _applySelectedModels() {
@@ -2873,8 +2876,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const str = (id, def) => { const el = v(id); return el ? el.value : def; };
             return {
                 agentic: v("agentic-toggle") ? v("agentic-toggle").checked : false,
-                llm_model:                  str("config-llm_model", "deepthought-claude-sonnet-4-6"),
-                agentic_model:              str("config-agentic_model", "deepthought-claude-sonnet-4-6"),
+                llm_model:                  str("config-llm_model", "claude-sonnet-4-6"),
+                agentic_model:              str("config-agentic_model", "claude-opus-4-7"),
                 final_rerank_topk:          num("config-final_rerank_topk", 10),
                 auto_gap_check:             chk("config-auto_gap_check"),
                 agentic_rerank_topk:        num("config-agentic_rerank_topk", 14),

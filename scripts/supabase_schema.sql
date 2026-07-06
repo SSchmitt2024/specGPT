@@ -275,21 +275,3 @@ CREATE TABLE IF NOT EXISTS qa_log (
 
 CREATE INDEX IF NOT EXISTS qa_log_created_idx ON qa_log (created_at DESC);
 CREATE INDEX IF NOT EXISTS qa_log_spec_idx    ON qa_log (spec);
-
--- ---------------------------------------------------------------------------
--- Row Level Security
---
--- Without RLS, Supabase flags every table "Unrestricted" — anyone with the
--- anon/publishable key could read/write via the REST API. The backend
--- connects with a secret key (sb_secret_…) which bypasses RLS, so enabling
--- RLS with NO policies locks out anon/public access while leaving the app
--- fully functional. Idempotent (ENABLE is a no-op if already on).
--- ---------------------------------------------------------------------------
-ALTER TABLE spec_chunks      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE spec_fields      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE spec_field_index ENABLE ROW LEVEL SECURITY;
-ALTER TABLE spec_tables      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE spec_enum_index  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE flagged_answers  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE dev_notes        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE qa_log           ENABLE ROW LEVEL SECURITY;

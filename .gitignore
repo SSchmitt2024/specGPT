@@ -15,4 +15,3 @@ ruvector.db
 .DS_Store
 
 scripts/preset_sim.py
-docker-cheat-sheet.md

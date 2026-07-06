@@ -45,7 +45,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Model defaults
-DEFAULT_MODEL = "deepthought-claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
 # Additive headroom (on top of DEFAULT_MAX_CONTEXT_TOKENS) reserved for the
 # deferred figure tables the prose references, so a prose-saturated context
@@ -79,38 +79,13 @@ def _is_reserved_figure(chunk: dict) -> bool:
         or chunk.get("prior_method") in _FIGURE_RESERVE_METHODS
     )
 
-# DeepThought is UNH's on-prem OpenAI-compatible LLM gateway. It is the only
-# generation backend this app exposes. Reachable only from the USNH network
-# (campus or GlobalProtect VPN); calls from elsewhere fail at TCP connect.
+# DeepThought is UNH's on-prem OpenAI-compatible LLM gateway. The dropdown
+# value "deepthought" is the public model id used by the UI; the underlying
+# model served by the gateway is named below. Reachable only from the USNH
+# network (campus or GlobalProtect VPN); calls from elsewhere time out at the
+# TCP layer rather than returning an HTTP error.
 DEEPTHOUGHT_BASE_URL = "https://dtcontroller.sr.unh.edu:4242/openai/v1"
-# Fallback underlying id for the legacy public value "deepthought".
 DEEPTHOUGHT_MODEL = "Meta-Llama-3.1-8B-Instruct"
-
-# Public dropdown id -> underlying DeepThought gateway model id. Only models
-# verified to complete a chat AND emit clean output (no <think> reasoning that
-# would corrupt citation parsing) are listed. Excluded after live testing:
-# Qwen3-32B (emits <think> blocks), claude-haiku-4-5 ("Model not available"),
-# NV-Embed-v2 (an embedding model, not chat). Re-check with the gateway's
-# /openai/v1/models endpoint when the served set changes.
-DEEPTHOUGHT_MODELS = {
-    # Claude served via DeepThought's AWS Bedrock route (best citation fidelity).
-    "deepthought-claude-sonnet-4-6": "ets:aws:us.anthropic.claude-sonnet-4-6",
-    "deepthought-claude-sonnet-4-5": "ets:aws:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    "deepthought-claude-sonnet-4":   "ets:aws:us.anthropic.claude-sonnet-4-20250514-v1:0",
-    # Local open-weight models (free UNH compute). Coder/vision/8B variants
-    # dropped from the menu: weak or off-task for spec prose Q&A.
-    "deepthought-llama-3.3-70b":        "default:local:Llama-3.3-70B-Instruct-bnb-4bit",
-    "deepthought-qwen3-30b":            "default:local:Qwen3-30B-A3B-Instruct-2507",
-}
-
-
-def resolve_deepthought_model(public_id: str) -> str:
-    """Map a public dropdown id to the underlying DeepThought gateway model id.
-
-    Accepts the legacy ``"deepthought"`` value (and any unknown id) by falling
-    back to ``DEEPTHOUGHT_MODEL``.
-    """
-    return DEEPTHOUGHT_MODELS.get(public_id, DEEPTHOUGHT_MODEL)
 
 
 class DeepThoughtUnreachableError(RuntimeError):
@@ -839,13 +814,11 @@ def _call_deepthought(
     query: str,
     system_prompt: str,
     *,
-    model: str = DEEPTHOUGHT_MODEL,
     max_tokens: int,
     max_retries: int,
 ) -> tuple[str, dict]:
     """Call UNH's DeepThought OpenAI-compatible gateway and return (answer, tokens_used).
 
-    ``model`` is the underlying gateway model id (see ``DEEPTHOUGHT_MODELS``).
     Requires DEEPTHOUGHT_API_KEY and USNH network access (on-campus or
     GlobalProtect VPN). Off-network calls fail at TCP connect, not HTTP.
     """
@@ -871,7 +844,7 @@ def _call_deepthought(
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=DEEPTHOUGHT_MODEL,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -908,11 +881,6 @@ def _call_deepthought(
 
     choice = response.choices[0]
     answer = choice.message.content or ""
-
-    # Defensive: some local models (Qwen3 hybrids) prepend a <think>...</think>
-    # chain-of-thought block. It corrupts citation parsing, so strip it. The
-    # listed models don't do this, but the gateway's served set can change.
-    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).lstrip()
 
     stop_reason = getattr(choice, "finish_reason", None)
     if stop_reason == "length":
@@ -1082,12 +1050,11 @@ def generate(
         full_system_prompt += VERDICT_INSTRUCTION
 
     # Step 3: Call the appropriate backend based on the model prefix.
-    if model in DEEPTHOUGHT_MODELS or model == "deepthought":
+    if model == "deepthought":
         # ── UNH DeepThought (OpenAI-compatible, on-prem) ───────────────
         answer, tokens_used = _call_deepthought(
             query,
             full_system_prompt,
-            model=resolve_deepthought_model(model),
             max_tokens=max_tokens,
             max_retries=max_retries,
         )

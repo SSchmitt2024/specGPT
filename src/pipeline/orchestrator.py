@@ -134,9 +134,8 @@ class PipelineConfig:
     # it. See generator.assemble_context.
     figure_reserve_tokens: int = 3000
 
-    # Generation parameters. DeepThought is the only generation backend; this
-    # routes claude-sonnet-4-6 through UNH's gateway (see generator.DEEPTHOUGHT_MODELS).
-    llm_model: str = "deepthought-claude-sonnet-4-6"
+    # Generation parameters
+    llm_model: str = "claude-sonnet-4-6"
     llm_max_context_tokens: int = 4000
     # 2048: procedural answers with tables were hitting stop_reason=max_tokens
     # at 1024, truncating the first pass — and gap analysis then chases gaps
@@ -144,7 +143,7 @@ class PipelineConfig:
     llm_max_output_tokens: int = 2048
 
     # Agentic-mode parameters (only used when orchestrate(..., agentic=True))
-    agentic_model: str = "deepthought-claude-sonnet-4-6"
+    agentic_model: str = "claude-opus-4-7"
     agentic_max_context_tokens: int = 16000
     agentic_max_output_tokens: int = 3072
     agentic_max_followups: int = 3   # cap LLM-generated follow-up queries
@@ -557,8 +556,8 @@ PRESETS: dict[str, dict] = {
         "label": "Fast",
         "agentic": False,
         "config": {
-            "agentic_model": "deepthought-claude-sonnet-4-6",
-            "llm_model": "deepthought-claude-sonnet-4-6",
+            "agentic_model": "claude-sonnet-4-6",
+            "llm_model": "claude-haiku-4-5-20251001",
             # Fast keeps the lean output budget; quick lookups don't need
             # long procedural answers and this keeps cost/latency flat.
             "llm_max_output_tokens": 1024,
@@ -589,8 +588,8 @@ PRESETS: dict[str, dict] = {
         "label": "Balanced",
         "agentic": False,
         "config": {
-            "agentic_model": "deepthought-claude-sonnet-4-6",
-            "llm_model": "deepthought-claude-sonnet-4-6",
+            "agentic_model": "claude-opus-4-7",
+            "llm_model": "claude-sonnet-4-6",
             "llm_max_output_tokens": 2048,
             # Keep in sync with the PipelineConfig default (Balanced IS default).
             "figure_reserve_tokens": 3000,
@@ -622,8 +621,8 @@ PRESETS: dict[str, dict] = {
         "label": "Thorough",
         "agentic": True,
         "config": {
-            "agentic_model": "deepthought-claude-sonnet-4-6",
-            "llm_model": "deepthought-claude-sonnet-4-6",
+            "agentic_model": "claude-sonnet-4-6",
+            "llm_model": "claude-sonnet-4-6",
             "llm_max_output_tokens": 2048,
             # Full figure reserve — Thorough optimises for completeness.
             "figure_reserve_tokens": 3000,

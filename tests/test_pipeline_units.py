@@ -466,13 +466,10 @@ def test_generate_context_is_final_appends_final_pass_instruction(monkeypatch):
     chunks = [{"id": "a", "text_raw": "hello", "content_type": "prose",
                "section_id": "1.1", "section_title": "Intro"}]
 
-    # Pin a Claude model so this exercises the mocked Anthropic path (the
-    # default model now routes to DeepThought). This test is about prompt
-    # assembly, not backend selection.
-    generator.generate("q", chunks, model="claude-sonnet-4-6", context_is_final=True)
+    generator.generate("q", chunks, context_is_final=True)
     assert "FINAL ANSWER MODE" in captured["system"]
 
-    generator.generate("q", chunks, model="claude-sonnet-4-6")
+    generator.generate("q", chunks)
     assert "FINAL ANSWER MODE" not in captured["system"]
 
 
@@ -497,14 +494,14 @@ def test_generate_synthesizes_not_answered_verdict_on_max_tokens(monkeypatch):
     chunks = [{"id": "a", "text_raw": "hello", "content_type": "prose",
                "section_id": "1.1", "section_title": "Intro"}]
 
-    _, _, _, _, verdict = generator.generate("q", chunks, model="claude-sonnet-4-6", emit_verdict=True)
+    _, _, _, _, verdict = generator.generate("q", chunks, emit_verdict=True)
     assert verdict is not None
     assert verdict["answered"] is False
     assert verdict["truncated"] is True
 
     # Clean stop without a verdict line: still None (model just didn't emit one).
     state["stop_reason"] = "end_turn"
-    _, _, _, _, verdict = generator.generate("q", chunks, model="claude-sonnet-4-6", emit_verdict=True)
+    _, _, _, _, verdict = generator.generate("q", chunks, emit_verdict=True)
     assert verdict is None
 
 
@@ -1161,9 +1158,8 @@ def test_pipeline_config_has_agentic_targeted_fetch_default():
     from src.pipeline.orchestrator import PipelineConfig
     cfg = PipelineConfig()
     assert cfg.agentic_targeted_fetch is True
-    # Other agentic defaults still in place. DeepThought is the only generation
-    # backend, so the default agentic model routes Claude through its gateway.
-    assert cfg.agentic_model == "deepthought-claude-sonnet-4-6"
+    # Other agentic defaults still in place
+    assert cfg.agentic_model == "claude-opus-4-7"
     assert cfg.agentic_max_context_tokens == 16000
 
 
