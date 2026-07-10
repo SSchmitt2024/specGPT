@@ -1,13 +1,15 @@
 # specGPT — Data Model Reference
 
-What we extract from the NVMe spec PDF and why each piece exists.
+What we extract from each spec PDF and why each piece exists.
+
+**Per-corpus layout:** `data/` root holds the NVMe Base corpus. `data/command/` (NVMe Command Set) and `data/pcie/` (PCIe) each carry the same set of artifacts. Files 1-13 below exist once per corpus; the eval and preset-sim files (14-17) are root-only tooling outputs. All of this is build-time only; the runtime app reads Supabase.
 
 ---
 
 ## Data Files (all in `data/`)
 
 ### 1. `toc.json` — Section Index
-**Source:** `parser.py` + `deep_sections.py`
+**Source:** `toc_rebuild.py` (from PDF bookmarks) + `deep_sections.py` (depth 4+ enrichment)
 **What it is:** Flat list of every section heading in the spec, with hierarchy.
 
 ```json
@@ -167,6 +169,85 @@ Cross-references also have a `strength` field:
 
 ---
 
+### 9. `relationships_merged.json` + `entity_registry.json` — Reconciled Graph
+**Source:** `llm/reconcile.py`
+**What it is:** `relationships_merged.json` is the authoritative edge list after merging the deterministic edges (`relationships.json`) with the LLM edges (`relationships_llm.json`) and de-duplicating. `entity_registry.json` maps canonical entity names to the aliases seen across both sources (e.g. `"structure:Submission Queue": ["Submission Queue (SQ)"]`), so the same entity spelled two ways becomes one node.
+
+**Why:** Reconcile also refreshes the `relationships` arrays inside `cards.json` from this merged list. Neither file is read at runtime; they're intermediate build artifacts.
+
+---
+
+### 10. `enum_index.json` — Value-Keyed Enum Lookup
+**Source:** `enum_tables.py` (from `tables.json`)
+**What it is:** Reverse lookup for the spec's enumeration tables — FID, LID, CNS, opcode, status codes — keyed by concept, each with `label` + `entries` for value→name resolution.
+
+**Why:** Loaded into Supabase `spec_enum_index` by `scripts/load_lookup_data.py`; the runtime structured lookup (`retriever.py:load_enum_index`) prefers that table and falls back to this local file. This is how "what is FID 0Dh?" gets an exact answer.
+
+---
+
+### 11. `chunks_prose.json` / `chunks_tables.json` / `chunks_embedded.json` — Index Pipeline Artifacts
+**Source:** `scripts/chunker.py` (prose), `pipeline/table_serializer.py` run as a build step (tables), `scripts/embedder.py` (embedded)
+**What it is:** The Phase 2 hand-off chain. Prose chunks are ~500-token overlapping windows per section, card summary prepended:
+
+```json
+{
+  "chunk_id": "1.1__c0",
+  "section_id": "1.1",
+  "section_title": "Overview",
+  "content_type": "prose",
+  "text": "[section summary] paragraph text...",
+  "token_count_approx": 153,
+  "pdf_pages": [24],
+  "has_normative": false
+}
+```
+
+Table chunks are tables serialized to embeddable markdown; tables over 30 rows split into 25-row chunks sharing a `figure_number` (with `row_start`/`row_end`) so they can be reconstructed. `chunks_embedded.json` is the union of both with a Voyage 1024-dim `embedding` vector per chunk.
+
+**Why:** `scripts/indexer.py` upserts `chunks_embedded.json` into the Supabase `spec_chunks` table — the corpus the runtime actually searches. The two pre-embedding files let you re-embed without re-chunking.
+
+---
+
+### 12. State checkpoints — `cards_state.json`, `relationships_llm_state.json`
+**Source:** `llm/generate_cards.py` and `llm/extract_relationships.py`
+**What it is:** `{"processed": [section ids...]}` progress checkpoints for the long-running LLM batch jobs.
+
+**Why:** Lets an interrupted enrichment run resume without re-paying for already-processed sections. Never consumed at runtime; safe to delete to force a full re-run.
+
+---
+
+### 13. Backups — `toc_depth3_backup.json` (and `toc_old_backup.json` when present)
+**Source:** `deep_sections.py` (and `toc_rebuild.py`)
+**What it is:** Snapshots of `toc.json` taken before each script overwrites it (pre-deep-enrichment; `toc_rebuild.py` writes `toc_old_backup.json` pre-rebuild when it runs).
+
+**Why:** Rollback/diff safety only. Not consumed by anything.
+
+---
+
+## Root-Only Tooling Outputs (no per-corpus copies)
+
+### 14. `eval_set.json` — Evaluation Question Set
+**Source:** `scripts/eval_gen.py`
+**What it is:** Curated QA ground truth (~60 items) mixing lookup, structural, relational, and procedural question types. Keys: `id, query, type, expected_sections, expected_fields, expected_figure, gold_answer, source, tags`.
+**Why:** Baseline for measuring retrieval and answer quality per question type.
+
+### 15. `eval_results.json` — Evaluation Run Output
+**Source:** `scripts/eval_run.py` (runs the live pipeline over `eval_set.json`)
+**What it is:** Per-item output: actual answer, citations, latency, and pass/fail scores (`answer_present`, `citation_hit`, `field_mentioned`).
+**Why:** Flags refusals, missing citations, and wrong-section answers end to end.
+
+### 16. `preset_sim_cache.json` — Retrieval Result Cache
+**Source:** `scripts/preset_sim.py` collect phase
+**What it is:** Cached retrieval results per eval item at depth MAX_K=20 for each method (vector, structured, fusion): ranked chunk ids, rerank scores, per-stage timings.
+**Why:** Lets the sweep phase replay retrieval offline, so tuning topk/fusion knobs costs no API calls.
+
+### 17. `preset_sim_results.json` — Preset Sweep Results
+**Source:** `scripts/preset_sim.py` sweep phase (replays the cache)
+**What it is:** Recall and by-type accuracy per tested config (`topk, n_sub, rrf_k, rrf_out, final_k`) plus mean context tokens.
+**Why:** This is where the Fast/Balanced/Thorough preset values come from.
+
+---
+
 ## How the Edges Get Used
 
 The edges are **not** a general-purpose knowledge graph for browsing. They serve one purpose: **retrieval expansion**.
@@ -220,16 +301,27 @@ The edges are an internal retrieval optimization, not a user-facing feature. Use
 ## Data Flow Summary
 
 ```
-NVMe PDF
-  ├── parser.py ────────→ toc.json (section index)
+Spec PDF
+  ├── toc_rebuild.py ───→ toc.json (section index)
   ├── tables.py ────────→ tables.json (structured tables)
   ├── fields.py ────────→ fields.json + field_index.json (named fields)
   ├── prose.py ─────────→ prose.json + definitions.json (text + normative tags)
-  ├── deep_sections.py ─→ toc.json (enriched with depth 4+ sections)
+  ├── deep_sections.py ─→ toc.json (enriched with depth 4+; toc_depth3_backup.json)
+  ├── enum_tables.py ───→ enum_index.json (value-keyed enum lookup)
   ├── relationships.py ─→ relationships.json (structural edges)
-  ├── llm/extract_relationships.py → relationships_llm.json (semantic edges)
-  └── llm/generate_cards.py ───────→ cards.json (per-section metadata cards)
+  ├── llm/extract_relationships.py → relationships_llm.json (+ _state checkpoint)
+  ├── llm/generate_cards.py ───────→ cards.json (+ cards_state checkpoint)
+  └── llm/reconcile.py ────────────→ relationships_merged.json + entity_registry.json
+
+Phase 2 (index):
+  chunker.py + table_serializer.py → chunks_prose.json + chunks_tables.json
+    → embedder.py → chunks_embedded.json
+    → indexer.py → Supabase spec_chunks
+  load_lookup_data.py → Supabase spec_fields / spec_field_index / spec_tables / spec_enum_index
+
+Tooling (root data/ only):
+  eval_gen.py → eval_set.json → eval_run.py → eval_results.json
+  preset_sim.py → preset_sim_cache.json → preset_sim_results.json
 ```
 
-Phase 2 consumes all of this to build the NetworkX graph + Supabase vector index.
-Phase 3 queries both during retrieval.
+The runtime queries Supabase, not these files (with a local fallback for enum_index.json).
