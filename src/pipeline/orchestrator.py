@@ -11,7 +11,6 @@ visualizes every decision and result.
 
 All high-impact tunable parameters are exposed as config:
   - vector_search.top_k
-  - tsvector_search.top_k
   - bm25_search.top_k
   - rrf_merge.k
   - rrf_output.top_k
@@ -21,7 +20,6 @@ All high-impact tunable parameters are exposed as config:
 
     config = PipelineConfig(
         vector_topk=15,
-        tsvector_topk=15,
         bm25_topk=15,
         rrf_k=45,
         final_rerank_topk=10,
@@ -78,8 +76,8 @@ class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
     # Which specification corpus to search: "base" | "pcie" | "command", or
     # ALL_SPECS to search every ingested corpus (see AVAILABLE_SPECS in
-    # app.py). A concrete spec scopes every retrieval (vector / tsvector /
-    # BM25 / structured lookup) to rows tagged with it so different specs'
+    # app.py). A concrete spec scopes every retrieval (vector / BM25 /
+    # structured lookup) to rows tagged with it so different specs'
     # results never co-mingle; ALL_SPECS removes the retrieval filter and
     # relies on per-chunk `spec` provenance for citation links.
     spec: str = "base"
@@ -91,7 +89,6 @@ class PipelineConfig:
     # These defaults ARE the "Balanced" preset — keep PRESETS["balanced"] in
     # sync when changing them.
     vector_topk: int = 5
-    tsvector_topk: int = 5
     bm25_topk: int = 5
 
     # RRF merge parameters
@@ -397,7 +394,7 @@ def hybrid_search(
     config: PipelineConfig | None = None,
 ) -> tuple[list[dict], list[PipelineStage]]:
     """
-    Orchestrate hybrid retrieval: vector + tsvector + BM25 per sub-query,
+    Orchestrate hybrid retrieval: vector + BM25 per sub-query,
     fused via Reciprocal Rank Fusion.
 
     Each (method, sub-query) pair is treated as an independent ranked list
@@ -428,7 +425,7 @@ def hybrid_search(
     # provenance, which the UI uses to label and deep-link citations).
     spec_filter = {} if config.spec == ALL_SPECS else {"spec": config.spec}
 
-    # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
+    # Step 1: vector + bm25 per sub-query, each as its own ranked list
     import concurrent.futures
 
     def _run_search(func, *args, **kwargs):
@@ -437,20 +434,17 @@ def hybrid_search(
         return res, time.time() - t0
 
     futures = []
-    # Step 1: vector + tsvector + bm25 per sub-query, each as its own ranked list
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(36, len(sub_queries) * 3)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(36, len(sub_queries) * 2)) as executor:
         for i, sq in enumerate(sub_queries):
             futures.append({
                 "i": i, "sq": sq,
                 "vec_fut": executor.submit(_run_search, search.vector_search, sq, top_k=config.vector_topk, filter=spec_filter),
-                "tsv_fut": executor.submit(_run_search, search.tsvector_search, sq, top_k=config.tsvector_topk, filter=spec_filter),
                 "bm25_fut": executor.submit(_run_search, search.bm25_search, sq, top_k=config.bm25_topk, filter=spec_filter)
             })
 
     for f in futures:
         i, sq = f["i"], f["sq"]
         vec_results, took_vec = f["vec_fut"].result()
-        tsv_results, took_tsv = f["tsv_fut"].result()
         bm25_results, took_bm25 = f["bm25_fut"].result()
 
         sub_trace.append(
@@ -463,14 +457,6 @@ def hybrid_search(
         )
         sub_trace.append(
             PipelineStage(
-                stage=f"hybrid_search.tsvector_search_q{i}",
-                input={"query": sq, "top_k": config.tsvector_topk},
-                output={"results": _result_summary(tsv_results, limit=3), "count": len(tsv_results)},
-                took_ms=took_tsv * 1000,
-            )
-        )
-        sub_trace.append(
-            PipelineStage(
                 stage=f"hybrid_search.bm25_search_q{i}",
                 input={"query": sq, "top_k": config.bm25_topk},
                 output={"results": _result_summary(bm25_results, limit=3), "count": len(bm25_results)},
@@ -478,7 +464,7 @@ def hybrid_search(
             )
         )
 
-        for lst in (vec_results, tsv_results, bm25_results):
+        for lst in (vec_results, bm25_results):
             if lst:
                 ranked_lists.append(lst)
                 total_input += len(lst)
@@ -565,7 +551,6 @@ PRESETS: dict[str, dict] = {
             # Leaner figure reserve to match Fast's flat cost/latency profile.
             "figure_reserve_tokens": 1500,
             "vector_topk": 6,
-            "tsvector_topk": 6,
             "bm25_topk": 6,
             "rrf_k": 60,
             "rrf_output_topk": 12,
@@ -595,7 +580,6 @@ PRESETS: dict[str, dict] = {
             # Keep in sync with the PipelineConfig default (Balanced IS default).
             "figure_reserve_tokens": 3000,
             "vector_topk": 5,
-            "tsvector_topk": 5,
             "bm25_topk": 5,
             "rrf_k": 60,
             "rrf_output_topk": 20,
@@ -628,7 +612,6 @@ PRESETS: dict[str, dict] = {
             # Full figure reserve — Thorough optimises for completeness.
             "figure_reserve_tokens": 3000,
             "vector_topk": 8,
-            "tsvector_topk": 8,
             "bm25_topk": 8,
             "rrf_k": 60,
             "rrf_output_topk": 20,
@@ -667,8 +650,8 @@ question given what was retrieved, and if not, identify TWO complementary
 forms of follow-up:
 
   (1) Free-form search QUERIES — focused questions a spec engineer would
-      phrase. The pipeline runs each through hybrid retrieval (vector + BM25 +
-      tsvector). Use these for "I need to know more about X concept".
+      phrase. The pipeline runs each through hybrid retrieval (vector + BM25).
+      Use these for "I need to know more about X concept".
 
   (2) Targeted REQUESTED_RESOURCES — specific figures, fields, or section IDs
       the answer mentions by NAME as missing or under-defined. The pipeline

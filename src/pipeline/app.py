@@ -2045,7 +2045,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                  getElementById("config-*") call site keeps working. -->
                             <div hidden aria-hidden="true">
                                 <input type="number" id="config-vector_topk" value="5">
-                                <input type="number" id="config-tsvector_topk" value="5">
                                 <input type="number" id="config-bm25_topk" value="5">
                                 <input type="number" id="config-rrf_k" value="60">
                                 <input type="number" id="config-rrf_output_topk" value="20">
@@ -2092,9 +2091,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         // purpose so the global picker (synced on each change, last
                         // one wins) ends up displaying the regular model.
                         var FALLBACK = {
-                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 6, tsvector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
-                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 5, tsvector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
-                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 8, tsvector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
+                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
+                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
+                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
                         };
                         var PRESETS = FALLBACK, DEFAULT = "balanced";
                         // True while apply() is programmatically writing inputs, so the
@@ -3092,7 +3091,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     "  classDef stage_skipped fill:#1c1c1a,color:#a8a29e,stroke:#44403c,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
                     "  classDef stage_subq   fill:#0c1f2e,color:#bae6fd,stroke:#0284c7,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_vector fill:#10203f,color:#bfdbfe,stroke:#2563eb,stroke-width:1px,rx:5,ry:5",
-                    "  classDef stage_tsv    fill:#0a2226,color:#a5f3fc,stroke:#0891b2,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_bm25   fill:#0a221f,color:#99f6e4,stroke:#0d9488,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_rrf    fill:#241f0a,color:#fde68a,stroke:#ca8a04,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_dedup  fill:#26160c,color:#fed7aa,stroke:#ea580c,stroke-width:1px,rx:5,ry:5",
@@ -3115,7 +3113,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 "  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
                 "  classDef stage_subq   fill:#f0f9ff,color:#0c4a6e,stroke:#bae6fd,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5",
-                "  classDef stage_tsv    fill:#ecfeff,color:#155e75,stroke:#a5f3fc,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_rrf    fill:#fefce8,color:#854d0e,stroke:#fde68a,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_dedup  fill:#fff7ed,color:#9a3412,stroke:#fed7aa,stroke-width:1px,rx:5,ry:5",
@@ -3291,7 +3288,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 nodeMap["SL"] = sl;
             }
 
-            // Per-sub-query branches: vector + tsvector + BM25
+            // Per-sub-query branches: vector + BM25
             const subIds = new Set();
             for (const s of trace) {
                 const m = s.stage.match(/^hybrid_search\\.\\w+_q(\\d+)$/);
@@ -3302,7 +3299,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const rrf = stages["hybrid_search.rrf_merge"];
             for (const i of sortedSubs) {
                 const v = stages[`hybrid_search.vector_search_q${i}`];
-                const t = stages[`hybrid_search.tsvector_search_q${i}`];
                 const b = stages[`hybrid_search.bm25_search_q${i}`];
                 const sqText = (v && v.input && v.input.query) || `q${i}`;
                 const sqStage = {stage: `sub_query_${i}`, input: {query: sqText}, output: {}, took_ms: 0};
@@ -3315,12 +3311,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     L.push(`  SQ${i} --> V${i}`);
                     if (rrf) L.push(`  V${i} --> RRF`);
                     nodeMap[`V${i}`] = v;
-                }
-                if (t) {
-                    L.push(`  T${i}["${_label("Keyword search", (t.output.count || 0) + " hits · tsvector", t)}"]:::stage_tsv`);
-                    L.push(`  SQ${i} --> T${i}`);
-                    if (rrf) L.push(`  T${i} --> RRF`);
-                    nodeMap[`T${i}`] = t;
                 }
                 if (b) {
                     L.push(`  B${i}["${_label("BM25 search", (b.output.count || 0) + " hits · Okapi", b)}"]:::stage_bm25`);
@@ -3447,7 +3437,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 
                         for (const j of fqSorted) {
                             const v = stages[`${nsPrefix}hybrid_search.vector_search_q${j}`];
-                            const t = stages[`${nsPrefix}hybrid_search.tsvector_search_q${j}`];
                             const b = stages[`${nsPrefix}hybrid_search.bm25_search_q${j}`];
                             const sqTxt = (v && v.input && v.input.query) || `q${j}`;
                             L.push(`    FQ${i}SQ${j}{{"${_label("Sub-query " + (j+1), _vizText(sqTxt, 48), null)}"}}:::stage_subq`);
@@ -3457,12 +3446,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                 L.push(`    FQ${i}SQ${j} --> FQ${i}V${j}`);
                                 if (fqRrf) L.push(`    FQ${i}V${j} --> FQ${i}RRF`);
                                 nodeMap[`FQ${i}V${j}`] = v;
-                            }
-                            if (t) {
-                                L.push(`    FQ${i}T${j}["${_label("Keyword", (t.output.count || 0) + " hits", t)}"]:::stage_tsv`);
-                                L.push(`    FQ${i}SQ${j} --> FQ${i}T${j}`);
-                                if (fqRrf) L.push(`    FQ${i}T${j} --> FQ${i}RRF`);
-                                nodeMap[`FQ${i}T${j}`] = t;
                             }
                             if (b) {
                                 L.push(`    FQ${i}B${j}["${_label("BM25", (b.output.count || 0) + " hits", b)}"]:::stage_bm25`);
@@ -4216,7 +4199,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             "query_processor":               "breaking your question into parts",
             "structured_lookup":             "looking up named fields and tables",
             "hybrid_search.vector_search":   "searching the specification",
-            "hybrid_search.tsvector_search": "scanning for key terms",
             "hybrid_search.bm25_search":     "ranking keyword matches",
             "hybrid_search.rrf_merge":       "fusing the search results",
             "hybrid_search.total":           "searching the specification",
@@ -4378,7 +4360,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 llm_model: document.getElementById("config-llm_model").value,
                 agentic_model: document.getElementById("config-agentic_model").value,
                 vector_topk: parseInt(document.getElementById("config-vector_topk").value),
-                tsvector_topk: parseInt(document.getElementById("config-tsvector_topk").value),
                 bm25_topk: parseInt(document.getElementById("config-bm25_topk").value),
                 rrf_k: parseInt(document.getElementById("config-rrf_k").value),
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
@@ -4503,7 +4484,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             "query_processor":              {t: "Understand the question",       s: "Decompose into sub-queries and extract entities",        g: "normal"},
             "structured_lookup":            {t: "Structured lookup",             s: "Direct hit against named fields, tables, or figures",     g: "normal"},
             "hybrid_search.vector_search":  {t: "Semantic search",               s: "Embeddings via Voyage (vector similarity)",               g: "normal"},
-            "hybrid_search.tsvector_search":{t: "Keyword search",                s: "Postgres full-text tsvector match",                       g: "normal"},
             "hybrid_search.bm25_search":    {t: "BM25 search",                   s: "Classic Okapi BM25 ranking over the corpus",              g: "normal"},
             "hybrid_search.rrf_merge":      {t: "Fuse search branches",          s: "Reciprocal Rank Fusion across semantic + keyword + BM25", g: "normal"},
             "hybrid_search.total":          {t: "Hybrid search (total)",         s: "End-to-end time across all retrieval branches",           g: "normal"},
@@ -4744,7 +4724,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const config = {
                 spec: window.getSelectedSpec(),
                 vector_topk: parseInt(document.getElementById("config-vector_topk").value),
-                tsvector_topk: parseInt(document.getElementById("config-tsvector_topk").value),
                 bm25_topk: parseInt(document.getElementById("config-bm25_topk").value),
                 rrf_k: parseInt(document.getElementById("config-rrf_k").value),
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
