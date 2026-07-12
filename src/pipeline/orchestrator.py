@@ -1241,6 +1241,7 @@ def _run_stage5_and_finalize(
     tokens_used: dict | None,
     llm_calls: list[dict] | None = None,
     first_pass_verdict: dict | None = None,
+    history: dict | None = None,
 ) -> dict:
     """Run Stage 5 (agentic refinement loop) + Stage 6 (non-agentic gap hint)
     and assemble the response. Extracted so /api/refine can reuse it on top
@@ -1645,6 +1646,8 @@ def _run_stage5_and_finalize(
                             figure_reserve_tokens=config.figure_reserve_tokens,
                             max_tokens=config.agentic_max_output_tokens,
                             context_is_final=True,
+                            history=(history or {}).get("turns") or None,
+                            pinned_chunks=(history or {}).get("pinned_chunks") or None,
                         )
                         took_fp = time.time() - start
                         if isinstance(tokens2, dict):
@@ -1705,6 +1708,8 @@ def _run_stage5_and_finalize(
                     figure_reserve_tokens=config.figure_reserve_tokens,
                     max_tokens=config.agentic_max_output_tokens,
                     emit_verdict=True,
+                    history=(history or {}).get("turns") or None,
+                    pinned_chunks=(history or {}).get("pinned_chunks") or None,
                 )
                 took_g2 = time.time() - start
                 if isinstance(tokens2, dict):
@@ -1836,6 +1841,7 @@ def orchestrate(
     agentic: bool = False,
     refine_seed: dict | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    history: dict | None = None,
 ) -> dict:
     """
     Execute the full retrieval + generation pipeline.
@@ -1856,6 +1862,12 @@ def orchestrate(
             receiving ``{"stage": str, "took_ms": float}``. Best-effort (its
             exceptions are swallowed); used by the streaming endpoint to push
             live progress. May be called from any thread.
+        history: multi-turn chat context, or None for one-shot. Shape:
+                {"turns": [{"query": str, "answer": str}, ...],   # oldest first
+                 "pinned_chunks": [full chunk dicts cited in prior turns]}
+            Turns become a token-budgeted transcript in the user message;
+            pinned chunks get a reserved context bucket so fresh retrieval
+            can't evict them (see generator.assemble_context).
 
     Returns:
         {
@@ -1924,6 +1936,7 @@ def orchestrate(
             citations=citations, context_chunks=context_chunks,
             tokens_used=tokens_used,
             llm_calls=llm_calls,
+            history=history,
         )
 
     # -------------------------------------------------------------------------
@@ -2204,6 +2217,8 @@ def orchestrate(
             # Only the agentic loop consumes the completeness verdict; skip the
             # extra instruction/tokens when the loop won't run.
             emit_verdict=agentic,
+            history=(history or {}).get("turns") or None,
+            pinned_chunks=(history or {}).get("pinned_chunks") or None,
         )
         took_gen = time.time() - start
         if isinstance(tokens_used, dict):
@@ -2284,6 +2299,7 @@ def orchestrate(
         tokens_used=tokens_used,
         llm_calls=llm_calls,
         first_pass_verdict=first_pass_verdict,
+        history=history,
     )
 
 

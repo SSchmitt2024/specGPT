@@ -87,12 +87,13 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.pipeline.auth import (
     SESSION_COOKIE,
     SESSION_LIFETIME_SECONDS,
     LoginThrottle,
+    RateLimiter,
     create_session_token,
     hash_password,
     verify_password,
@@ -176,7 +177,9 @@ _throttle = LoginThrottle()
 
 class QueryRequest(BaseModel):
     """Request body for /api/query endpoint."""
-    query: str
+    query: str = Field(max_length=4000)
+    # Client-generated UUID grouping multi-turn chat; None = one-shot.
+    conversation_id: str | None = Field(default=None, max_length=64)
     config: dict | None = None
     debug: bool = True
     # When true, after the normal pipeline finishes the orchestrator runs a
@@ -241,6 +244,9 @@ class RefineRequest(BaseModel):
     request_id: str
     config: dict | None = None
     debug: bool = True
+    # When the refined answer belongs to a chat turn, keep the stored
+    # conversation history in step with the replacement answer.
+    conversation_id: str | None = Field(default=None, max_length=64)
 
 
 # ============================================================================
@@ -269,6 +275,120 @@ def _refine_cache_get(request_id: str) -> dict | None:
         if state is not None:
             _REFINE_CACHE.move_to_end(request_id)
         return state
+
+
+# ── Multi-turn conversation store ──────────────────────────────────────────
+# Same single-worker in-process pattern as _REFINE_CACHE. Keyed by the
+# client-generated conversation_id; each turn keeps the Q/A pair plus the
+# full chunk dicts behind that turn's non-hallucinated citations so later
+# turns can pin them into context without a Supabase refetch. A page reload
+# mints a new conversation_id (no cross-restart persistence — qa_log keeps
+# the durable record).
+_CONVERSATIONS: OrderedDict[str, list[dict]] = OrderedDict()
+_CONVERSATIONS_LOCK = threading.Lock()
+_CONVERSATIONS_MAX = 100          # LRU cap on live conversations
+MAX_CONVERSATION_TURNS = 30       # growth cap; the UI offers "new conversation"
+# ponytail: pin at most this many chunks; the assemble_context pinned reserve
+# (3000 tokens) is the real ceiling, this just keeps the stored lists small.
+_MAX_PINNED_CHUNKS = 12
+
+
+def _cited_chunks(result: dict) -> list[dict]:
+    """Full chunk dicts behind the answer's non-hallucinated citations,
+    pulled from the pre-rerank pool (the only place in the orchestrate result
+    where chunk text survives). These are what later turns pin into context."""
+    cited_ids = {c.get("section_id") for c in result.get("citations") or []
+                 if not c.get("hallucinated")}
+    cited_ids.discard(None)
+    if not cited_ids:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    for chunk in result.get("deduplicated") or []:
+        sid = chunk.get("section_id")
+        if sid not in cited_ids or not chunk.get("text_raw"):
+            continue
+        key = (chunk.get("spec"), sid, chunk.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(chunk)
+        if len(out) >= _MAX_PINNED_CHUNKS:
+            break
+    return out
+
+
+def _conversation_history(conversation_id: str | None,
+                          exclude_last: bool = False) -> dict | None:
+    """Build the orchestrate(history=...) payload, or None for one-shot /
+    first turn. Raises 409 at the turn cap so the UI can offer a fresh
+    conversation instead of letting qa_log and the pinned pool grow forever.
+
+    ``exclude_last`` is the refine path: it re-answers the latest turn, so
+    that turn's own first-pass answer must not feed back in as history (and
+    re-answering never trips the turn cap)."""
+    if not conversation_id:
+        return None
+    with _CONVERSATIONS_LOCK:
+        turns = list(_CONVERSATIONS.get(conversation_id) or [])
+    if exclude_last:
+        turns = turns[:-1]
+    elif len(turns) >= MAX_CONVERSATION_TURNS:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "conversation_full",
+                    "max_turns": MAX_CONVERSATION_TURNS},
+        )
+    if not turns:
+        return None
+    pinned: list[dict] = []
+    seen: set = set()
+    for turn in turns:
+        for chunk in turn.get("pinned_chunks") or []:
+            key = (chunk.get("spec"), chunk.get("section_id"), chunk.get("chunk_index"))
+            if key in seen:
+                continue
+            seen.add(key)
+            pinned.append(chunk)
+    return {
+        "turns": [{"query": t["query"], "answer": t["answer"]} for t in turns],
+        "pinned_chunks": pinned[:_MAX_PINNED_CHUNKS] or None,
+    }
+
+
+def _conversation_append(conversation_id: str | None, result: dict) -> int | None:
+    """Record a completed turn. Returns the 0-based turn_index (for qa_log),
+    or None when the request wasn't part of a conversation."""
+    if not conversation_id:
+        return None
+    pinned = _cited_chunks(result)
+    with _CONVERSATIONS_LOCK:
+        turns = _CONVERSATIONS.setdefault(conversation_id, [])
+        turns.append({
+            "query": result["query"],
+            "answer": result["answer"],
+            "pinned_chunks": pinned,
+        })
+        _CONVERSATIONS.move_to_end(conversation_id)
+        while len(_CONVERSATIONS) > _CONVERSATIONS_MAX:
+            _CONVERSATIONS.popitem(last=False)
+        return len(turns) - 1
+
+
+def _conversation_replace_last(conversation_id: str | None, result: dict) -> None:
+    """Refine re-answers the latest turn; keep the stored history in step so
+    follow-ups build on the refined answer, not the superseded first pass."""
+    if not conversation_id:
+        return
+    pinned = _cited_chunks(result)
+    with _CONVERSATIONS_LOCK:
+        turns = _CONVERSATIONS.get(conversation_id)
+        if turns:
+            turns[-1] = {
+                "query": result["query"],
+                "answer": result["answer"],
+                "pinned_chunks": pinned,
+            }
 
 
 # ============================================================================
@@ -368,6 +488,32 @@ def require_auth(
     if verify_session_token(specgpt_session, _SESSION_SECRET_BYTES):
         return True
     raise HTTPException(status_code=401, detail={"error": "auth_required"})
+
+
+def _rate_limit_dep(limiter: RateLimiter):
+    """Build a FastAPI dependency that 429s past the limiter's window.
+
+    Keyed by session cookie value (all requests behind require_auth have
+    one), falling back to client IP. In-memory, single-worker, same
+    threat model as LoginThrottle.
+    """
+    def dep(
+        request: Request,
+        specgpt_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+    ) -> None:
+        wait = limiter.retry_after(specgpt_session or _client_ip(request))
+        if wait > 0:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "rate_limited"},
+                headers={"Retry-After": str(int(wait) + 1)},
+            )
+    return dep
+
+
+# /api/query*, /api/refine* each cost a full retrieval + LLM generation.
+query_rate_limit = _rate_limit_dep(RateLimiter(max_requests=10, window_seconds=60.0))
+flag_rate_limit = _rate_limit_dep(RateLimiter(max_requests=30, window_seconds=60.0))
 
 
 def _login_html(error: str | None = None, *, next_path: str = "/") -> str:
@@ -590,7 +736,9 @@ def _figures_from_sources(result: dict) -> list[dict]:
 _qa_log_tasks: set[asyncio.Task] = set()
 
 
-def _qa_log_row(resp: QueryResponse, request_id: str) -> dict:
+def _qa_log_row(resp: QueryResponse, request_id: str,
+                conversation_id: str | None = None,
+                turn_index: int | None = None) -> dict:
     """Map a QueryResponse to a qa_log row. Pure (no IO) so it's unit-testable;
     `spec`/`llm_model` are denormalized out of config for easy querying."""
     config = resp.config or {}
@@ -605,14 +753,18 @@ def _qa_log_row(resp: QueryResponse, request_id: str) -> dict:
         "agentic": resp.agentic,
         "latency_ms": resp.latency_ms,
         "tokens_used": resp.tokens_used,
+        "conversation_id": conversation_id,
+        "turn_index": turn_index,
     }
 
 
-async def _log_qa(resp: QueryResponse, request_id: str) -> None:
+async def _log_qa(resp: QueryResponse, request_id: str,
+                  conversation_id: str | None = None,
+                  turn_index: int | None = None) -> None:
     """Persist one answered query to qa_log. Best-effort: any failure is logged
     and swallowed so a logging problem never affects the user's response. The
     Supabase insert is sync, so it runs in a worker thread off the event loop."""
-    row = _qa_log_row(resp, request_id)
+    row = _qa_log_row(resp, request_id, conversation_id, turn_index)
     try:
         from src.pipeline.search import supabase_client
 
@@ -623,12 +775,14 @@ async def _log_qa(resp: QueryResponse, request_id: str) -> None:
         logger.exception("qa_log insert failed [%s]", request_id)
 
 
-def _schedule_qa_log(resp: QueryResponse, request_id: str) -> None:
+def _schedule_qa_log(resp: QueryResponse, request_id: str,
+                     conversation_id: str | None = None,
+                     turn_index: int | None = None) -> None:
     """Fire-and-forget the qa_log write so every Q&A is recorded without adding
     latency to the request. Records *all* answers, unlike flagged_answers which
     is only the subset a user explicitly flags."""
     try:
-        task = asyncio.create_task(_log_qa(resp, request_id))
+        task = asyncio.create_task(_log_qa(resp, request_id, conversation_id, turn_index))
     except RuntimeError:
         # No running loop (shouldn't happen inside a request handler).
         return
@@ -637,7 +791,11 @@ def _schedule_qa_log(resp: QueryResponse, request_id: str) -> None:
 
 
 @app.post("/api/query")
-async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> QueryResponse:
+async def query_endpoint(
+    req: QueryRequest,
+    _: bool = Depends(require_auth),
+    __: None = Depends(query_rate_limit),
+) -> QueryResponse:
     """
     Run the full retrieval + generation pipeline.
 
@@ -658,6 +816,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
 
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = uuid.uuid4().hex[:12]
+    history = _conversation_history(req.conversation_id)  # 409s at turn cap
 
     start = time.time()
     try:
@@ -666,7 +825,7 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         # block the FastAPI event loop for the duration of the pipeline.
         result = await asyncio.to_thread(
             orchestrate, req.query, config=config, debug=debug_trace,
-            agentic=req.agentic,
+            agentic=req.agentic, history=history,
         )
     except GenerationError as e:
         # Retrieval worked; generation failed. 502 (bad upstream gateway)
@@ -710,7 +869,8 @@ async def query_endpoint(req: QueryRequest, _: bool = Depends(require_auth)) -> 
         figures=_figures_from_sources(result),
         request_id=request_id if not req.agentic else None,
     )
-    _schedule_qa_log(resp, request_id)
+    turn_index = _conversation_append(req.conversation_id, result)
+    _schedule_qa_log(resp, request_id, req.conversation_id, turn_index)
     return resp
 
 
@@ -720,7 +880,11 @@ def _dump_model(model: BaseModel) -> dict:
 
 
 @app.post("/api/query/stream")
-async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_auth)):
+async def query_stream_endpoint(
+    req: QueryRequest,
+    _: bool = Depends(require_auth),
+    __: None = Depends(query_rate_limit),
+):
     """Streaming variant of /api/query.
 
     Emits newline-delimited JSON: a ``{"type":"progress","stage","took_ms"}``
@@ -740,6 +904,7 @@ async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_aut
 
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = uuid.uuid4().hex[:12]
+    history = _conversation_history(req.conversation_id)  # 409s at turn cap
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -752,7 +917,7 @@ async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_aut
         try:
             result = await asyncio.to_thread(
                 orchestrate, req.query, config=config, debug=debug_trace,
-                agentic=req.agentic, on_progress=on_progress,
+                agentic=req.agentic, on_progress=on_progress, history=history,
             )
             latency_ms = (time.time() - start) * 1000
             if not req.agentic:
@@ -777,7 +942,8 @@ async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_aut
                 figures=_figures_from_sources(result),
                 request_id=request_id if not req.agentic else None,
             )
-            _schedule_qa_log(resp, request_id)
+            turn_index = _conversation_append(req.conversation_id, result)
+            _schedule_qa_log(resp, request_id, req.conversation_id, turn_index)
             queue.put_nowait({"type": "done", "data": _dump_model(resp)})
         except GenerationError as e:
             logger.warning("Stream generation failure [%s]: %s", request_id, e.cause)
@@ -812,7 +978,11 @@ async def query_stream_endpoint(req: QueryRequest, _: bool = Depends(require_aut
 
 
 @app.post("/api/refine", response_model=QueryResponse)
-async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -> QueryResponse:
+async def refine_endpoint(
+    req: RefineRequest,
+    _: bool = Depends(require_auth),
+    __: None = Depends(query_rate_limit),
+) -> QueryResponse:
     """Resume a prior /api/query by request_id and run the agentic
     refinement against the cached first-pass state - no Stages 1-4 redo.
     Returns the same QueryResponse shape as /api/query with the refined
@@ -836,6 +1006,7 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         raise HTTPException(status_code=400, detail=f"unknown spec: {config.spec!r}")
 
     debug_trace = req.debug and DEBUG_PIPELINE
+    history = _conversation_history(req.conversation_id, exclude_last=True)
     start = time.time()
     try:
         result = await asyncio.to_thread(
@@ -845,6 +1016,7 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
             debug=debug_trace,
             agentic=True,
             refine_seed=seed,
+            history=history,
         )
     except GenerationError as e:
         logger.warning("Refine generation failure [%s]: %s", req.request_id, e.cause)
@@ -882,12 +1054,17 @@ async def refine_endpoint(req: RefineRequest, _: bool = Depends(require_auth)) -
         figures=_figures_from_sources(result),
         request_id=req.request_id,
     )
-    _schedule_qa_log(resp, req.request_id)
+    _conversation_replace_last(req.conversation_id, result)
+    _schedule_qa_log(resp, req.request_id, req.conversation_id)
     return resp
 
 
 @app.post("/api/refine/stream")
-async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_auth)):
+async def refine_stream_endpoint(
+    req: RefineRequest,
+    _: bool = Depends(require_auth),
+    __: None = Depends(query_rate_limit),
+):
     """Streaming variant of /api/refine — same NDJSON protocol as
     /api/query/stream (progress lines, then a terminal done/error). Lets the
     UI show live agentic-loop progress during the Opus regen, which is the
@@ -908,6 +1085,7 @@ async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_a
 
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = req.request_id
+    history = _conversation_history(req.conversation_id, exclude_last=True)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -920,6 +1098,7 @@ async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_a
             result = await asyncio.to_thread(
                 orchestrate, seed["query"], config=config, debug=debug_trace,
                 agentic=True, refine_seed=seed, on_progress=on_progress,
+                history=history,
             )
             latency_ms = (time.time() - start) * 1000
             # Refresh cache so a second refine builds on the latest Opus output.
@@ -944,7 +1123,8 @@ async def refine_stream_endpoint(req: RefineRequest, _: bool = Depends(require_a
                 figures=_figures_from_sources(result),
                 request_id=request_id,
             )
-            _schedule_qa_log(resp, request_id)
+            _conversation_replace_last(req.conversation_id, result)
+            _schedule_qa_log(resp, request_id, req.conversation_id)
             queue.put_nowait({"type": "done", "data": _dump_model(resp)})
         except GenerationError as e:
             logger.warning("Stream refine generation failure [%s]: %s", request_id, e.cause)
@@ -1129,6 +1309,7 @@ async def define_endpoint(term: str, spec: str = "base", _: bool = Depends(requi
 async def flag_answer_endpoint(
     req: FlagAnswerRequest,
     _: bool = Depends(require_auth),
+    __: None = Depends(flag_rate_limit),
 ) -> dict:
     """Persist a user-reported answer-quality flag.
 
@@ -1425,7 +1606,18 @@ a { color: var(--accent); text-decoration: none; }
 [data-theme="dark"] .icon-moon { display:none; }
 
 /* main */
-.main { flex:1; padding-top:var(--gap-block); padding-bottom:80px; }
+.main { flex:1; padding-top:var(--gap-block); padding-bottom:255px; }
+
+/* chat layout: composer docked to the bottom of the viewport */
+.composer-dock { position:fixed; left:0; right:0; bottom:0; z-index:35; padding:8px 0 14px;
+  background:linear-gradient(to top, var(--bg) 82%, transparent); }
+.turn { margin-bottom:30px; }
+.msg-user { display:flex; justify-content:flex-end; margin:0 0 12px; }
+.msg-user > span { max-width:72%; background:var(--accent-soft); border:1px solid var(--accent-bd);
+  color:var(--ink); padding:10px 14px; border-radius:14px 14px 4px 14px; font-size:14.5px;
+  line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+/* the query now lives in the chat bubble above the card */
+.meta-q { display:none; }
 
 /* composer */
 .composer { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
@@ -1478,7 +1670,7 @@ a { color: var(--accent); text-decoration: none; }
 
 /* cost breakdown popover (under the cost chip) */
 .cost-breakdown { display:none; }
-.cost-estimator.open .cost-breakdown { display:block; position:absolute; right:0; margin-top:8px; z-index:40;
+.cost-estimator.open .cost-breakdown { display:block; position:absolute; right:0; bottom:calc(100% + 8px); z-index:40;
   width:380px; background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
   box-shadow:var(--shadow-pop); padding:14px; animation:fadeUp .14s ease; }
 .cost-estimator { position:relative; }
@@ -1493,7 +1685,8 @@ a { color: var(--accent); text-decoration: none; }
 
 /* config popover */
 .config-panel, .agentic-config { display:none; }
-.config-panel.open { display:block; position:absolute; z-index:40; margin-top:8px; left:0; width:520px;
+.config-panel.open { display:block; position:absolute; z-index:40; bottom:calc(100% + 8px); left:0; width:520px;
+  max-height:min(70vh, 640px); overflow-y:auto;
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
   box-shadow:var(--shadow-pop); padding:16px; animation:fadeUp .14s ease; }
 .config-pop-wrap { position:relative; }
@@ -1545,7 +1738,7 @@ a { color: var(--accent); text-decoration: none; }
 /* answer card */
 .answer-box { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow-sm); overflow:hidden; }
-#answer-section.answer-stale { opacity: 0.4; transition: opacity 0.2s; }
+.answer-section.answer-stale { opacity: 0.4; transition: opacity 0.2s; }
 .answer-meta { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--surface-2); }
 .meta-q { font-size:13px; font-weight:600; color:var(--ink); margin-right:auto; letter-spacing:-0.01em;
   max-width:58%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1601,7 +1794,7 @@ a { color: var(--accent); text-decoration: none; }
 .answer-text table.has-attrib, .answer-text pre.has-attrib { margin-bottom:4px; }
 
 /* latency tag in answer meta (legacy id #latency reused) */
-#latency { display:none; }
+.latency { display:none; }
 
 /* sources sidebar */
 .sources { position:sticky; top:74px; }
@@ -1692,12 +1885,12 @@ a { color: var(--accent); text-decoration: none; }
 .viz-container svg { max-width:100%; height:auto; }
 .viz-empty { color:var(--t-faint); font-size:12.5px; padding:24px; text-align:center; }
 /* node hover highlight */
-#pipeline-viz g.node { transition:filter .12s ease; }
-#pipeline-viz g.node:hover { filter:drop-shadow(0 3px 9px rgba(0,0,0,.24)); }
-#pipeline-viz g.node:hover rect,
-#pipeline-viz g.node:hover polygon,
-#pipeline-viz g.node:hover circle,
-#pipeline-viz g.node:hover path { stroke-width:2.5px !important; }
+.viz-container g.node { transition:filter .12s ease; }
+.viz-container g.node:hover { filter:drop-shadow(0 3px 9px rgba(0,0,0,.24)); }
+.viz-container g.node:hover rect,
+.viz-container g.node:hover polygon,
+.viz-container g.node:hover circle,
+.viz-container g.node:hover path { stroke-width:2.5px !important; }
 /* per-iteration pass navigation (top-right of the chart) */
 .viz-pass-nav { position:absolute; right:10px; top:10px; z-index:5; display:flex; align-items:center; gap:5px; padding:4px 6px; background:var(--surface); border:1px solid var(--border); border-radius:9px; box-shadow:var(--shadow-sm); }
 .viz-pass-nav button { width:26px; height:26px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--t-muted); display:grid; place-items:center; font-size:14px; line-height:1; padding:0; cursor:pointer; transition:border-color .12s, color .12s; }
@@ -1716,7 +1909,7 @@ a { color: var(--accent); text-decoration: none; }
 .trace-count { color:var(--t-faint); font-weight:400; font-family:var(--mono); font-size:11.5px; }
 .trace-summary-chevron { margin-left:auto; color:var(--t-faint); font-size:10px; transition:transform .18s; }
 .trace-details[open] .trace-summary-chevron { transform:rotate(180deg); }
-#pipeline-stages { padding:6px 14px 14px; }
+.pipeline-stages { padding:6px 14px 14px; }
 .pipeline-stage { border-bottom:1px dashed var(--border); }
 .pipeline-stage:last-child { border-bottom:0; }
 .pipeline-stage.stage-group-agentic { background:color-mix(in srgb, var(--accent) 4%, transparent); border-radius:var(--radius-xs); }
@@ -1991,6 +2184,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     <span class="picker-lbl">Spec</span>
                     <select id="global-spec-select"></select>
                 </label>
+                <button id="new-chat-btn" class="ghost-btn" type="button" title="Start a fresh conversation">New chat</button>
                 <form class="topbar-form" method="post" action="/logout">
                     <button type="submit" class="ghost-btn">Sign out</button>
                 </form>
@@ -2000,11 +2194,150 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 
     <main class="main">
         <div class="wrap">
+            <div id="empty-state" class="empty">
+                <div class="empty-mark">
+                    <img src="/static/favicon.png" alt="">
+                </div>
+                <h2>Ask the NVMe specification anything</h2>
+                <p>Type a question and get a grounded, citation-backed answer. Every source
+                   section is listed alongside, and you can inspect exactly how the answer
+                   was retrieved.</p>
+                <div class="examples" id="examples"></div>
+            </div>
+
+            <div id="results" class="hidden">
+                <div id="error" class="error hidden"></div>
+
+            </div>
+
+            <!-- Per-turn chat message: cloned for every query. The clone carries
+                 the canonical ids so all existing render code targets the newest
+                 turn; retired turns keep classes/listeners but lose their ids. -->
+            <template id="turn-template">
+                <div class="turn">
+                    <div class="msg-user"><span></span></div>
+                <div id="loading" class="loading hidden" role="status" aria-live="polite">
+                    <div class="loading-spinner" aria-hidden="true"></div>
+                    <div class="loading-body">
+                        <div class="loading-title" id="loading-title">Thinking…</div>
+                        <div class="loading-ticker" id="loading-ticker"></div>
+                        <div class="loading-meta"><span id="loading-elapsed">0.0s elapsed</span></div>
+                    </div>
+                    <button type="button" class="loading-cancel" id="loading-cancel">Cancel</button>
+                </div>
+
+                <div id="answer-section" class="answer-section hidden">
+                    <div class="split">
+                        <div class="split-main">
+                            <div class="answer-box">
+                                <div class="answer-meta" id="answer-meta"></div>
+                                <h3>Answer</h3>
+                                <div id="latency" class="latency"></div>
+                                <div id="answer-text" class="answer-text"></div>
+                            </div>
+
+                            <div id="agent-strip" class="agent-strip" aria-label="Agent activity"></div>
+
+                            <div id="pipeline-disclosure" class="pipe">
+                                <button class="pipe-head" id="pipe-head" type="button">
+                                    <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
+                                    <span class="pipe-title">How this answer was found</span>
+                                    <span class="pipe-summary" id="pipe-summary"></span>
+                                    <span class="pipe-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
+                                </button>
+                                <div class="pipe-body" id="pipe-body">
+                                    <div class="viz-section">
+                                        <div class="viz-header-row">
+                                            <div>
+                                                <h2>Pipeline flow</h2>
+                                                <div class="viz-sub">
+                                                    Each color is a stage family. Branches show per-sub-query
+                                                    retrieval (semantic, keyword, BM25); all paths merge through
+                                                    rank fusion, dedup, rerank, generation. Click any node to inspect it.
+                                                </div>
+                                            </div>
+                                            <div id="viz-nav" class="viz-nav" style="display:none">
+                                                <button id="viz-nav-prev" class="viz-nav-btn" onclick="vizPrev()" title="Previous pass">&#8592;</button>
+                                                <span id="viz-nav-label" class="viz-nav-label">Pass 1 / 1</span>
+                                                <button id="viz-nav-next" class="viz-nav-btn" onclick="vizNext()" title="Next pass">&#8594;</button>
+                                            </div>
+                                        </div>
+                                        <div id="pipeline-viz" class="viz-container">
+                                            <div class="viz-empty">Run a query to see the pipeline flow.</div>
+                                        </div>
+                                        <div id="pipeline-legend" class="viz-legend" style="display:none">
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#ede9fe;border-color:#a78bfa"></span>Understand</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#d1fae5;border-color:#34d399"></span>Structured lookup</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#dbeafe;border-color:#93c5fd"></span>Semantic / keyword / BM25</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fef3c7;border-color:#fbbf24"></span>Fuse &amp; dedup</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fecaca;border-color:#fca5a5"></span>Rerank</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#1e40af;border-color:#1e3a8a"></span>Generate</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#f3e8ff;border-color:#c084fc"></span>Agentic pass</span>
+                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#10b981;border-color:#047857"></span>Final answer</span>
+                                        </div>
+                                    </div>
+
+                                    <details id="trace-details" class="trace-details">
+                                        <summary class="trace-summary">
+                                            Pipeline trace
+                                            <span id="trace-stage-count" class="trace-count"></span>
+                                            <span class="trace-summary-chevron">&#9662;</span>
+                                        </summary>
+                                        <div id="pipeline-stages" class="pipeline-stages"></div>
+                                    </details>
+
+                                    <div class="model-panel" id="model-panel">
+                                        <button class="model-panel-header" onclick="toggleModelPanel(this)" type="button">
+                                            Models &amp; cost
+                                            <span class="model-panel-badge" id="model-cost-badge" style="display:none"></span>
+                                            <span class="model-panel-chevron" id="model-panel-chevron">&#9662;</span>
+                                        </button>
+                                        <div class="model-panel-body" id="model-panel-body">
+                                            <table class="model-table" id="model-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>Stage</th><th>Model</th><th>Provider</th>
+                                                        <th>$/1M in</th><th>$/1M out</th><th>Note</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody id="model-table-body">
+                                                    <tr><td colspan="6" class="model-note">Loading...</td></tr>
+                                                </tbody>
+                                            </table>
+                                            <div class="model-cost-row" id="model-cost-row" style="display:none"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <aside class="sources">
+                            <div id="citations-box" class="citations hidden">
+                                <div class="sources-head">
+                                    <h3>Sources cited</h3>
+                                    <span class="sources-count" id="sources-count"></span>
+                                </div>
+                                <div id="citations-list" class="src-list"></div>
+                                <div class="sources-foot">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4m0-4h.01"/></svg>
+                                    <span>A green check marks a section verified in the retrieved context. An amber question mark means the model cited it without it being in the retrieved context.</span>
+                                </div>
+                            </div>
+                        </aside>
+                    </div>
+                </div>
+                </div>
+            </template>
+        </div>
+    </main>
+
+    <div class="composer-dock">
+        <div class="wrap">
             <div id="composer" class="composer">
                 <div class="composer-row">
                     <div class="composer-input-wrap">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
-                        <textarea id="query-input" autocomplete="off" rows="1"
+                        <textarea id="query-input" autocomplete="off" rows="1" maxlength="4000"
                                placeholder="Ask about the NVMe spec...  e.g. What does CIRN indicate?"></textarea>
                     </div>
                     <button id="search-btn" class="ask-btn">
@@ -2196,134 +2529,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     </span>
                 </div>
             </div>
-
-            <div id="empty-state" class="empty">
-                <div class="empty-mark">
-                    <img src="/static/favicon.png" alt="">
-                </div>
-                <h2>Ask the NVMe specification anything</h2>
-                <p>Type a question and get a grounded, citation-backed answer. Every source
-                   section is listed alongside, and you can inspect exactly how the answer
-                   was retrieved.</p>
-                <div class="examples" id="examples"></div>
-            </div>
-
-            <div id="results" class="hidden">
-                <div id="error" class="error hidden"></div>
-
-                <div id="loading" class="loading hidden" role="status" aria-live="polite">
-                    <div class="loading-spinner" aria-hidden="true"></div>
-                    <div class="loading-body">
-                        <div class="loading-title" id="loading-title">Thinking…</div>
-                        <div class="loading-ticker" id="loading-ticker"></div>
-                        <div class="loading-meta"><span id="loading-elapsed">0.0s elapsed</span></div>
-                    </div>
-                    <button type="button" class="loading-cancel" id="loading-cancel">Cancel</button>
-                </div>
-
-                <div id="answer-section" class="hidden">
-                    <div class="split">
-                        <div class="split-main">
-                            <div class="answer-box">
-                                <div class="answer-meta" id="answer-meta"></div>
-                                <h3>Answer</h3>
-                                <div id="latency"></div>
-                                <div id="answer-text" class="answer-text"></div>
-                            </div>
-
-                            <div id="agent-strip" class="agent-strip" aria-label="Agent activity"></div>
-
-                            <div id="pipeline-disclosure" class="pipe">
-                                <button class="pipe-head" id="pipe-head" type="button">
-                                    <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="15" y="3" width="6" height="5" rx="1.2"/><rect x="9" y="16" width="6" height="5" rx="1.2"/><path d="M6 8v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8M12 13v3"/></svg>
-                                    <span class="pipe-title">How this answer was found</span>
-                                    <span class="pipe-summary" id="pipe-summary"></span>
-                                    <span class="pipe-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
-                                </button>
-                                <div class="pipe-body" id="pipe-body">
-                                    <div class="viz-section">
-                                        <div class="viz-header-row">
-                                            <div>
-                                                <h2>Pipeline flow</h2>
-                                                <div class="viz-sub">
-                                                    Each color is a stage family. Branches show per-sub-query
-                                                    retrieval (semantic, keyword, BM25); all paths merge through
-                                                    rank fusion, dedup, rerank, generation. Click any node to inspect it.
-                                                </div>
-                                            </div>
-                                            <div id="viz-nav" class="viz-nav" style="display:none">
-                                                <button id="viz-nav-prev" class="viz-nav-btn" onclick="vizPrev()" title="Previous pass">&#8592;</button>
-                                                <span id="viz-nav-label" class="viz-nav-label">Pass 1 / 1</span>
-                                                <button id="viz-nav-next" class="viz-nav-btn" onclick="vizNext()" title="Next pass">&#8594;</button>
-                                            </div>
-                                        </div>
-                                        <div id="pipeline-viz" class="viz-container">
-                                            <div class="viz-empty">Run a query to see the pipeline flow.</div>
-                                        </div>
-                                        <div id="pipeline-legend" class="viz-legend" style="display:none">
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#ede9fe;border-color:#a78bfa"></span>Understand</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#d1fae5;border-color:#34d399"></span>Structured lookup</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#dbeafe;border-color:#93c5fd"></span>Semantic / keyword / BM25</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fef3c7;border-color:#fbbf24"></span>Fuse &amp; dedup</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#fecaca;border-color:#fca5a5"></span>Rerank</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#1e40af;border-color:#1e3a8a"></span>Generate</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#f3e8ff;border-color:#c084fc"></span>Agentic pass</span>
-                                            <span class="viz-legend-item"><span class="viz-legend-swatch" style="background:#10b981;border-color:#047857"></span>Final answer</span>
-                                        </div>
-                                    </div>
-
-                                    <details id="trace-details" class="trace-details">
-                                        <summary class="trace-summary">
-                                            Pipeline trace
-                                            <span id="trace-stage-count" class="trace-count"></span>
-                                            <span class="trace-summary-chevron">&#9662;</span>
-                                        </summary>
-                                        <div id="pipeline-stages"></div>
-                                    </details>
-
-                                    <div class="model-panel" id="model-panel">
-                                        <button class="model-panel-header" onclick="toggleModelPanel()" type="button">
-                                            Models &amp; cost
-                                            <span class="model-panel-badge" id="model-cost-badge" style="display:none"></span>
-                                            <span class="model-panel-chevron" id="model-panel-chevron">&#9662;</span>
-                                        </button>
-                                        <div class="model-panel-body" id="model-panel-body">
-                                            <table class="model-table" id="model-table">
-                                                <thead>
-                                                    <tr>
-                                                        <th>Stage</th><th>Model</th><th>Provider</th>
-                                                        <th>$/1M in</th><th>$/1M out</th><th>Note</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody id="model-table-body">
-                                                    <tr><td colspan="6" class="model-note">Loading...</td></tr>
-                                                </tbody>
-                                            </table>
-                                            <div class="model-cost-row" id="model-cost-row" style="display:none"></div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <aside class="sources">
-                            <div id="citations-box" class="citations hidden">
-                                <div class="sources-head">
-                                    <h3>Sources cited</h3>
-                                    <span class="sources-count" id="sources-count"></span>
-                                </div>
-                                <div id="citations-list" class="src-list"></div>
-                                <div class="sources-foot">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4m0-4h.01"/></svg>
-                                    <span>A green check marks a section verified in the retrieved context. An amber question mark means the model cited it without it being in the retrieved context.</span>
-                                </div>
-                            </div>
-                        </aside>
-                    </div>
-                </div>
-            </div>
         </div>
-    </main>
+    </div>
 
     <!-- Stage-detail popups are created dynamically (up to 4, draggable, FIFO);
          see showStagePopup() / the stage-popup manager in the script below. -->
@@ -2513,9 +2720,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         let _modelsData = null;
         let _lastIsAgentic = false;
 
-        function toggleModelPanel() {
-            const body = document.getElementById("model-panel-body");
-            const chevron = document.getElementById("model-panel-chevron");
+        function toggleModelPanel(btn) {
+            const panel = btn ? btn.closest(".model-panel") : document.getElementById("model-panel");
+            if (!panel) return;
+            const body = panel.querySelector(".model-panel-body");
+            const chevron = panel.querySelector(".model-panel-chevron");
             const open = body.classList.toggle("open");
             chevron.textContent = open ? "▲" : "▼";
         }
@@ -2554,6 +2763,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             // Open-weight models on UNH's own GPUs (free local compute)
             {id: "deepthought-llama-3.3-70b",        label: "Llama 3.3 70B",        provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 4, tags: []},
             {id: "deepthought-qwen3-30b",            label: "Qwen3 30B Instruct",   provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 3, tags: []},
+            // Direct Anthropic API (personal ANTHROPIC_API_KEY) - works off the
+            // UNH network, real per-token cost.
+            {id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "Claude (Anthropic API)", in: 3.0, out: 15.0, speed: 4, tags: ["no VPN"]},
         ];
 
         // Tag the per-provider cheapest (by input price) and fastest (by speed
@@ -2586,7 +2798,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (!selectEl) return;
             const byProvider = {};
             for (const m of MODEL_CATALOG) {
-                if (!m.provider || !m.provider.startsWith("DeepThought")) continue;
+                if (!m.provider || (!m.provider.startsWith("DeepThought") && !m.provider.startsWith("Claude"))) continue;
                 (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
             }
             // Stable provider order matching the catalog declaration (only included providers).
@@ -4071,9 +4283,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         const configToggle = document.getElementById("config-toggle");
         const configPanel = document.getElementById("config-panel");
         const resultsDiv = document.getElementById("results");
-        const loadingDiv = document.getElementById("loading");
         const errorDiv = document.getElementById("error");
-        const answerSection = document.getElementById("answer-section");
+        // Per-turn elements: resolve at call time — only the newest turn
+        // carries the canonical ids (see newTurnNode / retireTurns).
+        const loadingEl = () => document.getElementById("loading");
+        const answerSectionEl = () => document.getElementById("answer-section");
         const agenticToggle = document.getElementById("agentic-toggle");
         const agenticConfig = document.getElementById("agentic-config");
         agenticToggle.addEventListener("change", () => {
@@ -4115,6 +4329,62 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         let _loadingTimer = null;
         let _loadingStart = 0;
 
+        // ── Chat turns ────────────────────────────────────────────────────
+        // Each query appends a clone of #turn-template. The clone carries the
+        // canonical element ids, so every existing renderer keeps targeting
+        // the newest turn; retiring a turn strips its ids but leaves classes,
+        // rendered content, and listeners intact.
+        function _newConvoId() {
+            return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+                : "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+        }
+        let _conversationId = _newConvoId();
+
+        function retireTurns() {
+            resultsDiv.querySelectorAll(".turn [id]").forEach(el => el.removeAttribute("id"));
+            // Controls that only make sense on the live turn.
+            resultsDiv.querySelectorAll(".turn .viz-pass-nav").forEach(el => el.remove());
+            resultsDiv.querySelectorAll(".turn .gap-act").forEach(btn => {
+                btn.disabled = true;
+                btn.title = "Refine is only available on the latest answer";
+            });
+        }
+
+        function newTurnNode(query) {
+            retireTurns();
+            const tpl = document.getElementById("turn-template");
+            const node = tpl.content.firstElementChild.cloneNode(true);
+            node.querySelector(".msg-user > span").textContent = query;
+            resultsDiv.appendChild(node);
+            const empty = document.getElementById("empty-state");
+            if (empty) empty.classList.add("hidden");
+            node.scrollIntoView({ behavior: "smooth", block: "start" });
+            return node;
+        }
+
+        function currentTurn() {
+            const turns = resultsDiv.querySelectorAll(".turn");
+            return turns.length ? turns[turns.length - 1] : null;
+        }
+
+        function newConversation() {
+            if (_activeAbort) { try { _activeAbort.abort(); } catch (e) {} }
+            _conversationId = _newConvoId();
+            resultsDiv.querySelectorAll(".turn").forEach(el => el.remove());
+            errorDiv.classList.add("hidden");
+            resultsDiv.classList.add("hidden");
+            const empty = document.getElementById("empty-state");
+            if (empty) empty.classList.remove("hidden");
+            if (typeof closeAllStagePopups === "function") closeAllStagePopups();
+            if (typeof resetFlagFab === "function") resetFlagFab();
+            window._lastResponse = null;
+            window._pipeTrace = null;
+        }
+        (function () {
+            const btn = document.getElementById("new-chat-btn");
+            if (btn) btn.addEventListener("click", newConversation);
+        })();
+
         function _startLoading(title) {
             const titleEl   = document.getElementById("loading-title");
             const elapsedEl = document.getElementById("loading-elapsed");
@@ -4123,9 +4393,19 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (cancelBtn) {
                 cancelBtn.disabled = false;
                 cancelBtn.textContent = "Cancel";
+                // Each chat turn clones its own cancel button; onclick (not
+                // addEventListener) so re-entry never stacks handlers.
+                cancelBtn.onclick = () => {
+                    if (_activeAbort) {
+                        cancelBtn.disabled = true;
+                        cancelBtn.textContent = "Cancelling…";
+                        _activeAbort.abort();
+                    }
+                };
             }
             _startThinking();
-            loadingDiv.classList.remove("hidden");
+            const ld = loadingEl();
+            if (ld) ld.classList.remove("hidden");
             // Disable search to prevent concurrent submits while a query runs.
             if (searchBtn) searchBtn.disabled = true;
             _loadingStart = Date.now();
@@ -4139,12 +4419,14 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         }
 
         function _stopLoading() {
-            loadingDiv.classList.add("hidden");
+            const ld = loadingEl();
+            if (ld) ld.classList.add("hidden");
             if (_loadingTimer) { clearInterval(_loadingTimer); _loadingTimer = null; }
             _stopThinking();
             if (searchBtn) searchBtn.disabled = false;
             _activeAbort = null;
-            answerSection.classList.remove("answer-stale");
+            const ans = answerSectionEl();
+            if (ans) ans.classList.remove("answer-stale");
         }
 
         // ─── Favicon badge ────────────────────────────────────────────────
@@ -4329,19 +4611,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             return done;
         }
 
-        // Cancel button: aborts the in-flight fetch. Hook it up once on load.
-        (function () {
-            const btn = document.getElementById("loading-cancel");
-            if (!btn) return;
-            btn.addEventListener("click", () => {
-                if (_activeAbort) {
-                    btn.disabled = true;
-                    btn.textContent = "Cancelling…";
-                    _activeAbort.abort();
-                }
-            });
-        })();
-
         async function runQuery() {
             const query = queryInput.value.trim();
             if (!query) return;
@@ -4380,14 +4649,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 })(),
             };
 
-            // Show loading
+            // Append a fresh chat turn (query bubble + loading + answer card).
             resultsDiv.classList.remove("hidden");
             errorDiv.classList.add("hidden");
-            if (!answerSection.classList.contains("hidden")) {
-                answerSection.classList.add("answer-stale");
-            } else {
-                answerSection.classList.add("hidden");
-            }
+            newTurnNode(query);
+            queryInput.value = "";
+            autoResizeInput();
 
             const agentic = agenticToggle.checked;
             const title = agentic ? "Thinking deeply…" : "Thinking…";
@@ -4397,7 +4664,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             try {
                 const data = await _streamPipeline(
                     "/api/query/stream",
-                    { query, config, debug: true, agentic },
+                    { query, config, debug: true, agentic, conversation_id: _conversationId },
                     _activeAbort.signal,
                     (evt) => _onThinkStage(evt.stage)
                 );
@@ -4408,7 +4675,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     // and don't show an error banner.
                     return;
                 }
-                errorDiv.textContent = `Error: ${err.message}`;
+                errorDiv.textContent = err.status === 409
+                    ? "This conversation hit its turn limit. Use New chat (top right) to keep going."
+                    : `Error: ${err.message}`;
+                const turn = currentTurn();
+                if (turn) turn.appendChild(errorDiv);
                 errorDiv.classList.remove("hidden");
             } finally {
                 _stopLoading();
@@ -4745,10 +5016,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             };
 
             errorDiv.classList.add("hidden");
-            if (!answerSection.classList.contains("hidden")) {
-                answerSection.classList.add("answer-stale");
-            } else {
-                answerSection.classList.add("hidden");
+            const ans = answerSectionEl();
+            if (ans && !ans.classList.contains("hidden")) {
+                ans.classList.add("answer-stale");
             }
             _startLoading("Refining the answer…");
 
@@ -4756,7 +5026,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             try {
                 const data = await _streamPipeline(
                     "/api/refine/stream",
-                    { request_id: requestId, config, debug: true },
+                    { request_id: requestId, config, debug: true, conversation_id: _conversationId },
                     _activeAbort.signal,
                     (evt) => _onThinkStage(evt.stage)
                 );
@@ -4768,6 +5038,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     // full re-run so the user always has a working path. Hand
                     // off to runQuery which manages its own loading lifecycle.
                     _stopLoading();
+                    if (window._lastResponse && window._lastResponse.query) {
+                        queryInput.value = window._lastResponse.query;
+                    }
                     runQuery();
                     return;
                 }
@@ -6330,15 +6603,20 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (i) i.addEventListener("keydown", function (e) { if (e.key === "Enter" && !e.shiftKey) hideEmpty(); });
         })();
 
-        /* ── pipeline disclosure toggle ──────────────────────────────────── */
+        /* ── pipeline disclosure toggle (delegated: works on every chat turn) ── */
         (function () {
-            var head = document.getElementById("pipe-head");
-            var disc = document.getElementById("pipeline-disclosure");
-            if (head && disc) head.addEventListener("click", function () {
+            var results = document.getElementById("results");
+            if (!results) return;
+            results.addEventListener("click", function (e) {
+                var head = e.target.closest(".pipe-head");
+                if (!head || !results.contains(head)) return;
+                var disc = head.closest(".pipe");
+                if (!disc) return;
                 var opened = disc.classList.toggle("open");
-                if (opened && window._pipeTrace && typeof renderPipelineViz === "function") {
+                // Only the live turn re-renders; retired turns keep their SVG.
+                if (opened && disc.id === "pipeline-disclosure" && window._pipeTrace && typeof renderPipelineViz === "function") {
                     // Re-render now that the container is visible and measurable.
-                    try { renderPipelineViz(window._pipeTrace, window._pipeQuery); } catch (e) {}
+                    try { renderPipelineViz(window._pipeTrace, window._pipeQuery); } catch (err) {}
                 }
             });
         })();

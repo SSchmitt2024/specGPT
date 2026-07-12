@@ -183,6 +183,32 @@ _FAIL_WINDOW_SECONDS = 300
 _FAIL_DELAYS = [0.0, 0.0, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
 
 
+class RateLimiter:
+    """
+    Sliding-window request limiter for authenticated endpoints.
+
+    Keyed by session cookie value (falls back to client IP). Same
+    single-process / in-memory caveat as LoginThrottle below. Returns the
+    seconds to wait before the next request is allowed (0.0 = allowed now);
+    an allowed call is recorded immediately.
+    """
+
+    def __init__(self, max_requests: int, window_seconds: float = 60.0) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._hits: dict[str, list[float]] = {}
+
+    def retry_after(self, key: str) -> float:
+        now = time.monotonic()
+        recent = [t for t in self._hits.get(key, []) if t > now - self.window_seconds]
+        if len(recent) >= self.max_requests:
+            self._hits[key] = recent
+            return recent[0] + self.window_seconds - now
+        recent.append(now)
+        self._hits[key] = recent
+        return 0.0
+
+
 class LoginThrottle:
     """
     Sliding-window per-IP failure counter.

@@ -61,6 +61,13 @@ DEFAULT_FIGURE_RESERVE_TOKENS = 3000
 DEFAULT_FIGURE_TRIM_TOKENS = 450
 DEFAULT_REQUEST_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 3
+# Multi-turn chat: additive reserve for chunks cited in PRIOR conversation
+# turns (same shape as the figure reserve), so a follow-up's fresh retrieval
+# can never evict the sections the conversation is already anchored on.
+DEFAULT_PINNED_RESERVE_TOKENS = 3000
+# Token budget for the prior-turn Q/A transcript injected into the user
+# message on multi-turn requests. Newest turns kept first; oldest dropped.
+DEFAULT_HISTORY_TOKENS = 2000
 
 # Methods that mark a chunk as a deferred figure pull (the figure tables the
 # prose points at, fetched after ranking). These get the assemble_context
@@ -280,6 +287,23 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _format_history(turns: list[dict], max_tokens: int = DEFAULT_HISTORY_TOKENS) -> str:
+    """Render prior conversation turns as a Q/A transcript under a token
+    budget. Walks newest-first so the most recent turns survive, then emits
+    oldest-first for natural reading order. Turns are verbatim, not
+    summarised (ponytail: add LLM summaries only if follow-ups degrade)."""
+    kept: list[str] = []
+    total = 0
+    for turn in reversed(turns):
+        block = f"Q: {turn.get('query', '')}\nA: {turn.get('answer', '')}"
+        block_tokens = _estimate_tokens(block)
+        if total + block_tokens > max_tokens:
+            break
+        kept.append(block)
+        total += block_tokens
+    return "\n\n".join(reversed(kept))
+
+
 def _table_header_line_count(lines: list[str]) -> int:
     """
     Count the header rows emitted by table_serializer.serialize_table:
@@ -340,6 +364,8 @@ def assemble_context(
     *,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
     figure_reserve_tokens: int = DEFAULT_FIGURE_RESERVE_TOKENS,
+    pinned_chunks: list[dict] | None = None,
+    pinned_reserve_tokens: int = DEFAULT_PINNED_RESERVE_TOKENS,
 ) -> tuple[str, list[dict]]:
     """
     Assemble context from chunks, respecting token budget.
@@ -363,6 +389,11 @@ def assemble_context(
         figure_reserve_tokens: additional budget reserved for referenced-figure
             chunks so they survive a prose-saturated context. Set to 0 to
             disable the reserve (pre-fix behaviour).
+        pinned_chunks: full chunk dicts cited in PRIOR conversation turns.
+            Admitted first under their own additive ``pinned_reserve_tokens``
+            budget so fresh retrieval can never evict them (multi-turn
+            follow-ups must stay answerable against earlier citations).
+        pinned_reserve_tokens: budget for ``pinned_chunks``.
 
     Returns:
         (formatted_context, used_chunks) where formatted_context is ready for
@@ -440,6 +471,18 @@ def assemble_context(
         })
         seen_ids.add(dedup_key)
         return running_tokens + chunk_tokens
+
+    # Pass 0: chunks cited in prior conversation turns, under their own
+    # additive reserve. Running first means they hold the top context slots
+    # and Pass 1's seen_ids dedup skips any the new retrieval re-found.
+    if pinned_chunks and pinned_reserve_tokens > 0:
+        pin_tokens = 0
+        for chunk in pinned_chunks:
+            nt = _admit(chunk, running_tokens=pin_tokens,
+                        budget=pinned_reserve_tokens,
+                        trim_tokens=max(pinned_reserve_tokens // 3, DEFAULT_FIGURE_TRIM_TOKENS))
+            if nt is not None:
+                pin_tokens = nt
 
     # Pass 1: every chunk in rank order fills the main budget (generous trim),
     # skipping (not breaking on) oversized chunks so lower-ranked hits that
@@ -1015,6 +1058,8 @@ def generate(
     max_retries: int = DEFAULT_MAX_RETRIES,
     emit_verdict: bool = False,
     context_is_final: bool = False,
+    history: list[dict] | None = None,
+    pinned_chunks: list[dict] | None = None,
 ) -> tuple[str, list[dict], list[dict], dict, dict | None]:
     """
     Generate an answer using Claude Sonnet from retrieved context.
@@ -1034,6 +1079,11 @@ def generate(
             further retrieval will happen, so it must answer from the given
             context without deferring to unavailable sources. Used by the
             agentic loop's wrap-up pass after a stall / iteration cap.
+        history: prior conversation turns (``[{"query", "answer"}, ...]``,
+            oldest first). Rendered as a token-budgeted transcript block in
+            the user message so follow-up questions resolve against it.
+        pinned_chunks: full chunk dicts cited in prior turns; forwarded to
+            ``assemble_context`` under its pinned reserve budget.
 
     Returns:
         ``(answer, citations, used_chunks, tokens_used, verdict)`` where ``answer``
@@ -1060,6 +1110,7 @@ def generate(
         context_chunks,
         max_context_tokens=max_context_tokens,
         figure_reserve_tokens=figure_reserve_tokens,
+        pinned_chunks=pinned_chunks,
     )
 
     # If every retrieved chunk overflowed the token budget, used_chunks is
@@ -1081,11 +1132,25 @@ def generate(
     if emit_verdict:
         full_system_prompt += VERDICT_INSTRUCTION
 
+    # Multi-turn: prior turns ride in the user message as a transcript block.
+    # ponytail: one textual format works across all four backends; switch to
+    # real message turns if follow-up answer quality needs it.
+    user_message = query
+    if history:
+        transcript = _format_history(history)
+        if transcript:
+            user_message = (
+                "Prior turns of this conversation, for context only "
+                "(do not re-answer them):\n\n"
+                f"{transcript}\n\n"
+                f"Current question: {query}"
+            )
+
     # Step 3: Call the appropriate backend based on the model prefix.
     if model in DEEPTHOUGHT_MODELS or model == "deepthought":
         # ── UNH DeepThought (OpenAI-compatible, on-prem) ───────────────
         answer, tokens_used = _call_deepthought(
-            query,
+            user_message,
             full_system_prompt,
             model=resolve_deepthought_model(model),
             max_tokens=max_tokens,
@@ -1094,7 +1159,7 @@ def generate(
     elif model.startswith("gemini-"):
         # ── Google Gemini path ─────────────────────────────────────────
         answer, tokens_used = _call_gemini(
-            query,
+            user_message,
             full_system_prompt,
             model=model,
             max_tokens=max_tokens,
@@ -1103,7 +1168,7 @@ def generate(
     elif model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
         # ── OpenAI path (gpt-*, o1-*, o3-*, o4-*) ──────────────────────
         answer, tokens_used = _call_openai(
-            query,
+            user_message,
             full_system_prompt,
             model=model,
             max_tokens=max_tokens,
@@ -1116,7 +1181,7 @@ def generate(
             client,
             model=model,
             system=full_system_prompt,
-            messages=[{"role": "user", "content": query}],
+            messages=[{"role": "user", "content": user_message}],
             max_tokens=max_tokens,
             timeout=timeout,
             max_retries=max_retries,

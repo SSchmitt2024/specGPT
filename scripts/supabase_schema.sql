@@ -270,11 +270,21 @@ CREATE TABLE IF NOT EXISTS qa_log (
 
     -- Timing / cost
     latency_ms  double precision,
-    tokens_used jsonb
+    tokens_used jsonb,
+
+    -- Multi-turn chat (NULL for one-shot queries)
+    conversation_id text,                  -- client-generated UUID grouping turns
+    turn_index      integer                -- 0-based position within conversation
 );
+
+-- Migration for pre-chat deployments (idempotent).
+ALTER TABLE qa_log ADD COLUMN IF NOT EXISTS conversation_id text;
+ALTER TABLE qa_log ADD COLUMN IF NOT EXISTS turn_index integer;
 
 CREATE INDEX IF NOT EXISTS qa_log_created_idx ON qa_log (created_at DESC);
 CREATE INDEX IF NOT EXISTS qa_log_spec_idx    ON qa_log (spec);
+CREATE INDEX IF NOT EXISTS qa_log_convo_idx   ON qa_log (conversation_id, turn_index)
+    WHERE conversation_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Row Level Security
