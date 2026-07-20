@@ -741,7 +741,9 @@ def _extract_text(response) -> str:
 # 400 ("`temperature` is deprecated for this model"). We omit it for these so
 # the whole request doesn't fail; the inline fallback in `_call_with_retry`
 # adapts if this list goes stale against a future model.
-_TEMPERATURE_DEPRECATED_PREFIXES = ("claude-opus-4-7", "claude-opus-4-8")
+_TEMPERATURE_DEPRECATED_PREFIXES = (
+    "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
+)
 
 
 def _model_supports_temperature(model: str) -> bool:

@@ -1504,7 +1504,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
   --shadow-pop: 0 12px 40px -8px rgba(24,24,27,.22), 0 2px 8px rgba(24,24,27,.10);
   --pad-shell: 32px;
   --gap-block: 22px;
-  --composer-pad: 18px;
+  --composer-pad: 10px;
   --answer-fs: 15px;
 }
 .density-compact { --pad-shell: 22px; --gap-block: 14px; --composer-pad: 13px; --answer-fs: 14px; }
@@ -1606,13 +1606,16 @@ a { color: var(--accent); text-decoration: none; }
 [data-theme="dark"] .icon-moon { display:none; }
 
 /* main */
-.main { flex:1; padding-top:var(--gap-block); padding-bottom:255px; }
+.main { flex:1; padding-top:var(--gap-block); padding-bottom:185px; }
 
 /* chat layout: composer docked to the bottom of the viewport */
 .composer-dock { position:fixed; left:0; right:0; bottom:0; z-index:35; padding:8px 0 14px;
   background:linear-gradient(to top, var(--bg) 82%, transparent); }
-.turn { margin-bottom:30px; }
-.msg-user { display:flex; justify-content:flex-end; margin:0 0 12px; }
+/* each turn is its own filled, bordered section so answers don't float on a
+   flat white page */
+.turn { margin-bottom:20px; padding:18px 20px; background:var(--surface-2);
+  border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow-sm); }
+.msg-user { display:flex; justify-content:flex-end; margin:0 0 14px; }
 .msg-user > span { max-width:72%; background:var(--accent-soft); border:1px solid var(--accent-bd);
   color:var(--ink); padding:10px 14px; border-radius:14px 14px 4px 14px; font-size:14.5px;
   line-height:1.5; white-space:pre-wrap; word-break:break-word; }
@@ -1631,35 +1634,35 @@ a { color: var(--accent); text-decoration: none; }
   box-shadow:var(--shadow-md), 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent); }
 .composer-row { display:flex; align-items:flex-end; gap:10px; }
 .composer-input-wrap { flex:1; display:flex; align-items:flex-end; gap:10px; padding-left:4px; min-width:0; }
-.composer-input-wrap > svg { width:19px; height:19px; color:var(--t-faint); flex:none; margin-bottom:9px; }
-.composer textarea { flex:1; border:0; background:transparent; color:var(--ink); font-size:17px;
-  letter-spacing:-0.01em; outline:none; padding:8px 0; min-width:0; resize:none; overflow:hidden;
-  line-height:1.5; min-height:36px; max-height:200px; }
+.composer-input-wrap > svg { width:16px; height:16px; color:var(--t-faint); flex:none; margin-bottom:7px; }
+.composer textarea { flex:1; border:0; background:transparent; color:var(--ink); font-size:14.5px;
+  letter-spacing:-0.01em; outline:none; padding:5px 0; min-width:0; resize:none; overflow:hidden;
+  line-height:1.45; min-height:26px; max-height:160px; }
 .composer textarea::placeholder { color:var(--t-faint); }
-.ask-btn { box-sizing:border-box; width:130px; height:56px; padding:0; border-radius:9px; border:1px solid var(--ink);
-  background:var(--ink); color:var(--surface); font-size:14px; font-weight:600; letter-spacing:-0.01em;
-  display:inline-flex; align-items:center; justify-content:center; gap:10px;
+.ask-btn { box-sizing:border-box; width:96px; height:40px; padding:0; border-radius:8px; border:1px solid var(--ink);
+  background:var(--ink); color:var(--surface); font-size:13px; font-weight:600; letter-spacing:-0.01em;
+  display:inline-flex; align-items:center; justify-content:center; gap:8px;
   transition:filter .14s, opacity .14s; flex:none; }
 .ask-btn:hover { filter:brightness(1.18); }
 .ask-btn:disabled { opacity:.4; cursor:not-allowed; filter:none; }
-.ask-btn svg { width:15px; height:15px; flex:none; }
-.ask-btn-inner { display:flex; flex-direction:column; align-items:center; gap:1px; width:46px; }
+.ask-btn svg { width:13px; height:13px; flex:none; }
+.ask-btn-inner { display:flex; flex-direction:column; align-items:center; gap:0; width:44px; }
 .ask-spec-label { font-size:10px; font-weight:400; opacity:0.6; letter-spacing:0.02em; }
 
 /* control strip */
-.controls { display:flex; align-items:center; gap:8px; margin-top:13px; padding-top:13px;
+.controls { display:flex; align-items:center; gap:6px; margin-top:8px; padding-top:8px;
   border-top:1px dashed var(--border); flex-wrap:wrap; }
 .controls-spacer { flex:1; }
-.pill { display:inline-flex; align-items:center; gap:7px; height:32px; padding:0 12px; border-radius:99px;
-  border:1px solid var(--border); background:var(--surface); color:var(--t-muted); font-size:12.5px;
+.pill { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px; border-radius:99px;
+  border:1px solid var(--border); background:var(--surface); color:var(--t-muted); font-size:11.5px;
   font-weight:500; transition:all .14s; position:relative; }
 .pill:hover { border-color:var(--border-2); color:var(--ink); background:var(--surface-2); }
-.pill svg { width:14px; height:14px; }
+.pill svg { width:13px; height:13px; }
 .pill.on { background:var(--accent-soft); border-color:var(--accent-bd); color:var(--accent-ink); }
 .pill.on .pill-dot { background:var(--accent); }
 .pill-dot { width:7px; height:7px; border-radius:50%; background:var(--t-faint); transition:background .14s; }
-.cost-chip { display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 12px 0 10px;
-  border-radius:99px; border:1px solid var(--border); background:var(--surface); font-size:12px; color:var(--t-subtle); cursor:pointer; }
+.cost-chip { display:inline-flex; align-items:center; gap:7px; height:26px; padding:0 10px 0 9px;
+  border-radius:99px; border:1px solid var(--border); background:var(--surface); font-size:11.5px; color:var(--t-subtle); cursor:pointer; }
 .cost-chip:hover { border-color:var(--border-2); }
 .cost-chip .cost-total { color:var(--ink); font-weight:500; font-size:12.5px; font-family:var(--mono); }
 .cost-chip .cost-total.cost-warn { color:var(--warn); }
@@ -1685,8 +1688,8 @@ a { color: var(--accent); text-decoration: none; }
 
 /* config popover */
 .config-panel, .agentic-config { display:none; }
-.config-panel.open { display:block; position:absolute; z-index:40; bottom:calc(100% + 8px); left:0; width:520px;
-  max-height:min(70vh, 640px); overflow-y:auto;
+.config-panel.open { display:block; position:absolute; z-index:40; bottom:calc(100% + 8px); left:0; width:400px;
+  max-height:min(62vh, 520px); overflow-y:auto;
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
   box-shadow:var(--shadow-pop); padding:16px; animation:fadeUp .14s ease; }
 .config-pop-wrap { position:relative; }
@@ -2763,9 +2766,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             // Open-weight models on UNH's own GPUs (free local compute)
             {id: "deepthought-llama-3.3-70b",        label: "Llama 3.3 70B",        provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 4, tags: []},
             {id: "deepthought-qwen3-30b",            label: "Qwen3 30B Instruct",   provider: "DeepThought (Local)", in: 0.0, out: 0.0, speed: 3, tags: []},
-            // Direct Anthropic API (personal ANTHROPIC_API_KEY) - works off the
-            // UNH network, real per-token cost.
-            {id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "Claude (Anthropic API)", in: 3.0, out: 15.0, speed: 4, tags: ["no VPN"]},
+            // Direct Anthropic API (personal ANTHROPIC_API_KEY) - not Bedrock,
+            // works off the UNH network, real per-token cost.
+            {id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "Claude (Anthropic API)", in: 3.0, out: 15.0, speed: 4, tags: ["no VPN"]},
         ];
 
         // Tag the per-provider cheapest (by input price) and fastest (by speed
