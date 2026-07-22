@@ -2828,6 +2828,7 @@ a { color: var(--accent); text-decoration: none; }
                 <div id="dev-pane-batch" class="dev-pane" hidden>
                     <div class="dev-toolbar">
                         <input type="file" id="batch-file" accept=".json,application/json">
+                        <select id="batch-model-select"></select>
                         <button class="dev-btn dev-btn-primary" id="batch-run" type="button" disabled>Run batch</button>
                         <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
                         <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
@@ -7037,7 +7038,9 @@ a { color: var(--accent); text-decoration: none; }
             var barFill = document.getElementById("batch-bar-fill");
             var pctEl = document.getElementById("batch-pct");
             var logEl = document.getElementById("batch-log");
+            var modelSelect = document.getElementById("batch-model-select");
             if (!fileInput || !runBtn) return;
+            if (modelSelect) populateModelSelect(modelSelect, "agentic");
 
             var questions = null;
             var results = null;
@@ -7128,8 +7131,10 @@ a { color: var(--accent); text-decoration: none; }
                 setProgress(0, questions.length);
 
                 var thorough = await fetchThoroughConfig();
+                var model = modelSelect && modelSelect.value;
                 var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
-                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ")...");
+                if (model) { config.llm_model = model; config.agentic_model = model; }
+                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ", model: " + (model || config.llm_model) + ")...");
 
                 for (var i = 0; i < questions.length; i++) {
                     if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
