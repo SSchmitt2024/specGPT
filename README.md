@@ -20,6 +20,6 @@ Built on publicly available NVMe specifications from nvmexpress.org.
 
 Python · Supabase · Multiple LLM API · FastAPI · Docker 
 
-See [BUILD_PLAN_FINAL.md](BUILD_PLAN_FINAL.md) for phase-by-phase detail.
+See [docs/BUILD_PLAN_FINAL.md](docs/BUILD_PLAN_FINAL.md) for phase-by-phase detail.
 
 

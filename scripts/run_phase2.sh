@@ -48,15 +48,31 @@ select_spec() {
   if [[ -z "$choice" ]]; then
     echo ""
     echo "Which specification do you want to ingest?"
-    echo "  1) base     — NVM Express Base Specification        <- data/"
-    echo "  2) pcie     — NVM Express PCIe Transport Spec        <- data/pcie/"
-    echo "  3) command  — NVM Express NVM Command Set Spec       <- data/command/"
+    echo "  1) base     — NVM Express Base Specification              <- data/"
+    echo "  2) pcie     — NVM Express PCIe Transport Spec              <- data/pcie/"
+    echo "  3) command  — NVM Express NVM Command Set Spec             <- data/command/"
+    echo "  4) boot     — NVM Express Boot Specification                <- data/boot/"
+    echo "  5) cps      — NVM Express Computational Programs Cmd Set  <- data/cps/"
+    echo "  6) kv       — NVM Express Key Value Command Set            <- data/kv/"
+    echo "  7) mi       — NVM Express Management Interface Spec        <- data/mi/"
+    echo "  8) rdma     — NVM Express over RDMA Transport Spec         <- data/rdma/"
+    echo "  9) tcp      — NVM Express over TCP Transport Spec          <- data/tcp/"
+    echo " 10) slm      — NVM Express Subsystem Local Memory Cmd Set  <- data/slm/"
+    echo " 11) zns      — NVM Express Zoned Namespace Command Set     <- data/zns/"
     read -rp "spec> [1] " spec_reply
     case "${spec_reply:-1}" in
       1|base|Base|BASE)             choice="base" ;;
       2|pcie|Pcie|PCIE|PCIe)        choice="pcie" ;;
       3|command|Command|COMMAND)    choice="command" ;;
-      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base, 2/pcie or 3/command)" >&2; exit 1 ;;
+      4|boot|Boot|BOOT)             choice="boot" ;;
+      5|cps|Cps|CPS)                choice="cps" ;;
+      6|kv|Kv|KV)                   choice="kv" ;;
+      7|mi|Mi|MI)                   choice="mi" ;;
+      8|rdma|Rdma|RDMA)             choice="rdma" ;;
+      9|tcp|Tcp|TCP)                choice="tcp" ;;
+      10|slm|Slm|SLM)               choice="slm" ;;
+      11|zns|Zns|ZNS)               choice="zns" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1-11)" >&2; exit 1 ;;
     esac
   fi
 
@@ -81,6 +97,62 @@ select_spec() {
       export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVM Command Set Specification}"
       export SPEC_VERSION="${SPEC_VERSION:-1.2}"
       export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-7}"
+      ;;
+    boot)
+      export NVME_SPEC="boot"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/boot}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Boot Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-6}"
+      ;;
+    cps)
+      export NVME_SPEC="cps"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/cps}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Computational Programs Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-6}"
+      ;;
+    kv)
+      export NVME_SPEC="kv"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/kv}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Key Value Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-4}"
+      ;;
+    mi)
+      export NVME_SPEC="mi"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/mi}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Management Interface Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-9}"
+      ;;
+    rdma)
+      export NVME_SPEC="rdma"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/rdma}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVMe-over-RDMA Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-4}"
+      ;;
+    tcp)
+      export NVME_SPEC="tcp"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/tcp}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVMe-over-TCP Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
+      ;;
+    slm)
+      export NVME_SPEC="slm"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/slm}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Subsystem Local Memory Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
+      ;;
+    zns)
+      export NVME_SPEC="zns"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/zns}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Zoned Namespace Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.4}"
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
       ;;
   esac
 

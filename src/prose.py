@@ -788,7 +788,10 @@ if __name__ == "__main__":
 
     first_arg = sys.argv[1] if len(sys.argv) > 1 else None
     last_arg = sys.argv[2] if len(sys.argv) > 2 else None
-    first_pi = int(first_arg) if first_arg else DEFAULT_FIRST_CONTENT_PAGE
+    # SPEC_FIRST_CONTENT (per-spec, set by rerun_pipeline.sh) wins over the
+    # Base-spec hardcoded default, same as src/tables.py. An explicit CLI arg
+    # still wins over both.
+    first_pi = int(first_arg) if first_arg else int(os.getenv("SPEC_FIRST_CONTENT", str(DEFAULT_FIRST_CONTENT_PAGE)))
     last_pi = int(last_arg) if last_arg else None
 
     sections, definitions = extract_prose(

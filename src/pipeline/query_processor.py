@@ -153,7 +153,13 @@ _RE_SECTION = re.compile(
 )
 
 # Field-name candidates: ALL-CAPS tokens (and CAP.MQES style), 2–10 chars, possibly with dot.
-_RE_FIELD_CANDIDATE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}(?:\.[A-Z][A-Z0-9]{1,9})?)\b")
+# Case-insensitive: users type "oacs"/"edgn", the field index stores "OACS".
+# Membership in field_index.json is the real gate, so a loose candidate pass is
+# safe. A handful of field names collide with common English words; those stay
+# uppercase-only (see _FIELD_STOPWORDS) so prose like "how did it..." doesn't
+# fire a spurious structured lookup.
+_RE_FIELD_CANDIDATE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}(?:\.[A-Za-z][A-Za-z0-9]{1,9})?)\b")
+_FIELD_STOPWORDS = {"CAP", "DATA", "DID", "ID", "TIME", "VALUE"}
 
 
 @lru_cache(maxsize=1)
@@ -248,20 +254,26 @@ def extract_entities(query: str) -> list[Entity]:
     # Skip tokens already captured as a more specific kind (cdw/fid/figure/hex)
     # to avoid e.g. CDW10 showing up twice (once as cdw, once as field).
     already_captured = {e.text.upper() for e in found}
-    field_set = _load_field_index()
+    field_set = _load_field_index()  # canonical field names, all uppercase
     if field_set:
         for m in _RE_FIELD_CANDIDATE.finditer(query):
             tok = m.group(1)
-            if tok.upper() in already_captured:
+            tok_u = tok.upper()
+            if tok_u in already_captured:
+                continue
+            # Collision words match only when the user typed them uppercase, so
+            # lowercase prose ("did", "time") stays out of structured lookup.
+            if tok_u in _FIELD_STOPWORDS and tok != tok_u:
                 continue
             # Match either the full token or its first dotted segment (e.g. CAP.MQES → MQES).
-            if tok in field_set:
-                found.append(Entity(text=tok, kind="field"))
+            # Store the canonical uppercase form so downstream structured-lookup keys match.
+            if tok_u in field_set:
+                found.append(Entity(text=tok_u, kind="field"))
             elif "." in tok:
-                head, tail = tok.split(".", 1)
-                if head in field_set and head.upper() not in already_captured:
+                head, tail = (p.upper() for p in tok.split(".", 1))
+                if head in field_set and head not in already_captured:
                     found.append(Entity(text=head, kind="field"))
-                if tail in field_set and tail.upper() not in already_captured:
+                if tail in field_set and tail not in already_captured:
                     found.append(Entity(text=tail, kind="field"))
 
     return _dedup_keep_order(found)

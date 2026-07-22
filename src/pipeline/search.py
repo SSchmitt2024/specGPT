@@ -358,6 +358,43 @@ def bm25_search(
 
 
 # ---------------------------------------------------------------------------
+# UNH-IOL test plans (see scripts/ingest_iol_testplans.py)
+
+@ttl_cache(maxsize=1, ttl=3600)
+def fetch_test_plan_index() -> list[dict]:
+    """Lightweight listing of every test-plan row for the picker UI.
+    Paginated: PostgREST caps a single request at 1000 rows and the corpus
+    is ~1700."""
+    rows: list[dict] = []
+    try:
+        page = 1000
+        while True:
+            res = (supabase_client().table("test_plans")
+                   .select("id, test_id, case_num, subcase_num, title, test_title, group_name")
+                   .order("id")
+                   .range(len(rows), len(rows) + page - 1).execute())
+            batch = res.data or []
+            rows.extend(batch)
+            if len(batch) < page:
+                return rows
+    except Exception as e:  # noqa: BLE001
+        logger.error("fetch_test_plan_index failed: %s", e)
+        return rows
+
+
+@ttl_cache(maxsize=256, ttl=3600)
+def fetch_test_plan(plan_id: str) -> dict | None:
+    """Full row for one selectable test-plan unit (case/sub-case/test)."""
+    try:
+        res = (supabase_client().table("test_plans")
+               .select("*").eq("id", plan_id).limit(1).execute())
+        return (res.data or [None])[0]
+    except Exception as e:  # noqa: BLE001
+        logger.error("fetch_test_plan(%s) failed: %s", plan_id, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 def _print_results(results: list[dict]) -> None:

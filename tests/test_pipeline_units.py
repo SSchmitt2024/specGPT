@@ -1699,3 +1699,36 @@ def test_hallucinated_section_ids_returns_only_fetchable_ids():
     ]
     assert _hallucinated_section_ids(cits) == ["8.1.6.3.2", "8.1.6.3.1.1", "A.2.1"]
     assert _hallucinated_section_ids(None) == []
+
+
+def test_extract_entities_matches_lowercase_field_names():
+    """Field acronyms typed in lowercase must still drive structured lookup
+    (regression: OACS/EDGN queries returned "not in context"). Collision words
+    like "did"/"data" must NOT fire a field entity unless typed uppercase."""
+    from src.pipeline.query_processor import extract_entities
+
+    def fields(q):
+        return {e.text for e in extract_entities(q) if e.kind == "field"}
+
+    assert "OACS" in fields("what does bit 9 of oacs represent")
+    assert "EDGN" in fields("is edgn a zeros based number")
+    # canonical uppercase is stored regardless of input casing
+    assert "OACS" in fields("what is OACS")
+    # collision words: lowercase prose stays out, uppercase still resolves
+    assert "DID" not in fields("how did the controller start")
+    assert "DATA" not in fields("what is its data value")
+    assert "CAP" in fields("what is the CAP register")
+
+
+def test_frontend_batch_mode_markup_and_escaping():
+    """Dev-panel batch mode: pane, tab, and runner script survive the
+    JS-in-Python escaping trap (backslashes must reach the browser intact)."""
+    from src.pipeline.app import FRONTEND_HTML as html
+
+    assert 'data-devtab="batch"' in html
+    assert 'id="dev-pane-batch"' in html
+    for el in ("batch-file", "batch-run", "batch-cancel", "batch-download",
+               "batch-bar-fill", "batch-pct", "batch-log"):
+        assert f'id="{el}"' in html
+    # the escaped quote in the validation message must arrive as \" not \\"
+    assert 'missing a \\"question\\" string' in html

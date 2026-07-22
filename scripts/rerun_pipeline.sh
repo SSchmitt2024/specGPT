@@ -56,15 +56,31 @@ select_spec() {
   if [[ -z "$choice" ]]; then
     echo ""
     echo "Which specification do you want to run the pipeline for?"
-    echo "  1) base     — NVM Express Base Specification        -> data/"
-    echo "  2) pcie     — NVM Express PCIe Transport Spec        -> data/pcie/"
-    echo "  3) command  — NVM Express NVM Command Set Spec       -> data/command/"
+    echo "  1) base     — NVM Express Base Specification              -> data/"
+    echo "  2) pcie     — NVM Express PCIe Transport Spec              -> data/pcie/"
+    echo "  3) command  — NVM Express NVM Command Set Spec             -> data/command/"
+    echo "  4) boot     — NVM Express Boot Specification                -> data/boot/"
+    echo "  5) cps      — NVM Express Computational Programs Cmd Set  -> data/cps/"
+    echo "  6) kv       — NVM Express Key Value Command Set            -> data/kv/"
+    echo "  7) mi       — NVM Express Management Interface Spec        -> data/mi/"
+    echo "  8) rdma     — NVM Express over RDMA Transport Spec         -> data/rdma/"
+    echo "  9) tcp      — NVM Express over TCP Transport Spec          -> data/tcp/"
+    echo " 10) slm      — NVM Express Subsystem Local Memory Cmd Set  -> data/slm/"
+    echo " 11) zns      — NVM Express Zoned Namespace Command Set     -> data/zns/"
     read -rp "spec> [1] " spec_reply
     case "${spec_reply:-1}" in
       1|base|Base|BASE)             choice="base" ;;
       2|pcie|Pcie|PCIE|PCIe)        choice="pcie" ;;
       3|command|Command|COMMAND)    choice="command" ;;
-      *) echo "ERROR: unknown spec '$spec_reply' (pick 1/base, 2/pcie or 3/command)" >&2; exit 1 ;;
+      4|boot|Boot|BOOT)             choice="boot" ;;
+      5|cps|Cps|CPS)                choice="cps" ;;
+      6|kv|Kv|KV)                   choice="kv" ;;
+      7|mi|Mi|MI)                   choice="mi" ;;
+      8|rdma|Rdma|RDMA)             choice="rdma" ;;
+      9|tcp|Tcp|TCP)                choice="tcp" ;;
+      10|slm|Slm|SLM)               choice="slm" ;;
+      11|zns|Zns|ZNS)               choice="zns" ;;
+      *) echo "ERROR: unknown spec '$spec_reply' (pick 1-11)" >&2; exit 1 ;;
     esac
   fi
 
@@ -117,6 +133,119 @@ select_spec() {
       # auto-adds its +1 — see src/spec_env.py). Prompt unless already set.
       if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
         read -rp "    Command Set PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    boot)
+      export NVME_SPEC="boot"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/boot}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Boot-Specification-Revision-1.3-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Boot Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      # Boot spec has a roman-numeral front matter (i-vi) like Base, unlike the
+      # other new specs. Body ("1 Introduction") starts at pdf idx 6 = printed p.1.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-6}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Boot PAGE_OFFSET (pdf_page - printed_page) [5] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:-5}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    cps)
+      export NVME_SPEC="cps"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/cps}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Computational-Programs-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Computational Programs Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Verified against the PDF: printed p.7 == 0-indexed pdf idx 6.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-6}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Computational Programs PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    kv)
+      export NVME_SPEC="kv"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/kv}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Key-Value-Command-Set-Specification-Revision-1.3-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Key Value Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.3}"
+      # Verified against the PDF: printed p.5 == 0-indexed pdf idx 4.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-4}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Key Value PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    mi)
+      export NVME_SPEC="mi"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/mi}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Management-Interface-Specification-Revision-2.1-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Management Interface Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-2.1}"
+      # Verified against the PDF: printed p.10 == 0-indexed pdf idx 9.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-9}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Management Interface PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    rdma)
+      export NVME_SPEC="rdma"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/rdma}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-NVMe-over-RDMA-Transport-Specification-Revision-1.2-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVMe-over-RDMA Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Verified against the PDF: printed p.5 == 0-indexed pdf idx 4.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-4}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    RDMA Transport PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    tcp)
+      export NVME_SPEC="tcp"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/tcp}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-NVMe-over-TCP-Transport-Specification-Revision-1.2-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express NVMe-over-TCP Transport Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Verified against the PDF: printed p.6 == 0-indexed pdf idx 5.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    TCP Transport PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    slm)
+      export NVME_SPEC="slm"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/slm}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Subsystem-Local-Memory-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Subsystem Local Memory Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.2}"
+      # Verified against the PDF: printed p.6 == 0-indexed pdf idx 5.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Subsystem Local Memory PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
+        export SPEC_PAGE_OFFSET="${off_reply:--1}"
+      fi
+      mkdir -p "$SPEC_DATA_DIR"
+      ;;
+    zns)
+      export NVME_SPEC="zns"
+      export SPEC_DATA_DIR="${SPEC_DATA_DIR:-data/zns}"
+      export SPEC_PDF_PATH="${SPEC_PDF_PATH:-nvme_spec/NVM-Express-Zoned-Namespace-Command-Set-Specification-Revision-1.4-2025.08.01-Ratified.pdf}"
+      export SPEC_DOCUMENT="${SPEC_DOCUMENT:-NVM Express Zoned Namespace Command Set Specification}"
+      export SPEC_VERSION="${SPEC_VERSION:-1.4}"
+      # Verified against the PDF: printed p.6 == 0-indexed pdf idx 5.
+      export SPEC_FIRST_CONTENT="${SPEC_FIRST_CONTENT:-5}"
+      if [[ -z "${SPEC_PAGE_OFFSET:-}" ]]; then
+        read -rp "    Zoned Namespace PAGE_OFFSET (pdf_page - printed_page) [-1] " off_reply
         export SPEC_PAGE_OFFSET="${off_reply:--1}"
       fi
       mkdir -p "$SPEC_DATA_DIR"

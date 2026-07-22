@@ -16,3 +16,5 @@ ruvector.db
 
 scripts/preset_sim.py
 docker-cheat-sheet.md
+
+scripts/build_raft_dataset.py

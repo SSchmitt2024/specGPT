@@ -286,6 +286,40 @@ CREATE INDEX IF NOT EXISTS qa_log_spec_idx    ON qa_log (spec);
 CREATE INDEX IF NOT EXISTS qa_log_convo_idx   ON qa_log (conversation_id, turn_index)
     WHERE conversation_id IS NOT NULL;
 
+-- ── UNH-IOL conformance test plans ──────────────────────────────────────────
+-- One row per selectable unit: a test-level row (tests with no cases), a Case,
+-- or a Sub-Case. Test-level metadata (purpose/setup/discussion) is
+-- denormalized onto every row so context injection is a single fetch.
+-- Populated by scripts/ingest_iol_testplans.py --load.
+CREATE TABLE IF NOT EXISTS test_plans (
+    id                text PRIMARY KEY,      -- "1.1/16/3" = test/case/subcase
+    test_id           text NOT NULL,         -- "1.1"
+    case_num          text,                  -- NULL for test-level rows
+    subcase_num       text,
+    title             text NOT NULL,
+    test_title        text NOT NULL,
+    group_name        text NOT NULL,
+
+    -- test-level metadata (denormalized)
+    purpose           text,
+    references_text   text,
+    requirements      text,
+    last_modification text,
+    discussion        text,
+    setup             text,
+
+    -- the case itself
+    steps             jsonb,                 -- [{n, text}]
+    observables       jsonb,                 -- [{n, text}]
+    possible_problems text,
+    raw_text          text,                  -- verbatim PDF segment (fallback)
+    materialized_from text,                  -- source id when steps were copied
+    pdf_page          integer,
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS test_plans_test_idx ON test_plans (test_id);
+
 -- ---------------------------------------------------------------------------
 -- Row Level Security
 --
@@ -303,3 +337,4 @@ ALTER TABLE spec_enum_index  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE flagged_answers  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dev_notes        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE qa_log           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_plans       ENABLE ROW LEVEL SECURITY;

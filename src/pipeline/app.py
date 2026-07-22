@@ -105,6 +105,7 @@ from src.pipeline.orchestrator import (
     CONCRETE_SPEC_IDS,
     GenerationError,
     orchestrate,
+    prime_test_plan,
     PipelineConfig,
     PRESETS,
     DEFAULT_PRESET,
@@ -187,6 +188,11 @@ class QueryRequest(BaseModel):
     # under-covered aspects, merges + re-reranks the expanded chunk pool,
     # and regenerates with the agentic model. Adds ~30-60s + Opus cost.
     agentic: bool = False
+    # UNH-IOL conformance test selection: id of a test_plans row, e.g.
+    # "1.1/16/3" (test/case/subcase). One TEST per conversation, enforced
+    # server-side (_resolve_test_context); the case within that test may
+    # change per turn. None = plain spec Q&A.
+    test_case_id: str | None = Field(default=None, max_length=40)
 
 
 class QueryResponse(BaseModel):
@@ -375,6 +381,131 @@ def _conversation_append(conversation_id: str | None, result: dict) -> int | Non
         return len(turns) - 1
 
 
+# ── One-test-per-conversation binding (UNH-IOL test plans) ─────────────────
+# conversation_id → test_id ("1.1"). Bound by the first processed message
+# that carries a test_case_id; after that every request in the conversation
+# must reference a case of the same test (409 otherwise). A new chat mints a
+# new conversation_id, which resets the binding. Same in-process/single-worker
+# caveats as _CONVERSATIONS.
+_CONVO_TESTS: OrderedDict[str, str] = OrderedDict()
+_CONVO_TESTS_MAX = 200
+
+
+def _resolve_test_context(conversation_id: str | None,
+                          test_case_id: str | None) -> dict | None:
+    """Validate + fetch the selected test-plan row and enforce the
+    one-test-per-chat lock. Returns the full test_plans row (passed to
+    orchestrate as test_context) or None when no test is selected."""
+    from src.pipeline.search import fetch_test_plan
+
+    bound = None
+    if conversation_id:
+        with _CONVERSATIONS_LOCK:
+            bound = _CONVO_TESTS.get(conversation_id)
+    if not test_case_id:
+        if bound:
+            raise HTTPException(status_code=409, detail={
+                "error": "test_locked", "test_id": bound,
+                "note": "this conversation is bound to a conformance test; "
+                        "keep sending test_case_id or start a new chat"})
+        return None
+    row = fetch_test_plan(test_case_id)
+    if row is None:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown test_case_id: {test_case_id!r}")
+    if conversation_id:
+        if bound and bound != row["test_id"]:
+            raise HTTPException(status_code=409, detail={
+                "error": "test_locked", "test_id": bound,
+                "note": "only one conformance test per chat; start a new "
+                        "chat to switch tests"})
+        with _CONVERSATIONS_LOCK:
+            _CONVO_TESTS[conversation_id] = row["test_id"]
+            _CONVO_TESTS.move_to_end(conversation_id)
+            while len(_CONVO_TESTS) > _CONVO_TESTS_MAX:
+                _CONVO_TESTS.popitem(last=False)
+    return row
+
+
+# ── Test-plan priming pins ─────────────────────────────────────────────────
+# conversation_id → chunks tagged important by prime_test_plan on the first
+# test-bound query. Merged into history.pinned_chunks on EVERY later turn so
+# the test's background sections survive retrieval/rerank for the whole chat.
+# Same in-process/single-worker caveats as _CONVERSATIONS.
+_CONVO_TEST_PINS: OrderedDict[str, list[dict]] = OrderedDict()
+
+
+def _test_pins(conversation_id: str | None, test_context: dict, config,
+               on_progress=None) -> tuple[list[dict], dict | None]:
+    """(pins, primed) for this conversation, running prime_test_plan on the
+    first call (first query after the test is selected); later calls hit the
+    cache and return primed=None (llm_calls/trace only exist on turn one).
+    Failures degrade to no pins — the query still answers normally."""
+    key = conversation_id or ""
+    if key:
+        with _CONVERSATIONS_LOCK:
+            cached = _CONVO_TEST_PINS.get(key)
+        if cached is not None:
+            return cached, None
+    primed: dict | None = None
+    try:
+        primed = prime_test_plan(test_context, config=config, on_progress=on_progress)
+        pins = primed["chunks"]
+    except Exception:
+        logger.exception("test-plan priming failed; answering without pins")
+        pins = []
+    if key:
+        with _CONVERSATIONS_LOCK:
+            _CONVO_TEST_PINS[key] = pins
+            _CONVO_TEST_PINS.move_to_end(key)
+            while len(_CONVO_TEST_PINS) > _CONVO_TESTS_MAX:
+                _CONVO_TEST_PINS.popitem(last=False)
+    return pins, primed
+
+
+def _history_with_pins(history: dict | None, pins: list[dict]) -> dict | None:
+    """History payload with the test pins prepended to pinned_chunks (pins
+    first so they win the assemble_context pinned reserve budget)."""
+    if not pins:
+        return history
+    out = dict(history) if history else {"turns": []}
+    merged: list[dict] = []
+    seen: set = set()
+    for chunk in list(pins) + list(out.get("pinned_chunks") or []):
+        key = (chunk.get("spec"), chunk.get("section_id"), chunk.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(chunk)
+    out["pinned_chunks"] = merged
+    return out
+
+
+def _cached_test_pins(conversation_id: str | None) -> list[dict]:
+    """Already-primed pins only (refine path: never re-primes)."""
+    with _CONVERSATIONS_LOCK:
+        return list(_CONVO_TEST_PINS.get(conversation_id or "") or [])
+
+
+def _orchestrate_query(query: str, *, config, debug, agentic, history,
+                       test_context, conversation_id, on_progress=None) -> dict:
+    """Worker-thread body for /api/query[/stream]: test-plan priming (first
+    test-bound query only, unless disabled via config) then the pipeline."""
+    extra_calls: list[dict] | None = None
+    extra_trace: list | None = None
+    if test_context is not None and config.testplan_priming:
+        pins, primed = _test_pins(conversation_id, test_context, config,
+                                  on_progress)
+        history = _history_with_pins(history, pins)
+        if primed:
+            extra_calls = primed.get("llm_calls")
+            extra_trace = primed.get("trace")
+    return orchestrate(query, config=config, debug=debug, agentic=agentic,
+                       history=history, test_context=test_context,
+                       on_progress=on_progress, extra_llm_calls=extra_calls,
+                       extra_trace=extra_trace)
+
+
 def _conversation_replace_last(conversation_id: str | None, result: dict) -> None:
     """Refine re-answers the latest turn; keep the stored history in step so
     follow-ups build on the refined answer, not the superseded first pass."""
@@ -513,6 +644,7 @@ def _rate_limit_dep(limiter: RateLimiter):
 
 # /api/query*, /api/refine* each cost a full retrieval + LLM generation.
 query_rate_limit = _rate_limit_dep(RateLimiter(max_requests=10, window_seconds=60.0))
+# Shared by /api/flag-answer and the read-only /api/testplans* endpoints.
 flag_rate_limit = _rate_limit_dep(RateLimiter(max_requests=30, window_seconds=60.0))
 
 
@@ -817,6 +949,7 @@ async def query_endpoint(
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = uuid.uuid4().hex[:12]
     history = _conversation_history(req.conversation_id)  # 409s at turn cap
+    test_context = _resolve_test_context(req.conversation_id, req.test_case_id)
 
     start = time.time()
     try:
@@ -824,8 +957,9 @@ async def query_endpoint(
         # cross-encoder, Anthropic). Run it in a worker thread so we don't
         # block the FastAPI event loop for the duration of the pipeline.
         result = await asyncio.to_thread(
-            orchestrate, req.query, config=config, debug=debug_trace,
-            agentic=req.agentic, history=history,
+            _orchestrate_query, req.query, config=config, debug=debug_trace,
+            agentic=req.agentic, history=history, test_context=test_context,
+            conversation_id=req.conversation_id,
         )
     except GenerationError as e:
         # Retrieval worked; generation failed. 502 (bad upstream gateway)
@@ -854,6 +988,8 @@ async def query_endpoint(
             "citations": result["citations"],
             "context_chunks": result.get("sources") or [],
             "tokens_used": result.get("tokens_used"),
+            # so /api/refine regenerates with the same test plan injected
+            "test_context": test_context,
         })
 
     resp = QueryResponse(
@@ -905,6 +1041,7 @@ async def query_stream_endpoint(
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = uuid.uuid4().hex[:12]
     history = _conversation_history(req.conversation_id)  # 409s at turn cap
+    test_context = _resolve_test_context(req.conversation_id, req.test_case_id)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -916,8 +1053,9 @@ async def query_stream_endpoint(
         start = time.time()
         try:
             result = await asyncio.to_thread(
-                orchestrate, req.query, config=config, debug=debug_trace,
+                _orchestrate_query, req.query, config=config, debug=debug_trace,
                 agentic=req.agentic, on_progress=on_progress, history=history,
+                test_context=test_context, conversation_id=req.conversation_id,
             )
             latency_ms = (time.time() - start) * 1000
             if not req.agentic:
@@ -928,6 +1066,7 @@ async def query_stream_endpoint(
                     "citations": result["citations"],
                     "context_chunks": result.get("sources") or [],
                     "tokens_used": result.get("tokens_used"),
+                    "test_context": test_context,
                 })
             resp = QueryResponse(
                 query=result["query"],
@@ -1007,6 +1146,7 @@ async def refine_endpoint(
 
     debug_trace = req.debug and DEBUG_PIPELINE
     history = _conversation_history(req.conversation_id, exclude_last=True)
+    history = _history_with_pins(history, _cached_test_pins(req.conversation_id))
     start = time.time()
     try:
         result = await asyncio.to_thread(
@@ -1017,6 +1157,7 @@ async def refine_endpoint(
             agentic=True,
             refine_seed=seed,
             history=history,
+            test_context=seed.get("test_context"),
         )
     except GenerationError as e:
         logger.warning("Refine generation failure [%s]: %s", req.request_id, e.cause)
@@ -1039,6 +1180,7 @@ async def refine_endpoint(
         "citations": result["citations"],
         "context_chunks": result.get("sources") or [],
         "tokens_used": result.get("tokens_used"),
+        "test_context": seed.get("test_context"),
     })
 
     resp = QueryResponse(
@@ -1086,6 +1228,7 @@ async def refine_stream_endpoint(
     debug_trace = req.debug and DEBUG_PIPELINE
     request_id = req.request_id
     history = _conversation_history(req.conversation_id, exclude_last=True)
+    history = _history_with_pins(history, _cached_test_pins(req.conversation_id))
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1098,7 +1241,7 @@ async def refine_stream_endpoint(
             result = await asyncio.to_thread(
                 orchestrate, seed["query"], config=config, debug=debug_trace,
                 agentic=True, refine_seed=seed, on_progress=on_progress,
-                history=history,
+                history=history, test_context=seed.get("test_context"),
             )
             latency_ms = (time.time() - start) * 1000
             # Refresh cache so a second refine builds on the latest Opus output.
@@ -1109,6 +1252,7 @@ async def refine_stream_endpoint(
                 "citations": result["citations"],
                 "context_chunks": result.get("sources") or [],
                 "tokens_used": result.get("tokens_used"),
+                "test_context": seed.get("test_context"),
             })
             resp = QueryResponse(
                 query=result["query"],
@@ -1176,6 +1320,64 @@ async def presets_endpoint(_: bool = Depends(require_auth)) -> dict:
 async def specs_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Specs the UI can search, plus the default selection."""
     return {"specs": AVAILABLE_SPECS, "default": PipelineConfig().spec}
+
+
+def _num_key(s: str | None) -> tuple:
+    """Sort key that orders '1.2' before '1.10' and tolerates suffixes."""
+    if not s:
+        return (0,)
+    return tuple(int(p) if p.isdigit() else 999 for p in re.split(r"[./]", s))
+
+
+@app.get("/api/testplans")
+async def testplans_endpoint(
+    _: bool = Depends(require_auth), __: None = Depends(flag_rate_limit)
+) -> dict:
+    """UNH-IOL conformance test index for the picker: groups → tests → cases.
+
+    Cases include level-4 sub-cases (their id has three segments). Tests that
+    have no cases appear with a single case entry whose id equals the test id.
+    """
+    from src.pipeline.search import fetch_test_plan_index
+
+    rows = fetch_test_plan_index()
+    tests: dict[str, dict] = {}
+    for r in rows:
+        t = tests.setdefault(r["test_id"], {
+            "test_id": r["test_id"],
+            "test_title": r["test_title"],
+            "group_name": r["group_name"],
+            "cases": [],
+        })
+        t["cases"].append({
+            "id": r["id"],
+            "case_num": r["case_num"],
+            "subcase_num": r["subcase_num"],
+            "title": r["title"],
+        })
+    groups: dict[str, list] = {}
+    for t in sorted(tests.values(), key=lambda t: _num_key(t["test_id"])):
+        t["cases"].sort(key=lambda c: _num_key(c["id"]))
+        groups.setdefault(t["group_name"], []).append(t)
+    return {"groups": [
+        {"group_name": g, "tests": ts}
+        for g, ts in sorted(groups.items(),
+                            key=lambda kv: _num_key(kv[0].split(":")[0].replace("Group ", "")))
+    ]}
+
+
+@app.get("/api/testplans/{plan_id:path}")
+async def testplan_detail_endpoint(
+    plan_id: str, _: bool = Depends(require_auth), __: None = Depends(flag_rate_limit)
+) -> dict:
+    """Full test_plans row (steps, observables, setup...) for one case id
+    like '1.1/16/3'. Used by the picker preview panel."""
+    from src.pipeline.search import fetch_test_plan
+
+    row = fetch_test_plan(plan_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"unknown test case: {plan_id!r}")
+    return row
 
 
 @app.get("/api/models")
@@ -1564,6 +1766,7 @@ a { color: var(--accent); text-decoration: none; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fadeUp { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes fadeCenter { from { opacity:0; } to { opacity:1; } }
 @keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
 @keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
 
@@ -1581,6 +1784,11 @@ a { color: var(--accent); text-decoration: none; }
 .brand-mark svg { width:17px; height:17px; }
 .brand-name { font-size:15px; font-weight:600; letter-spacing:-0.02em; white-space:nowrap; }
 .brand-name b { color:var(--accent); font-weight:600; }
+.usage-meter { display:inline-flex; align-items:center; gap:6px; margin-left:8px; padding:3px 9px;
+  border:1px solid var(--border); border-radius:99px; font-family:var(--mono); font-size:11px;
+  color:var(--t-muted); white-space:nowrap; }
+.usage-meter[hidden] { display:none; }
+.usage-meter .usage-sep { color:var(--t-faint); }
 .brand-tag { font-size:11px; color:var(--t-faint); font-weight:500; margin-left:2px; white-space:nowrap;
   padding:2px 7px; border:1px solid var(--border); border-radius:99px; letter-spacing:.01em; }
 .topbar-right { display:flex; align-items:center; gap:10px; flex:none; }
@@ -1626,12 +1834,6 @@ a { color: var(--accent); text-decoration: none; }
 .composer { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow-md); padding:var(--composer-pad); transition:border-color .15s, box-shadow .2s; }
 .composer.focus { border-color:var(--accent-bd); box-shadow:var(--shadow-md), 0 0 0 4px var(--accent-soft); }
-/* agentic on: highlight the composer with the accent + a slight glow */
-.composer.agentic-active { border-color:var(--accent);
-  background:radial-gradient(ellipse at center,
-    color-mix(in srgb, var(--accent) 13%, transparent),
-    color-mix(in srgb, var(--accent) 4%, transparent) 72%), var(--surface);
-  box-shadow:var(--shadow-md), 0 0 0 1px var(--accent), 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent); }
 .composer-row { display:flex; align-items:flex-end; gap:10px; }
 .composer-input-wrap { flex:1; display:flex; align-items:flex-end; gap:10px; padding-left:4px; min-width:0; }
 .composer-input-wrap > svg { width:16px; height:16px; color:var(--t-faint); flex:none; margin-bottom:7px; }
@@ -1659,8 +1861,6 @@ a { color: var(--accent); text-decoration: none; }
 .pill:hover { border-color:var(--border-2); color:var(--ink); background:var(--surface-2); }
 .pill svg { width:13px; height:13px; }
 .pill.on { background:var(--accent-soft); border-color:var(--accent-bd); color:var(--accent-ink); }
-.pill.on .pill-dot { background:var(--accent); }
-.pill-dot { width:7px; height:7px; border-radius:50%; background:var(--t-faint); transition:background .14s; }
 .cost-chip { display:inline-flex; align-items:center; gap:7px; height:26px; padding:0 10px 0 9px;
   border-radius:99px; border:1px solid var(--border); background:var(--surface); font-size:11.5px; color:var(--t-subtle); cursor:pointer; }
 .cost-chip:hover { border-color:var(--border-2); }
@@ -1711,13 +1911,47 @@ a { color: var(--accent); text-decoration: none; }
 .config-panel .agentic-config,
 .config-panel .agentic-config.hidden { display:block !important; }
 
-/* agentic-row (hint text under composer when agentic on) */
-.agentic-row { display:none; }
-.agentic-row.active { display:flex; gap:10px; align-items:flex-start; margin-top:12px; padding:11px 13px;
-  background:var(--accent-soft); border:1px solid var(--accent-bd); border-radius:var(--radius-sm); }
-.agentic-row label { display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600; color:var(--accent-ink); white-space:nowrap; }
-.agentic-row label input { accent-color:var(--accent); width:15px; height:15px; }
-.agentic-hint { font-size:12px; color:var(--t-muted); line-height:1.5; }
+/* ── Add test plan popover ──────────────────────────────────────────────── */
+.addtest-pop-wrap { position:relative; }
+.addtest-panel { display:none; }
+.addtest-panel.open { display:flex; flex-direction:column; position:fixed; z-index:2500;
+  top:50%; left:50%; transform:translate(-50%, -50%);
+  width:min(460px, 92vw); height:min(560px, 82vh);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--radius);
+  box-shadow:var(--shadow-pop); padding:16px; animation:fadeCenter .14s ease; }
+.addtest-warn { font-size:11.5px; font-weight:600; color:var(--warn); background:var(--warn-soft);
+  border:1px solid color-mix(in srgb, var(--warn) 26%, transparent); border-radius:var(--radius-xs);
+  padding:7px 10px; margin-bottom:11px; }
+.addtest-inwrap { position:relative; }
+.addtest-inwrap input { width:100%; height:36px; padding:0 11px; border:1px solid var(--border);
+  border-radius:var(--radius-xs); background:var(--surface); color:var(--ink); font-size:13px;
+  font-family:var(--mono); outline:none; }
+.addtest-inwrap input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+.addtest-ac, .addtest-browse { margin-top:6px; flex:1 1 auto; min-height:0; overflow-y:auto; border:1px solid var(--border);
+  border-radius:var(--radius-xs); background:var(--surface); }
+.addtest-ac[hidden], .addtest-browse[hidden] { display:none; }
+.addtest-opt { padding:7px 10px; cursor:pointer; border-bottom:1px solid var(--border); }
+.addtest-opt:last-child { border-bottom:0; }
+.addtest-opt:hover, .addtest-opt.active { background:var(--accent-soft); }
+.addtest-opt-id { font-family:var(--mono); font-size:12.5px; font-weight:600; color:var(--ink); }
+.addtest-opt-title { font-size:12px; color:var(--t-muted); margin-top:1px; }
+.addtest-opt-det { font-size:11px; color:var(--t-faint); margin-top:1px; }
+.addtest-grp { padding:7px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--t-faint); font-weight:600; background:var(--surface-2); position:sticky; top:0; }
+.addtest-test { border-bottom:1px solid var(--border); }
+.addtest-test-head { display:flex; align-items:center; gap:8px; padding:7px 10px; cursor:pointer; }
+.addtest-test-head:hover { background:var(--surface-2); }
+.addtest-test-head .tw { color:var(--t-faint); font-size:10px; width:12px; }
+.addtest-cases { display:none; }
+.addtest-test.open .addtest-cases { display:block; }
+.addtest-test.open .addtest-test-head .tw { transform:rotate(90deg); }
+.addtest-case { padding:6px 10px 6px 30px; cursor:pointer; font-size:12.5px; color:var(--t-muted); }
+.addtest-case:hover, .addtest-case.active { background:var(--accent-soft); color:var(--ink); }
+.addtest-error { margin-top:8px; font-size:12px; color:var(--danger); }
+.addtest-error[hidden] { display:none; }
+.addtest-actions { display:flex; align-items:center; gap:10px; margin-top:auto; padding-top:12px; }
+.addtest-selected { flex:1; font-size:12px; color:var(--t-subtle); font-family:var(--mono);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
 /* empty state */
 .empty { text-align:center; padding:54px 20px 30px; }
@@ -1867,13 +2101,9 @@ a { color: var(--accent); text-decoration: none; }
 .pipe.open .pipe-chev { transform:rotate(180deg); }
 .pipe-body { display:none; padding:6px 18px 18px; border-top:1px solid var(--border); }
 .pipe.open .pipe-body { display:block; animation:fadeUp .2s ease; }
-/* When expanded, the trace breaks out of the answer column to (near) full
-   screen width so the flow chart has room. The .split sidebar (332px) + gap
-   shift the main column's center left of the viewport center, so we re-center
-   by offsetting the transform by half that amount. */
-.pipe.open { position:relative; z-index:20; width:min(96vw, 1500px);
-  left:50%; transform:translateX(calc(-50% + (332px + var(--gap-block)) / 2)); }
-@media (max-width:880px) { .pipe.open { width:auto; left:auto; transform:none; } }
+/* Expanded, the trace stays inside its turn card (the old near-full-width
+   breakout poked outside the card border once turns became bordered
+   sections). The chart scrolls inside .viz-container when it's wider. */
 
 /* pipeline viz */
 .viz-section { margin-top:8px; }
@@ -1885,7 +2115,10 @@ a { color: var(--accent); text-decoration: none; }
 .viz-nav-btn:hover { border-color:var(--border-2); color:var(--ink); }
 .viz-nav-label { font-size:11.5px; color:var(--t-subtle); font-family:var(--mono); white-space:nowrap; }
 .viz-container { position:relative; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:14px; overflow:auto; }
-.viz-container svg { max-width:100%; height:auto; }
+.viz-container svg { max-width:100%; height:auto; display:block; margin:0 auto; }
+/* ponytail: shrink the whole transcript (answers, sources, pipeline) without
+   touching the topbar or the docked composer, which live outside #results. */
+#results { zoom: 0.9; }
 .viz-empty { color:var(--t-faint); font-size:12.5px; padding:24px; text-align:center; }
 /* node hover highlight */
 .viz-container g.node { transition:filter .12s ease; }
@@ -1953,7 +2186,6 @@ a { color: var(--accent); text-decoration: none; }
 .stage-json { font-family:var(--mono); font-size:11px; background:var(--subtle); border:1px solid var(--border); border-radius:var(--radius-xs); padding:10px; overflow:auto; margin-top:6px; max-height:340px; color:var(--t-muted); }
 
 /* model picker locked while agentic is on (always uses the strongest model) */
-select.locked-agentic { opacity:.55; cursor:not-allowed; }
 
 /* model panel */
 .model-panel { margin-top:14px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden; }
@@ -2080,12 +2312,23 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 .flag-toast[hidden] { display:none; }
 
 /* ── Dev panel: bottom-left FAB + flags/notes drawer ─────────────────────── */
-.dev-fab { position:fixed; left:20px; bottom:20px; z-index:1500; width:40px; height:40px;
+.dev-fab { position:fixed; left:20px; bottom:68px; z-index:1500; width:40px; height:40px;
   display:inline-flex; align-items:center; justify-content:center; border-radius:10px;
   background:var(--surface); color:var(--t-subtle); border:1px solid var(--border);
   box-shadow:0 2px 10px rgba(0,0,0,.14); cursor:pointer; opacity:.7;
   transition:transform .12s ease, color .12s ease, border-color .12s ease, opacity .12s ease; }
 .dev-fab:hover { transform:translateY(-1px); color:var(--accent); border-color:var(--accent); opacity:1; }
+
+/* Config FAB: icon-only, sits right below the dev (</>) FAB. */
+.config-fab-wrap { position:fixed; left:20px; bottom:20px; z-index:1500; }
+#config-toggle.config-fab { width:40px; height:40px; padding:0; gap:0; border-radius:10px;
+  display:inline-flex; align-items:center; justify-content:center;
+  background:var(--surface); color:var(--t-subtle); border:1px solid var(--border);
+  box-shadow:0 2px 10px rgba(0,0,0,.14); opacity:.7; height:40px;
+  transition:transform .12s ease, color .12s ease, border-color .12s ease, opacity .12s ease; }
+#config-toggle.config-fab:hover { transform:translateY(-1px); color:var(--accent); border-color:var(--accent); opacity:1; background:var(--surface); }
+#config-toggle.config-fab svg { width:18px; height:18px; }
+.config-fab-wrap .config-panel.open { bottom:calc(100% + 8px); left:0; }
 .dev-overlay { position:fixed; inset:0; z-index:2400; background:color-mix(in srgb, var(--ink) 38%, transparent);
   display:flex; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(2px); animation:fadeUp .14s ease; }
 .dev-overlay[hidden] { display:none; }
@@ -2151,6 +2394,15 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
 .dev-note-del { width:22px; height:22px; flex:none; border:0; background:transparent; color:var(--t-faint); border-radius:6px; cursor:pointer; font-size:12px; line-height:1; }
 .dev-note-del:hover { background:var(--surface-2); color:var(--danger); }
 .dev-note-body { font-size:12.5px; color:var(--ink); white-space:pre-wrap; word-break:break-word; }
+/* batch mode */
+.batch-hint { font-size:12px; color:var(--t-subtle); margin:0 0 12px; line-height:1.5; }
+.batch-progress { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.batch-bar { flex:1; height:8px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
+.batch-bar-fill { height:100%; width:0%; background:var(--accent); border-radius:99px; transition:width .25s ease; }
+.batch-log { display:flex; flex-direction:column; gap:4px; font-family:var(--mono); font-size:11.5px; }
+.batch-log-line { padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-xs); background:var(--surface); color:var(--t-muted); word-break:break-word; }
+.batch-log-line.ok { border-color:color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.batch-log-line.err { color:var(--danger); border-color:color-mix(in srgb, var(--danger) 40%, var(--border)); }
 /* dev flow chart (reconstructed from stored pipeline_trace) */
 .dev-flow-host { position:relative; margin-top:8px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:12px; overflow:auto; }
 .dev-flow-host:empty { display:none; }
@@ -2176,6 +2428,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             <div class="brand">
                 <div class="brand-name">spec<b>GPT</b></div>
                 <span class="brand-tag">NVMe Spec Q&amp;A</span>
+                <span class="usage-meter" id="usage-meter" title="Total tokens and estimated cost this conversation" hidden>
+                    <span id="usage-tok">0</span> tok
+                    <span class="usage-sep">&#183;</span>
+                    <span id="usage-cost">$0.0000</span>
+                </span>
             </div>
             <div class="topbar-right">
                 <button id="theme-toggle" class="icon-btn" type="button" role="switch"
@@ -2350,18 +2607,13 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 </div>
 
                 <div class="controls">
-                    <div class="config-pop-wrap">
-                        <button id="config-toggle" class="pill" type="button">
+                    <div class="config-pop-wrap config-fab-wrap">
+                        <button id="config-toggle" class="config-fab" type="button" title="Pipeline configuration" aria-label="Pipeline configuration">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></svg>
-                            Config
                         </button>
                         <div id="config-panel" class="config-panel">
                             <strong>Pipeline configuration</strong>
                             <div class="config-grid">
-                                <div class="config-item config-item-wide">
-                                    <label>Regular LLM</label>
-                                    <select id="config-llm_model" data-model-select="llm"></select>
-                                </div>
                                 <div class="config-item">
                                     <label>Context Chunks</label>
                                     <input type="number" id="config-final_rerank_topk" value="10" min="1" max="20" title="How many top-ranked sections are sent to the model. More = better coverage, higher cost.">
@@ -2373,6 +2625,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                 <div class="config-item">
                                     <label title="After answering, a cheap model checks for gaps and offers agentic refinement when coverage looks thin"><input type="checkbox" id="config-auto_gap_check" checked> Auto Gap Check</label>
                                 </div>
+                                <div class="config-item">
+                                    <label title="When a conformance test is selected, the first question pre-searches the spec until the test's dependencies are understood, then keeps those sections in context for the whole chat"><input type="checkbox" id="config-testplan_priming" checked> Test Priming</label>
+                                </div>
+                                <div class="config-item">
+                                    <label title="Skip agentic refinement for a faster, cheaper answer. Refinement normally runs on every query."><input type="checkbox" id="config-ultra_fast"> Fast Mode</label>
+                                </div>
                             </div>
 
                             <!-- Advanced retrieval internals: still applied per request (presets
@@ -2380,6 +2638,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                  not user-editable. Hidden, not removed, so every
                                  getElementById("config-*") call site keeps working. -->
                             <div hidden aria-hidden="true">
+                                <select id="config-llm_model" data-model-select="llm"></select>
                                 <input type="number" id="config-vector_topk" value="5">
                                 <input type="number" id="config-bm25_topk" value="5">
                                 <input type="number" id="config-rrf_k" value="60">
@@ -2389,10 +2648,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                             <div class="config-section-label">Agentic refinement</div>
                             <div id="agentic-config" class="agentic-config">
                                 <div class="config-grid">
-                                    <div class="config-item config-item-wide">
-                                        <label>Agentic LLM</label>
-                                        <select id="config-agentic_model" data-model-select="agentic"></select>
-                                    </div>
                                     <div class="config-item">
                                         <label title="Keep refining until the gap analyser reports no missing context"><input type="checkbox" id="config-agentic_recursive" checked> Recursive</label>
                                     </div>
@@ -2402,6 +2657,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                                     </div>
                                 </div>
                                 <div hidden aria-hidden="true">
+                                    <select id="config-agentic_model" data-model-select="agentic"></select>
                                     <input type="number" id="config-agentic_max_followups" value="3">
                                     <input type="number" id="config-agentic_rerank_topk" value="14">
                                     <input type="number" id="config-agentic_max_context_tokens" value="16000">
@@ -2413,97 +2669,36 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         </div>
                     </div>
 
-                    <label class="pill preset-pill" title="Speed vs. depth preset — applies a bundle of pipeline settings">
-                        <span style="font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--t-faint);font-weight:600;">Preset</span>
-                        <select id="preset-select" style="border:0;background:transparent;color:inherit;font:inherit;font-weight:500;outline:none;cursor:pointer;"></select>
-                    </label>
-                    <script>
-                    (function () {
-                        // Config presets (#3): a dropdown that applies a bundle of
-                        // pipeline settings to the existing config inputs. The server
-                        // (/api/presets, mirroring orchestrator.PRESETS) is the source
-                        // of truth; this fallback keeps the selector working if that
-                        // fetch fails. agentic_model is listed before llm_model on
-                        // purpose so the global picker (synced on each change, last
-                        // one wins) ends up displaying the regular model.
-                        var FALLBACK = {
-                            fast:     { label: "Fast",     agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 6, bm25_topk: 6, rrf_k: 60, rrf_output_topk: 12, final_rerank_topk: 5, max_subqueries: 1, auto_gap_check: false, agentic_max_followups: 2, agentic_rerank_topk: 10, agentic_max_context_tokens: 8000, agentic_max_output_tokens: 1024, agentic_targeted_fetch: true, agentic_recursive: false, agentic_max_iterations: 1, figure_reserve_tokens: 1500 } },
-                            balanced: { label: "Balanced", agentic: false, config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 5, bm25_topk: 5, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } },
-                            thorough: { label: "Thorough", agentic: true,  config: { agentic_model: "deepthought-claude-sonnet-4-6", llm_model: "deepthought-claude-sonnet-4-6", vector_topk: 8, bm25_topk: 8, rrf_k: 60, rrf_output_topk: 20, final_rerank_topk: 10, max_subqueries: 3, auto_gap_check: true, agentic_max_followups: 3, agentic_rerank_topk: 14, agentic_max_context_tokens: 16000, agentic_max_output_tokens: 2048, agentic_targeted_fetch: true, agentic_recursive: true, agentic_max_iterations: 4, figure_reserve_tokens: 3000 } }
-                        };
-                        var PRESETS = FALLBACK, DEFAULT = "balanced";
-                        // True while apply() is programmatically writing inputs, so the
-                        // divergence listeners below don't mistake it for a hand-edit.
-                        var applying = false;
-                        function setInput(key, val) {
-                            var el = document.getElementById("config-" + key);
-                            if (!el) return;
-                            if (el.type === "checkbox") el.checked = !!val; else el.value = val;
-                            el.dispatchEvent(new Event("change", { bubbles: true }));
-                        }
-                        function apply(name) {
-                            var p = PRESETS[name] || PRESETS[DEFAULT];
-                            if (!p) return;
-                            applying = true;
-                            try {
-                                var cfg = p.config || {};
-                                for (var k in cfg) if (Object.prototype.hasOwnProperty.call(cfg, k)) setInput(k, cfg[k]);
-                                var tog = document.getElementById("agentic-toggle");
-                                if (tog && tog.checked !== !!p.agentic) {
-                                    tog.checked = !!p.agentic;
-                                    tog.dispatchEvent(new Event("change", { bubbles: true }));
-                                }
-                            } finally { applying = false; }
-                            try { localStorage.setItem("specgpt_preset", name); } catch (e) {}
-                        }
-                        function render(sel, cur) {
-                            sel.innerHTML = Object.keys(PRESETS).map(function (k) {
-                                return '<option value="' + k + '">' + (PRESETS[k].label || k) + "</option>";
-                            }).join("") + '<option value="custom" disabled hidden>Custom</option>';
-                            sel.value = (cur === "custom" || PRESETS[cur]) ? cur : DEFAULT;
-                        }
-                        // Hand-editing any config knob diverges from the applied preset;
-                        // show "Custom" instead of letting the selector lie. Re-picking a
-                        // preset re-applies the bundle. Not persisted: the last real
-                        // preset stays in localStorage.
-                        function markCustom() {
-                            if (applying) return;
-                            var sel = document.getElementById("preset-select");
-                            if (sel && sel.value !== "custom") sel.value = "custom";
-                        }
-                        document.addEventListener("DOMContentLoaded", function () {
-                            var sel = document.getElementById("preset-select");
-                            if (!sel) return;
-                            var cur = "balanced";
-                            try { cur = localStorage.getItem("specgpt_preset") || "balanced"; } catch (e) {}
-                            render(sel, cur);
-                            apply(sel.value);
-                            sel.addEventListener("change", function () {
-                                if (sel.value !== "custom") apply(sel.value);
-                            });
-                            // #agentic-config is watched separately because the refine
-                            // overlay moves that node out of #config-panel.
-                            ["config-panel", "agentic-config"].forEach(function (id) {
-                                var host = document.getElementById(id);
-                                if (!host) return;
-                                host.addEventListener("change", markCustom);
-                                host.addEventListener("input", markCustom);
-                            });
-                            var tog = document.getElementById("agentic-toggle");
-                            if (tog) tog.addEventListener("change", markCustom);
-                            fetch("/api/presets").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
-                                if (d && d.presets) { PRESETS = d.presets; DEFAULT = d.default || "balanced"; render(sel, sel.value); }
-                            }).catch(function () {});
-                        });
-                    })();
-                    </script>
+                    <div class="addtest-pop-wrap">
+                        <button id="addtest-toggle" class="pill" type="button" title="Attach a UNH-IOL conformance test plan to this chat. One test per chat: it locks on your first message, start a new chat to switch.">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M12 8v6M9 11h6"/></svg>
+                            Add test plan
+                        </button>
+                        <div id="addtest-panel" class="addtest-panel">
+                            <div class="addtest-warn">Only NVM Command Set Test Plans Supported Currently</div>
+                            <div class="addtest-inwrap">
+                                <input id="addtest-input" type="text" autocomplete="off"
+                                       placeholder="Type a test number, e.g. 2.1.3">
+                            </div>
+                            <div id="addtest-ac" class="addtest-ac" hidden></div>
+                            <div id="addtest-browse" class="addtest-browse"></div>
+                            <div id="addtest-error" class="addtest-error" hidden></div>
+                            <div class="addtest-actions">
+                                <span id="addtest-selected" class="addtest-selected"></span>
+                                <button id="addtest-clear" class="dev-btn" type="button" disabled>Clear</button>
+                            </div>
+                        </div>
+                    </div>
 
-                    <button id="agentic-pill" class="pill" type="button"
-                            title="Toggle agentic refinement for the next query">
-                        <span class="pill-dot"></span>
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="3" x2="12" y2="6"/><circle cx="12" cy="2.6" r="1" fill="currentColor" stroke="none"/><rect x="4" y="7" width="16" height="12" rx="3"/><circle cx="9" cy="13" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.3" fill="currentColor" stroke="none"/><line x1="10" y1="16.5" x2="14" y2="16.5"/></svg>
-                        <span id="agentic-pill-label">Agentic</span>
-                    </button>
+                    <!-- Single model picker: drives both the regular and agentic
+                         model selects (hidden in the config panel), which every
+                         downstream reader still uses. Populated + mirrored by
+                         _wireGlobalModelSelect in the main script. Config input
+                         defaults match the old "balanced" preset. -->
+                    <label class="pill" title="Generation model for every stage of the pipeline">
+                        <span style="font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--t-faint);font-weight:600;">Model</span>
+                        <select id="global-model-select" style="border:0;background:transparent;color:inherit;font:inherit;font-weight:500;outline:none;cursor:pointer;"></select>
+                    </label>
 
                     <div class="controls-spacer"></div>
 
@@ -2518,19 +2713,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     </div>
                 </div>
 
-                <div id="agentic-row" class="agentic-row">
-                    <label>
-                        <input type="checkbox" id="agentic-toggle">
-                        <span>Agentic mode</span>
-                    </label>
-                    <span class="agentic-hint">
-                        Decomposes the answer, runs follow-up retrieval to fill gaps, then
-                        regenerates with the agentic model and a larger context. Slower
-                        (about 30 to 90 seconds) and many times the cost, so leave it off
-                        for routine queries. The Est. cost chip shows the price for the
-                        current settings.
-                    </span>
-                </div>
+                <!-- Agentic refinement runs on every query unless Fast Mode
+                     is checked in the config. #agentic-toggle stays in the DOM
+                     (hidden, mirrored inverted from #config-ultra_fast) so all
+                     existing agentic JS wiring keeps working. -->
+                <input type="checkbox" id="agentic-toggle" checked hidden>
             </div>
         </div>
     </div>
@@ -2607,6 +2794,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 <div class="dev-tabs">
                     <button class="dev-tab active" type="button" data-devtab="flags">Flagged answers</button>
                     <button class="dev-tab" type="button" data-devtab="notes">Notes</button>
+                    <button class="dev-tab" type="button" data-devtab="batch">Batch mode</button>
                 </div>
                 <button class="dev-close" id="dev-close" type="button" aria-label="Close">&#x2715;</button>
             </div>
@@ -2636,6 +2824,20 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                         <button class="dev-btn dev-btn-primary" id="dev-note-add" type="button">Add note</button>
                     </div>
                     <div id="dev-notes-list"></div>
+                </div>
+                <div id="dev-pane-batch" class="dev-pane" hidden>
+                    <div class="dev-toolbar">
+                        <input type="file" id="batch-file" accept=".json,application/json">
+                        <button class="dev-btn dev-btn-primary" id="batch-run" type="button" disabled>Run batch</button>
+                        <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
+                        <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
+                    </div>
+                    <p class="batch-hint">Upload a JSON array of objects with a "question" field. Each question runs through the pipeline on the Thorough preset, one at a time. Results download as question/answer JSON.</p>
+                    <div class="batch-progress" id="batch-progress" hidden>
+                        <div class="batch-bar"><div class="batch-bar-fill" id="batch-bar-fill"></div></div>
+                        <span class="dev-count" id="batch-pct">0%</span>
+                    </div>
+                    <div id="batch-log" class="batch-log"></div>
                 </div>
             </div>
         </div>
@@ -2703,7 +2905,10 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 flowchart: {
                     curve: "basis",
                     htmlLabels: true,
-                    useMaxWidth: true,
+                    // ponytail: false = render at intrinsic size (container
+                    // scrolls). true upscaled small graphs to full width, which
+                    // fattened stroke-scaled edges/arrowheads into black wedges.
+                    useMaxWidth: false,
                     diagramPadding: 24,
                     nodeSpacing: 48,
                     rankSpacing: 56,
@@ -2717,7 +2922,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         const MODEL_STAGE_LABELS = {
             embedding: "Embedding",
             reranker: "Reranker",
-            llm: "LLM (standard)",
+            llm: "LLM",
             agentic_llm: "LLM (agentic)",
         };
         let _modelsData = null;
@@ -2828,6 +3033,26 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         populateModelSelect(document.getElementById("config-llm_model"),     "llm");
         populateModelSelect(document.getElementById("config-agentic_model"), "agentic");
 
+        // The one visible model picker. Mirrors into the hidden regular and
+        // agentic selects (dispatching change) so the cost estimator, config
+        // payload, and model table all keep reading the ids they always have.
+        (function _wireGlobalModelSelect() {
+            const global = document.getElementById("global-model-select");
+            if (!global) return;
+            populateModelSelect(global, "agentic");
+            const sync = () => {
+                ["config-llm_model", "config-agentic_model"].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el && el.value !== global.value) {
+                        el.value = global.value;
+                        el.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                });
+            };
+            global.addEventListener("change", sync);
+            sync();
+        })();
+
         // ── Spec picker (Base vs PCIe Transport) ───────────────────────────
         // Scopes every query to one specification. Persisted in localStorage so
         // the choice survives reloads; sent as config.spec on each request.
@@ -2912,8 +3137,14 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             _lastIsAgentic = isAgentic;
             _applySelectedModels();
             const tbody = document.getElementById("model-table-body");
-            tbody.innerHTML = Object.entries(_modelsData).map(([key, info]) => {
-                const active = (key === "llm" && !isAgentic) || (key === "agentic_llm" && isAgentic);
+            // One model drives both regular and agentic generation now, so
+            // collapse the duplicate agentic_llm row when the ids match.
+            const merged = _modelsData.llm && _modelsData.agentic_llm
+                && _modelsData.llm.model === _modelsData.agentic_llm.model;
+            tbody.innerHTML = Object.entries(_modelsData).filter(([key]) =>
+                !(merged && key === "agentic_llm")
+            ).map(([key, info]) => {
+                const active = key === "llm" ? (merged || !isAgentic) : (key === "agentic_llm" && isAgentic);
                 return `<tr class="${active ? "model-row-active" : ""}">
                     <td>${MODEL_STAGE_LABELS[key] || key}</td>
                     <td><code>${escapeHtml(info.model)}</code></td>
@@ -3459,6 +3690,30 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             L.push(`  Q["${_label(_qLabel, _qSub, null)}"]:::input`);
             nodeMap["Q"] = _qStage;
 
+            // Test-plan priming (first query of a test-bound chat): ran BEFORE
+            // the pipeline; its pinned sections feed generation context
+            // directly, so the node branches off Q and rejoins at GEN.
+            const tpEntries = trace.filter(s => s.stage && s.stage.indexOf("testplan_prime.") === 0);
+            if (tpEntries.length) {
+                const tpPlans = tpEntries.filter(s => s.stage === "testplan_prime.plan");
+                const tpLast = tpPlans[tpPlans.length - 1] || tpEntries[tpEntries.length - 1];
+                const tpSearches = tpEntries.length - tpPlans.length;
+                const tpPinned = ((tpLast.output && tpLast.output.important_sections) || []).length;
+                const tpDone = tpLast.output && tpLast.output.understood;
+                const tpSub = tpSearches + " search round" + (tpSearches === 1 ? "" : "s")
+                    + (tpPinned ? " · " + tpPinned + " pinned" : "")
+                    + (tpDone ? " · understood" : "");
+                const tpStage = {
+                    stage: "testplan_prime",
+                    input: {plan_rounds: tpPlans.length, search_rounds: tpSearches},
+                    output: tpLast.output || {},
+                    took_ms: tpEntries.reduce((a, s) => a + (s.took_ms || 0), 0),
+                };
+                L.push(`  TP["${_label("Test plan priming", _vizText(tpSub, 60), tpStage)}"]:::stage_struct`);
+                L.push("  Q --> TP");
+                nodeMap["TP"] = tpStage;
+            }
+
             // Refine-mode trace: /api/refine reused a prior /api/query's
             // first-pass state, so Stages 1-4 didn't run. Emit a "Resume"
             // marker so the diagram still has a visible upstream node feeding
@@ -3561,6 +3816,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 const ans = gen.output.answer_length || 0;
                 L.push(`  GEN["${_label("Generate answer", ans.toLocaleString() + " chars · " + cits + " citation" + (cits===1?"":"s") + " · Claude", gen)}"]:::stage_gen`);
                 if (rr) L.push("  RR --> GEN");
+                if (nodeMap["TP"]) L.push("  TP --> GEN");
                 nodeMap["GEN"] = gen;
             }
 
@@ -4294,15 +4550,221 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         const agenticToggle = document.getElementById("agentic-toggle");
         const agenticConfig = document.getElementById("agentic-config");
         agenticToggle.addEventListener("change", () => {
-            const composerEl = document.getElementById("composer");
-            if (composerEl) composerEl.classList.toggle("agentic-active", agenticToggle.checked);
             agenticConfig.classList.toggle("hidden", !agenticToggle.checked);
         });
+
+        // Fast Mode is the only user-facing switch: checking it turns
+        // agentic refinement off. The hidden #agentic-toggle stays the single
+        // source of truth all existing wiring reads, mirrored inverted here.
+        (function () {
+            const ultraFast = document.getElementById("config-ultra_fast");
+            if (!ultraFast) return;
+            ultraFast.addEventListener("change", () => {
+                agenticToggle.checked = !ultraFast.checked;
+                agenticToggle.dispatchEvent(new Event("change"));
+            });
+            // Keep the checkbox honest when something else flips agentic
+            // (presets, the run-refinement flow, config-popup cancel).
+            agenticToggle.addEventListener("change", () => {
+                ultraFast.checked = !agenticToggle.checked;
+            });
+        })();
 
         // Config panel toggle
         configToggle.addEventListener("click", () => {
             configPanel.classList.toggle("open");
         });
+
+        // ── Add test plan picker ──────────────────────────────────────────
+        // The single way to attach a UNH-IOL test to a chat: type a test
+        // number to filter, or browse the grouped tree. Picking a case
+        // applies it immediately. Owns the picker state used by sendQuery
+        // (_selectedTestCaseId) and the one-test-per-chat lock; the server
+        // enforces the same rule in _resolve_test_context (409 test_locked).
+        (function () {
+            const wrap   = document.querySelector(".addtest-pop-wrap");
+            const toggle = document.getElementById("addtest-toggle");
+            const panel  = document.getElementById("addtest-panel");
+            const input  = document.getElementById("addtest-input");
+            const acBox  = document.getElementById("addtest-ac");
+            const browse = document.getElementById("addtest-browse");
+            const errEl  = document.getElementById("addtest-error");
+            const clearBtn = document.getElementById("addtest-clear");
+            const selEl  = document.getElementById("addtest-selected");
+            if (!toggle || !panel) return;
+
+            let groups = [];     // [{group_name, tests:[...]}]
+            let units = [];      // flattened selectable cases
+            let selected = null; // chosen unit
+            let locked = false;  // test bound to this chat by the first sent message
+            let loaded = false;
+            let acList = [];     // current autocomplete results
+            let acIdx = -1;      // keyboard-highlighted row, -1 = none
+
+            const dotted = id => id.replace(/\\//g, ".");
+            const shortTitle = s => (s || "")
+                .replace(/^Case\\s+\\d+:\\s*/, "")
+                .replace(/^Test\\s+\\S+\\s*[\\u2013-]\\s*/, "")
+                .replace(/\\s*\\([^)]*\\)\\s*$/, "");
+
+            function build(index) {
+                groups = index.groups || []; units = [];
+                groups.forEach(g => (g.tests || []).forEach(t =>
+                    (t.cases || []).forEach(c => units.push({
+                        caseId: c.id, testId: t.test_id, dot: dotted(c.id),
+                        title: shortTitle(c.title || c.id), testTitle: t.test_title,
+                    }))));
+            }
+
+            function ensureLoaded() {
+                if (loaded) return Promise.resolve();
+                return fetch("/api/testplans")
+                    .then(r => (r.ok ? r.json() : null))
+                    .then(d => { if (d && d.groups) { build(d); loaded = true; renderBrowse(); } })
+                    .catch(() => {});
+            }
+
+            function syncUI() {
+                toggle.classList.toggle("on", !!selected);
+                toggle.lastChild.textContent = selected ? " Test " + selected.dot : " Add test plan";
+                selEl.textContent = selected ? selected.dot + "  " + selected.title : "";
+                clearBtn.disabled = !selected || locked;
+            }
+
+            function pick(u) {
+                if (locked && selected && u.testId !== selected.testId) {
+                    errEl.textContent = "Test is locked for this chat. Start a new chat to switch.";
+                    errEl.hidden = false;
+                    return;
+                }
+                selected = u;
+                errEl.hidden = true;
+                input.value = "";
+                acBox.hidden = true;
+                browse.hidden = false;
+                syncUI();
+                panel.classList.remove("open");
+            }
+
+            // ponytail: numbers-only prefix match by design, titles are the browse tree's job
+            function match(q) {
+                q = q.trim();
+                if (!q) return [];
+                return units.filter(u => u.dot.startsWith(q)).slice(0, 50);
+            }
+
+            function renderAC(list) {
+                acList = list; acIdx = -1;
+                acBox.innerHTML = "";
+                list.forEach(u => {
+                    const d = document.createElement("div");
+                    d.className = "addtest-opt";
+                    d.innerHTML = '<div class="addtest-opt-id"></div><div class="addtest-opt-title"></div><div class="addtest-opt-det"></div>';
+                    d.children[0].textContent = u.dot;
+                    d.children[1].textContent = u.title;
+                    d.children[2].textContent = u.testTitle;
+                    d.addEventListener("mousedown", e => { e.preventDefault(); pick(u); });
+                    acBox.appendChild(d);
+                });
+                acBox.hidden = list.length === 0;
+            }
+
+            function highlight(idx) {
+                const rows = acBox.children;
+                if (!rows.length) return;
+                acIdx = (idx + rows.length) % rows.length;
+                for (let i = 0; i < rows.length; i++) rows[i].classList.toggle("active", i === acIdx);
+                rows[acIdx].scrollIntoView({ block: "nearest" });
+            }
+
+            function renderBrowse() {
+                browse.innerHTML = "";
+                groups.forEach(g => {
+                    const grp = document.createElement("div");
+                    grp.className = "addtest-grp";
+                    grp.textContent = g.group_name;
+                    browse.appendChild(grp);
+                    (g.tests || []).forEach(t => {
+                        const box = document.createElement("div");
+                        box.className = "addtest-test";
+                        const head = document.createElement("div");
+                        head.className = "addtest-test-head";
+                        head.innerHTML = '<span class="tw">&#9654;</span><span class="addtest-opt-id"></span>';
+                        head.children[1].textContent = t.test_id + " " + shortTitle(t.test_title);
+                        head.addEventListener("click", () => box.classList.toggle("open"));
+                        box.appendChild(head);
+                        const cases = document.createElement("div");
+                        cases.className = "addtest-cases";
+                        (t.cases || []).forEach(c => {
+                            const u = units.find(x => x.caseId === c.id);
+                            const row = document.createElement("div");
+                            row.className = "addtest-case";
+                            row.textContent = dotted(c.id) + "  " + shortTitle(c.title || c.id);
+                            row.addEventListener("click", () => u && pick(u));
+                            cases.appendChild(row);
+                        });
+                        box.appendChild(cases);
+                        browse.appendChild(box);
+                    });
+                });
+            }
+
+            input.addEventListener("input", () => {
+                errEl.hidden = true;
+                const q = input.value.trim();
+                if (!q) { acBox.hidden = true; acList = []; acIdx = -1; browse.hidden = false; return; }
+                browse.hidden = true;
+                renderAC(match(q));
+                if (acList.length === 0) {
+                    errEl.textContent = "No test number starts with \\"" + q + "\\".";
+                    errEl.hidden = false;
+                }
+            });
+
+            input.addEventListener("keydown", e => {
+                if (e.key === "ArrowDown") { e.preventDefault(); highlight(acIdx + 1); return; }
+                if (e.key === "ArrowUp")   { e.preventDefault(); highlight(acIdx - 1); return; }
+                if (e.key === "Escape")    { panel.classList.remove("open"); return; }
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                if (acList.length) pick(acList[acIdx >= 0 ? acIdx : 0]);
+            });
+
+            clearBtn.addEventListener("click", () => {
+                if (locked || !selected) return;
+                selected = null;
+                errEl.hidden = true;
+                syncUI();
+            });
+
+            toggle.addEventListener("click", () => {
+                const open = panel.classList.toggle("open");
+                if (open) {
+                    ensureLoaded();
+                    input.value = "";
+                    acBox.hidden = true;
+                    browse.hidden = false;
+                    errEl.hidden = true;
+                    input.focus();
+                }
+            });
+
+            document.addEventListener("mousedown", e => {
+                if (panel.classList.contains("open") && !wrap.contains(e.target)) panel.classList.remove("open");
+            });
+
+            // Wiring used by sendQuery / newConversation.
+            window._selectedTestCaseId = function () { return selected ? selected.caseId : null; };
+            window._lockTestPicker = function () {
+                if (locked || !selected) return;
+                locked = true;
+                syncUI();
+            };
+            window._resetTestPickerLock = function () {
+                locked = false;   // selection carries into the new chat, switchable again
+                syncUI();
+            };
+        })();
 
         // Auto-resize textarea
         const TEXTAREA_MAX_H = 200;
@@ -4344,7 +4806,13 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         let _conversationId = _newConvoId();
 
         function retireTurns() {
-            resultsDiv.querySelectorAll(".turn [id]").forEach(el => el.removeAttribute("id"));
+            // Keep ids inside rendered Mermaid SVGs: the chart's injected
+            // <style> is scoped by the svg's own id (#viz-N ...), so stripping
+            // it de-styles the old graph (edges lose fill:none and render as
+            // thick black wedges). Those ids are render-unique, never reused.
+            resultsDiv.querySelectorAll(".turn [id]").forEach(el => {
+                if (!el.closest("svg")) el.removeAttribute("id");
+            });
             // Controls that only make sense on the live turn.
             resultsDiv.querySelectorAll(".turn .viz-pass-nav").forEach(el => el.remove());
             resultsDiv.querySelectorAll(".turn .gap-act").forEach(btn => {
@@ -4382,6 +4850,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (typeof resetFlagFab === "function") resetFlagFab();
             window._lastResponse = null;
             window._pipeTrace = null;
+            if (typeof resetUsageMeter === "function") resetUsageMeter();
+            if (typeof window._resetTestPickerLock === "function") window._resetTestPickerLock();
         }
         (function () {
             const btn = document.getElementById("new-chat-btn");
@@ -4498,7 +4968,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             "agentic.followup_search":       "following up on a sub-question",
             "agentic.rerank":                "re-ranking the expanded context",
             "agentic.regenerate":            "refining the final answer",
-            "agentic.cap_reached":           "wrapping up"
+            "agentic.cap_reached":           "wrapping up",
+            "testplan_prime.plan":           "studying the selected test plan",
+            "testplan_prime.search":         "gathering spec background for the test"
         };
         var THINK_DEFAULT = [
             "reading your question",
@@ -4569,9 +5041,11 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 let detail;
                 try { detail = (await response.json()).detail; } catch (e) { detail = null; }
                 const message = typeof detail === "string" ? detail
-                    : (detail && typeof detail.message === "string" ? detail.message : "Request failed");
+                    : (detail && typeof (detail.message || detail.note) === "string"
+                        ? (detail.message || detail.note) : "Request failed");
                 const httpErr = new Error(message);
                 httpErr.status = response.status;  // let callers branch (e.g. 404 → re-run)
+                httpErr.detail = (detail && typeof detail === "object") ? detail : null;
                 throw httpErr;
             }
 
@@ -4645,6 +5119,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
                 auto_gap_check: document.getElementById("config-auto_gap_check").checked,
+                testplan_priming: document.getElementById("config-testplan_priming").checked,
                 figure_reserve_tokens: (function () {
                     var el = document.getElementById("config-figure_reserve_tokens");
                     var n = el ? parseInt(el.value, 10) : NaN;
@@ -4663,11 +5138,16 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const title = agentic ? "Thinking deeply…" : "Thinking…";
             _startLoading(title);
 
+            const testCaseId = (typeof window._selectedTestCaseId === "function")
+                ? window._selectedTestCaseId() : null;
+            if (testCaseId && typeof window._lockTestPicker === "function") window._lockTestPicker();
+
             _activeAbort = new AbortController();
             try {
                 const data = await _streamPipeline(
                     "/api/query/stream",
-                    { query, config, debug: true, agentic, conversation_id: _conversationId },
+                    { query, config, debug: true, agentic, conversation_id: _conversationId,
+                      test_case_id: testCaseId },
                     _activeAbort.signal,
                     (evt) => _onThinkStage(evt.stage)
                 );
@@ -4679,7 +5159,9 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     return;
                 }
                 errorDiv.textContent = err.status === 409
-                    ? "This conversation hit its turn limit. Use New chat (top right) to keep going."
+                    ? ((err.detail && err.detail.error === "test_locked")
+                        ? "This chat is locked to test " + err.detail.test_id + ". Start a new chat to switch tests."
+                        : "This conversation hit its turn limit. Use New chat (top right) to keep going.")
                     : `Error: ${err.message}`;
                 const turn = currentTurn();
                 if (turn) turn.appendChild(errorDiv);
@@ -4713,6 +5195,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             const useMd = (typeof marked !== "undefined" && typeof DOMPurify !== "undefined");
             let i = 0;
             let cancelled = false;
+            let finished = false;
             let timer = null;
             el.classList.add("streaming");
             function step() {
@@ -4727,21 +5210,27 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 if (i < fullText.length) {
                     timer = setTimeout(step, tickMs);
                 } else {
+                    finished = true;
                     el.classList.remove("streaming");
                     if (onDone) onDone();
                 }
             }
             step();
             return () => {
+                // Already finished: the DOM was decorated by onDone (citation
+                // chips, def terms). Re-flushing would wipe that - leave it.
+                if (finished || cancelled) return;
                 cancelled = true;
                 if (timer) clearTimeout(timer);
-                // Flush to the full text so the user keeps the complete answer.
+                // Flush to the full text so the user keeps the complete answer,
+                // then decorate it just like a natural finish would.
                 if (useMd) {
                     el.innerHTML = renderMarkdown(fullText);
                 } else {
                     el.textContent = fullText;
                 }
                 el.classList.remove("streaming");
+                if (onDone) onDone();
             };
         }
 
@@ -5011,6 +5500,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
                 auto_gap_check: document.getElementById("config-auto_gap_check").checked,
+                testplan_priming: document.getElementById("config-testplan_priming").checked,
                 figure_reserve_tokens: (function () {
                     var el = document.getElementById("config-figure_reserve_tokens");
                     var n = el ? parseInt(el.value, 10) : NaN;
@@ -5068,22 +5558,30 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
         var I_arrow = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 
         /* ── citation cross-highlighting ─────────────────────────────────── */
-        function setActiveSec(sec) {
-            document.querySelectorAll(".cite-chip").forEach(function (c) {
+        // Scope highlighting to the hovered element's own turn so an older
+        // answer's chips/sources cross-highlight within that turn instead of
+        // colliding with same-numbered citations in later turns.
+        function _turnScope(origin) {
+            return (origin && origin.closest && origin.closest(".turn")) || document;
+        }
+        function setActiveSec(sec, origin) {
+            var scope = _turnScope(origin);
+            scope.querySelectorAll(".cite-chip").forEach(function (c) {
                 c.classList.toggle("hot", !!sec && c.getAttribute("data-sec") === sec);
             });
-            document.querySelectorAll(".src").forEach(function (s) {
+            scope.querySelectorAll(".src").forEach(function (s) {
                 s.classList.toggle("hot", !!sec && s.getAttribute("data-sec") === sec);
             });
         }
         /* Figure analog of setActiveSec: hovering a fig-chip (or a figure card
            in the sidebar) highlights every chip/card for that figure, exactly
            like section chips do. Matches on data-fig instead of data-sec. */
-        function setActiveFig(num) {
-            document.querySelectorAll(".fig-chip").forEach(function (c) {
+        function setActiveFig(num, origin) {
+            var scope = _turnScope(origin);
+            scope.querySelectorAll(".fig-chip").forEach(function (c) {
                 c.classList.toggle("hot", !!num && c.getAttribute("data-fig") === num);
             });
-            document.querySelectorAll(".src").forEach(function (s) {
+            scope.querySelectorAll(".src").forEach(function (s) {
                 s.classList.toggle("hot", !!num && s.getAttribute("data-fig") === num);
             });
         }
@@ -5407,8 +5905,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                 // wired by linkifyFigures, which runs next - skip them here so
                 // their click handler isn't bound twice (which opens two tabs).
                 if (c.classList.contains("fig-chip")) return;
-                c.addEventListener("mouseenter", function () { setActiveSec(c.getAttribute("data-sec")); });
-                c.addEventListener("mouseleave", function () { setActiveSec(null); });
+                c.addEventListener("mouseenter", function () { setActiveSec(c.getAttribute("data-sec"), c); });
+                c.addEventListener("mouseleave", function () { setActiveSec(null, c); });
                 c.addEventListener("click", function () {
                     var sec = c.getAttribute("data-sec");
                     showCitePop(c, citeMap[sec]);
@@ -5896,8 +6394,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             });
 
             root.querySelectorAll(".fig-chip").forEach(function (c) {
-                c.addEventListener("mouseenter", function () { setActiveFig(c.getAttribute("data-fig")); });
-                c.addEventListener("mouseleave", function () { setActiveFig(null); });
+                c.addEventListener("mouseenter", function () { setActiveFig(c.getAttribute("data-fig"), c); });
+                c.addEventListener("mouseleave", function () { setActiveFig(null, c); });
                 c.addEventListener("click", function () {
                     showFigPop(c, figMap[c.getAttribute("data-fig")]);
                 });
@@ -5943,12 +6441,12 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             list.querySelectorAll(".src").forEach(function (el, i) {
                 var s = sources[i];
                 el.addEventListener("mouseenter", function () {
-                    if (s.kind === "fig") setActiveFig(el.getAttribute("data-fig"));
-                    else setActiveSec(el.getAttribute("data-sec"));
+                    if (s.kind === "fig") setActiveFig(el.getAttribute("data-fig"), el);
+                    else setActiveSec(el.getAttribute("data-sec"), el);
                 });
                 el.addEventListener("mouseleave", function () {
-                    if (s.kind === "fig") setActiveFig(null);
-                    else setActiveSec(null);
+                    if (s.kind === "fig") setActiveFig(null, el);
+                    else setActiveSec(null, el);
                 });
                 el.addEventListener("click", function () {
                     if (s.kind === "fig") openFigurePdf(s.f);
@@ -6002,6 +6500,28 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             el.innerHTML = parts.join("");
         }
 
+        /* ── conversation usage meter (top-left) ─────────────────────────── */
+        var _convoTok = 0, _convoCost = 0, _convoCostKnown = true;
+        function _renderUsageMeter() {
+            var m = document.getElementById("usage-meter");
+            if (!m) return;
+            if (!_convoTok) { m.hidden = true; return; }
+            m.hidden = false;
+            document.getElementById("usage-tok").textContent = _convoTok.toLocaleString();
+            document.getElementById("usage-cost").textContent =
+                (_convoCostKnown ? "$" : "~$") + _convoCost.toFixed(4);
+        }
+        function bumpUsageMeter(data) {
+            _convoTok += _tokensTotal(data.tokens_used);
+            var cost = _totalCostFromTokens(data.tokens_used);
+            if (cost === null) _convoCostKnown = false; else _convoCost += cost;
+            _renderUsageMeter();
+        }
+        function resetUsageMeter() {
+            _convoTok = 0; _convoCost = 0; _convoCostKnown = true;
+            _renderUsageMeter();
+        }
+
         /* ── displayResults override (two-column layout) ─────────────────── */
         window.displayResults = function (data) {
             var empty = document.getElementById("empty-state");
@@ -6050,6 +6570,8 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             renderModelCost(data.tokens_used, isAgentic);
             renderPipeSummary(data);
             renderSidebar(data);
+
+            bumpUsageMeter(data);
 
             // Snapshot for the flag button (POSTed verbatim on flag, no re-run).
             window._lastResponse = data;
@@ -6475,6 +6997,7 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             });
             document.getElementById("dev-pane-flags").hidden = (tab !== "flags");
             document.getElementById("dev-pane-notes").hidden = (tab !== "notes");
+            document.getElementById("dev-pane-batch").hidden = (tab !== "batch");
             if (tab === "flags") showFlagList();
         }
         (function () {
@@ -6500,6 +7023,155 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
             if (noteInput) noteInput.addEventListener("keydown", function (e) {
                 if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); addDevNote(); }
             });
+        })();
+
+        /* Batch mode (dev panel): run a JSON file of questions through the
+           pipeline sequentially on the Thorough preset, then download the
+           question/answer pairs as JSON. */
+        (function () {
+            var fileInput = document.getElementById("batch-file");
+            var runBtn = document.getElementById("batch-run");
+            var cancelBtn = document.getElementById("batch-cancel");
+            var dlBtn = document.getElementById("batch-download");
+            var progWrap = document.getElementById("batch-progress");
+            var barFill = document.getElementById("batch-bar-fill");
+            var pctEl = document.getElementById("batch-pct");
+            var logEl = document.getElementById("batch-log");
+            if (!fileInput || !runBtn) return;
+
+            var questions = null;
+            var results = null;
+            var running = false;
+            var cancelled = false;
+
+            function logLine(text, cls) {
+                var div = document.createElement("div");
+                div.className = "batch-log-line" + (cls ? " " + cls : "");
+                div.textContent = text;
+                logEl.appendChild(div);
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            function setProgress(done, total) {
+                var pct = total ? Math.round(done / total * 100) : 0;
+                barFill.style.width = pct + "%";
+                pctEl.textContent = pct + "% (" + done + "/" + total + ")";
+            }
+
+            fileInput.addEventListener("change", function () {
+                questions = null;
+                runBtn.disabled = true;
+                dlBtn.hidden = true;
+                logEl.innerHTML = "";
+                var f = fileInput.files && fileInput.files[0];
+                if (!f) return;
+                f.text().then(function (txt) {
+                    var data = JSON.parse(txt);
+                    if (!Array.isArray(data)) throw new Error("top level must be an array");
+                    var qs = data.map(function (row, i) {
+                        if (!row || typeof row.question !== "string" || !row.question.trim())
+                            throw new Error("item " + i + " is missing a \\"question\\" string");
+                        return row.question.trim();
+                    });
+                    if (!qs.length) throw new Error("no questions in file");
+                    questions = qs;
+                    runBtn.disabled = false;
+                    logLine("Loaded " + qs.length + " question" + (qs.length === 1 ? "" : "s") + " from " + f.name + ".");
+                }).catch(function (err) {
+                    logLine("Invalid file: " + err.message, "err");
+                });
+            });
+
+            async function fetchThoroughConfig() {
+                try {
+                    var res = await fetch("/api/presets");
+                    if (res.ok) {
+                        var data = await res.json();
+                        if (data.presets && data.presets.thorough) return data.presets.thorough.config;
+                    }
+                } catch (e) { /* fall back to current config inputs */ }
+                return null;
+            }
+
+            /* POST one question; on 429 honor Retry-After and retry. The
+               query endpoint allows 10/min; thorough runs are slow enough
+               that this rarely triggers. */
+            async function askOne(query, config) {
+                for (;;) {
+                    if (cancelled) throw new Error("cancelled");
+                    var res = await fetch("/api/query", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ query: query, config: config, debug: false, agentic: true }),
+                    });
+                    if (res.status === 429) {
+                        var wait = parseInt(res.headers.get("Retry-After") || "10", 10) || 10;
+                        logLine("Rate limited, retrying in " + wait + "s...");
+                        await new Promise(function (r) { setTimeout(r, wait * 1000); });
+                        continue;
+                    }
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    return res.json();
+                }
+            }
+
+            async function runBatch() {
+                if (running || !questions) return;
+                running = true;
+                cancelled = false;
+                results = [];
+                runBtn.disabled = true;
+                fileInput.disabled = true;
+                cancelBtn.hidden = false;
+                dlBtn.hidden = true;
+                logEl.innerHTML = "";
+                progWrap.hidden = false;
+                setProgress(0, questions.length);
+
+                var thorough = await fetchThoroughConfig();
+                var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
+                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ")...");
+
+                for (var i = 0; i < questions.length; i++) {
+                    if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
+                    var q = questions[i];
+                    var t0 = Date.now();
+                    try {
+                        var data = await askOne(q, config);
+                        results.push({ question: q, answer: data.answer });
+                        var secs = Math.round((Date.now() - t0) / 1000);
+                        logLine("[" + (i + 1) + "/" + questions.length + "] OK (" + secs + "s): " + q, "ok");
+                    } catch (err) {
+                        if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
+                        results.push({ question: q, answer: null, error: err.message });
+                        logLine("[" + (i + 1) + "/" + questions.length + "] FAILED (" + err.message + "): " + q, "err");
+                    }
+                    setProgress(i + 1, questions.length);
+                }
+
+                running = false;
+                fileInput.disabled = false;
+                runBtn.disabled = false;
+                cancelBtn.hidden = true;
+                if (results.length) {
+                    dlBtn.hidden = false;
+                    var failed = results.filter(function (r) { return r.error; }).length;
+                    logLine("Done: " + (results.length - failed) + " answered, " + failed + " failed. Download is ready.");
+                }
+            }
+
+            function downloadResults() {
+                if (!results || !results.length) return;
+                var blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
+                var a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = "batch_answers.json";
+                a.click();
+                URL.revokeObjectURL(a.href);
+            }
+
+            runBtn.addEventListener("click", runBatch);
+            cancelBtn.addEventListener("click", function () { cancelled = true; cancelBtn.hidden = true; });
+            dlBtn.addEventListener("click", downloadResults);
         })();
 
         /* ── renderSidebar override (gap-hint card) ──────────────────────── */
@@ -6622,64 +7294,6 @@ select.locked-agentic { opacity:.55; cursor:not-allowed; }
                     try { renderPipelineViz(window._pipeTrace, window._pipeQuery); } catch (err) {}
                 }
             });
-        })();
-
-        /* ── agentic pill toggle ─────────────────────────────────────────── */
-        (function () {
-            var pill = document.getElementById("agentic-pill");
-            var lbl = document.getElementById("agentic-pill-label");
-            function sync() {
-                var on = agenticToggle.checked;
-                if (pill) pill.classList.toggle("on", on);
-                if (lbl) lbl.textContent = on ? "Agentic on" : "Agentic";
-            }
-            if (pill) pill.addEventListener("click", function () {
-                agenticToggle.checked = !agenticToggle.checked;
-                agenticToggle.dispatchEvent(new Event("change"));
-            });
-            agenticToggle.addEventListener("change", sync);
-            sync();
-        })();
-
-        /* ── agentic locks the model picker to the strongest model ─────────────
-           Agentic mode always runs on the strong (agentic) model — the backend
-           forces it server-side — so the regular model picker is disabled while
-           agentic is on and shows the strong model. The previous pick is stashed
-           and restored when agentic is turned back off. No change events are
-           dispatched, so the advanced agentic-model select is never clobbered. */
-        (function _wireAgenticModelLock() {
-            function strongModelId() {
-                var ag = document.getElementById("config-agentic_model");
-                return ag && ag.value ? ag.value : null;
-            }
-            function apply() {
-                var on = agenticToggle.checked;
-                var strong = strongModelId();
-                ["config-llm_model"].forEach(function (id) {
-                    var el = document.getElementById(id);
-                    if (!el) return;
-                    if (on) {
-                        if (el.dataset.prevModel === undefined) el.dataset.prevModel = el.value;
-                        if (strong) el.value = strong;
-                        el.disabled = true;
-                        el.classList.add("locked-agentic");
-                        el.title = "Agentic mode always uses the strongest model";
-                    } else {
-                        el.disabled = false;
-                        el.classList.remove("locked-agentic");
-                        el.title = "";
-                        if (el.dataset.prevModel !== undefined) {
-                            el.value = el.dataset.prevModel;
-                            delete el.dataset.prevModel;
-                        }
-                    }
-                });
-                if (typeof renderCostEstimate === "function") {
-                    try { renderCostEstimate(); } catch (e) {}
-                }
-            }
-            agenticToggle.addEventListener("change", apply);
-            apply();  // set initial state (handles presets that default agentic on)
         })();
 
         /* ── close popovers on outside click ─────────────────────────────── */
