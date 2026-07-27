@@ -2403,6 +2403,27 @@ a { color: var(--accent); text-decoration: none; }
 .batch-log-line { padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-xs); background:var(--surface); color:var(--t-muted); word-break:break-word; }
 .batch-log-line.ok { border-color:color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .batch-log-line.err { color:var(--danger); border-color:color-mix(in srgb, var(--danger) 40%, var(--border)); }
+/* batch results: a scrollable running list of completed answers */
+.batch-results { margin-top:14px; display:flex; flex-direction:column; gap:10px;
+  max-height:min(52vh, 620px); overflow-y:auto; padding-right:4px; scroll-behavior:smooth; }
+.batch-results:empty { display:none; }
+.batch-item { border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden;
+  flex:0 0 auto; }  /* keep natural height so the container scrolls instead of shrinking cards */
+.batch-item.err { border-color:color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.batch-item-head { display:flex; align-items:baseline; gap:8px; padding:9px 12px; background:var(--surface-2);
+  border-bottom:1px solid var(--border); }
+.batch-item-idx { font-family:var(--mono); font-size:11px; color:var(--t-faint); flex:none; }
+.batch-item-q { font-size:12.5px; font-weight:600; color:var(--ink); word-break:break-word; flex:1; }
+.batch-item-time { font-family:var(--mono); font-size:10.5px; color:var(--t-faint); flex:none; }
+.batch-item-badge { font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.04em;
+  padding:1px 6px; border-radius:99px; flex:none; }
+.batch-item-badge.ok { color:var(--accent); background:var(--accent-soft); }
+.batch-item-badge.err { color:var(--danger); background:var(--danger-soft, color-mix(in srgb, var(--danger) 12%, transparent)); }
+.batch-item-a { padding:4px 16px 14px; font-size:13px; line-height:1.62; color:var(--t-strong); word-break:break-word; }
+.batch-item-a.pending { color:var(--t-faint); font-style:italic; padding:12px 16px; }
+.batch-item-a.err-text { color:var(--danger); font-family:var(--mono); font-size:11.5px; }
+.batch-item-a p:first-child { margin-top:8px; }
+.batch-item-a p:last-child { margin-bottom:0; }
 /* dev flow chart (reconstructed from stored pipeline_trace) */
 .dev-flow-host { position:relative; margin-top:8px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:12px; overflow:auto; }
 .dev-flow-host:empty { display:none; }
@@ -2833,12 +2854,13 @@ a { color: var(--accent); text-decoration: none; }
                         <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
                         <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
                     </div>
-                    <p class="batch-hint">Upload a JSON array of objects with a "question" field. Each question runs through the pipeline on the Thorough preset, one at a time. Results download as question/answer JSON.</p>
+                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset, one at a time. Answers appear in the scrollable list below as they finish, and can be downloaded as question/answer JSON.</p>
                     <div class="batch-progress" id="batch-progress" hidden>
                         <div class="batch-bar"><div class="batch-bar-fill" id="batch-bar-fill"></div></div>
                         <span class="dev-count" id="batch-pct">0%</span>
                     </div>
                     <div id="batch-log" class="batch-log"></div>
+                    <div id="batch-results" class="batch-results"></div>
                 </div>
             </div>
         </div>
@@ -7038,6 +7060,7 @@ a { color: var(--accent); text-decoration: none; }
             var barFill = document.getElementById("batch-bar-fill");
             var pctEl = document.getElementById("batch-pct");
             var logEl = document.getElementById("batch-log");
+            var resultsEl = document.getElementById("batch-results");
             var modelSelect = document.getElementById("batch-model-select");
             if (!fileInput || !runBtn) return;
             if (modelSelect) populateModelSelect(modelSelect, "agentic");
@@ -7060,22 +7083,110 @@ a { color: var(--accent); text-decoration: none; }
                 pctEl.textContent = pct + "% (" + done + "/" + total + ")";
             }
 
+            /* Tolerant question extractor: accept ANY JSON that contains dicts
+               with a "question" key. Handles a top-level array of objects, a
+               wrapper object like {"questions": [...]} or {"data": [...]}, a
+               single object, and a bare array of strings. Walks the structure
+               and collects every dict with a non-empty string "question",
+               plus any bare strings sitting directly in an array. */
+            function extractQuestions(data) {
+                var out = [];
+                function visit(node) {
+                    if (node == null) return;
+                    if (Array.isArray(node)) {
+                        node.forEach(function (el) {
+                            if (typeof el === "string") {
+                                if (el.trim()) out.push(el.trim());
+                            } else {
+                                visit(el);
+                            }
+                        });
+                        return;
+                    }
+                    if (typeof node === "object") {
+                        if (typeof node.question === "string" && node.question.trim()) {
+                            out.push(node.question.trim());
+                            return;   // a matched question dict is a leaf; don't descend
+                        }
+                        Object.keys(node).forEach(function (k) { visit(node[k]); });
+                    }
+                }
+                visit(data);
+                return out;
+            }
+
+            /* Append a live card to the scrollable running list and return
+               handles to fill it in once the answer (or error) arrives. */
+            function startResultCard(index, total, question) {
+                var card = document.createElement("div");
+                card.className = "batch-item";
+                var head = document.createElement("div");
+                head.className = "batch-item-head";
+                var idx = document.createElement("span");
+                idx.className = "batch-item-idx";
+                idx.textContent = index + "/" + total;
+                var q = document.createElement("span");
+                q.className = "batch-item-q";
+                q.textContent = question;
+                var time = document.createElement("span");
+                time.className = "batch-item-time";
+                var badge = document.createElement("span");
+                badge.className = "batch-item-badge";
+                badge.textContent = "running";
+                head.appendChild(idx);
+                head.appendChild(q);
+                head.appendChild(time);
+                head.appendChild(badge);
+                var body = document.createElement("div");
+                body.className = "batch-item-a pending";
+                body.textContent = "Running\\u2026";
+                card.appendChild(head);
+                card.appendChild(body);
+                // Follow the newest card only if the user is already near the
+                // bottom, so scrolling up to read earlier answers isn't yanked.
+                var nearBottom = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 60;
+                resultsEl.appendChild(card);
+                if (nearBottom) resultsEl.scrollTop = resultsEl.scrollHeight;
+                function follow() {
+                    var nb = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 120;
+                    if (nb) resultsEl.scrollTop = resultsEl.scrollHeight;
+                }
+                return {
+                    ok: function (answer, secs) {
+                        badge.className = "batch-item-badge ok";
+                        badge.textContent = "done";
+                        time.textContent = secs + "s";
+                        body.className = "batch-item-a";
+                        var html = (typeof renderMarkdown === "function") ? renderMarkdown(answer || "") : "";
+                        if (html) { body.innerHTML = html; }
+                        else { body.textContent = (answer && answer.trim()) ? answer : "(empty answer)"; }
+                        follow();
+                    },
+                    fail: function (msg) {
+                        card.classList.add("err");
+                        badge.className = "batch-item-badge err";
+                        badge.textContent = "error";
+                        body.className = "batch-item-a err-text";
+                        body.textContent = msg;
+                        follow();
+                    }
+                };
+            }
+
             fileInput.addEventListener("change", function () {
                 questions = null;
                 runBtn.disabled = true;
                 dlBtn.hidden = true;
                 logEl.innerHTML = "";
+                if (resultsEl) resultsEl.innerHTML = "";
                 var f = fileInput.files && fileInput.files[0];
                 if (!f) return;
                 f.text().then(function (txt) {
-                    var data = JSON.parse(txt);
-                    if (!Array.isArray(data)) throw new Error("top level must be an array");
-                    var qs = data.map(function (row, i) {
-                        if (!row || typeof row.question !== "string" || !row.question.trim())
-                            throw new Error("item " + i + " is missing a \\"question\\" string");
-                        return row.question.trim();
-                    });
-                    if (!qs.length) throw new Error("no questions in file");
+                    var data;
+                    try { data = JSON.parse(txt); }
+                    catch (e) { throw new Error("not valid JSON (" + e.message + ")"); }
+                    var qs = extractQuestions(data);
+                    if (!qs.length) throw new Error('no objects with a "question" field found');
                     questions = qs;
                     runBtn.disabled = false;
                     logLine("Loaded " + qs.length + " question" + (qs.length === 1 ? "" : "s") + " from " + f.name + ".");
@@ -7127,6 +7238,7 @@ a { color: var(--accent); text-decoration: none; }
                 cancelBtn.hidden = false;
                 dlBtn.hidden = true;
                 logEl.innerHTML = "";
+                if (resultsEl) resultsEl.innerHTML = "";
                 progWrap.hidden = false;
                 setProgress(0, questions.length);
 
@@ -7140,14 +7252,17 @@ a { color: var(--accent); text-decoration: none; }
                     if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
                     var q = questions[i];
                     var t0 = Date.now();
+                    var card = startResultCard(i + 1, questions.length, q);
                     try {
                         var data = await askOne(q, config);
-                        results.push({ question: q, answer: data.answer });
                         var secs = Math.round((Date.now() - t0) / 1000);
+                        results.push({ question: q, answer: data.answer });
+                        card.ok(data.answer, secs);
                         logLine("[" + (i + 1) + "/" + questions.length + "] OK (" + secs + "s): " + q, "ok");
                     } catch (err) {
-                        if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
+                        if (cancelled) { card.fail("cancelled"); logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
                         results.push({ question: q, answer: null, error: err.message });
+                        card.fail(err.message);
                         logLine("[" + (i + 1) + "/" + questions.length + "] FAILED (" + err.message + "): " + q, "err");
                     }
                     setProgress(i + 1, questions.length);
