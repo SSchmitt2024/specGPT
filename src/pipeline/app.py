@@ -255,6 +255,22 @@ class RefineRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=64)
 
 
+class FinetuneRecordRequest(BaseModel):
+    """Request body for POST /api/finetune-record (batch-mode dataset export).
+
+    Turns one answered query into a ShareGPT training record, reusing the exact
+    same oracle-resolution / context-assembly logic as scripts.build_raft_dataset
+    so batch exports match the offline dataset byte-for-byte. `fmt="sft"` grounds
+    the record on just the cited (oracle) sections; `fmt="raft"` shuffles in
+    random same-spec distractor chunks.
+    """
+    query: str = Field(max_length=4000)
+    answer: str
+    citations: list[dict] = []
+    spec: str = "base"
+    fmt: str = Field(default="sft", pattern="^(sft|raft)$")
+
+
 # ============================================================================
 # Refine cache - in-process LRU mapping request_id → first-pass state.
 #
@@ -1013,6 +1029,75 @@ async def query_endpoint(
 def _dump_model(model: BaseModel) -> dict:
     """Serialize a pydantic model to a plain dict across pydantic v1/v2."""
     return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+@lru_cache(maxsize=1)
+def _finetune_pools():
+    """Lazily load + cache the corpus pools build_raft_dataset needs to resolve
+    oracle sections and sample distractors. First batch record pays the load;
+    the rest are instant (process-lifetime cache)."""
+    from scripts.build_raft_dataset import _load_pools
+    return _load_pools()
+
+
+@app.post("/api/finetune-record")
+async def finetune_record_endpoint(
+    req: FinetuneRecordRequest,
+    _: bool = Depends(require_auth),
+) -> dict:
+    """Build one ShareGPT fine-tuning record (system+context / question / answer)
+    from an answered query. Reuses scripts.build_raft_dataset so batch exports are
+    identical to the offline dataset. fmt=sft: oracle-only context; fmt=raft: adds
+    shuffled same-spec distractors."""
+    import random as _random
+
+    from scripts.build_raft_dataset import (
+        DISTRACTOR_RANGE,
+        MAX_CONTEXT_TOKENS,
+        _resolve_oracle,
+        _sample_distractors,
+    )
+    from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, assemble_context
+
+    by_section, by_spec, fields_by_section, enums_by_section = await asyncio.to_thread(
+        _finetune_pools
+    )
+
+    oracle_chunks: list[dict] = []
+    oracle_sections: set[str] = set()
+    specs_used: set[str] = set()
+    for c in req.citations:
+        if c.get("hallucinated"):
+            continue
+        resolved = _resolve_oracle(c, req.spec, by_section, fields_by_section, enums_by_section)
+        if resolved and resolved["section_id"] not in oracle_sections:
+            oracle_chunks.append(resolved)
+            oracle_sections.add(resolved["section_id"])
+            specs_used.add(resolved["spec"])
+
+    if not oracle_chunks:
+        raise HTTPException(
+            status_code=422,
+            detail="no citation resolved to a corpus section; nothing to ground a record on",
+        )
+
+    combined = list(oracle_chunks)
+    if req.fmt == "raft":
+        n_distractors = _random.randint(*DISTRACTOR_RANGE)
+        combined += _sample_distractors(by_spec, specs_used, oracle_sections, n_distractors)
+        _random.shuffle(combined)
+
+    context_text, _used = assemble_context(
+        req.query, combined, max_context_tokens=MAX_CONTEXT_TOKENS, figure_reserve_tokens=0
+    )
+    system = DEFAULT_SYSTEM_PROMPT.format(context=context_text)
+    return {
+        "conversations": [
+            {"from": "system", "value": system},
+            {"from": "human", "value": req.query},
+            {"from": "gpt", "value": req.answer},
+        ]
+    }
 
 
 @app.post("/api/query/stream")
@@ -2850,11 +2935,16 @@ a { color: var(--accent); text-decoration: none; }
                     <div class="dev-toolbar">
                         <input type="file" id="batch-file" accept=".json,application/json">
                         <select id="batch-model-select"></select>
+                        <select id="batch-format-select" title="Download format">
+                            <option value="">Answers only</option>
+                            <option value="sft">SFT</option>
+                            <option value="raft">SFT RAFT</option>
+                        </select>
                         <button class="dev-btn dev-btn-primary" id="batch-run" type="button" disabled>Run batch</button>
                         <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
                         <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
                     </div>
-                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset, one at a time. Answers appear in the scrollable list below as they finish, and can be downloaded as question/answer JSON.</p>
+                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset, one at a time. Answers appear in the scrollable list below as they finish. <b>Answers only</b> downloads question/answer JSON; <b>SFT</b> / <b>SFT RAFT</b> download a ShareGPT <code>.jsonl</code> where each record carries the injected context (SFT: cited sections only; RAFT: plus shuffled distractors).</p>
                     <div class="batch-progress" id="batch-progress" hidden>
                         <div class="batch-bar"><div class="batch-bar-fill" id="batch-bar-fill"></div></div>
                         <span class="dev-count" id="batch-pct">0%</span>
@@ -7062,6 +7152,7 @@ a { color: var(--accent); text-decoration: none; }
             var logEl = document.getElementById("batch-log");
             var resultsEl = document.getElementById("batch-results");
             var modelSelect = document.getElementById("batch-model-select");
+            var formatSelect = document.getElementById("batch-format-select");
             if (!fileInput || !runBtn) return;
             if (modelSelect) populateModelSelect(modelSelect, "agentic");
 
@@ -7228,6 +7319,22 @@ a { color: var(--accent); text-decoration: none; }
                 }
             }
 
+            /* Turn one answered query into a ShareGPT training record (system
+               prompt with injected context / question / answer). fmt is "sft"
+               or "raft"; the backend reuses the offline dataset builder. */
+            async function fetchRecord(data, fmt, spec) {
+                var res = await fetch("/api/finetune-record", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        query: data.query, answer: data.answer,
+                        citations: data.citations || [], spec: spec, fmt: fmt,
+                    }),
+                });
+                if (!res.ok) throw new Error("record HTTP " + res.status);
+                return res.json();
+            }
+
             async function runBatch() {
                 if (running || !questions) return;
                 running = true;
@@ -7244,9 +7351,10 @@ a { color: var(--accent); text-decoration: none; }
 
                 var thorough = await fetchThoroughConfig();
                 var model = modelSelect && modelSelect.value;
+                var fmt = formatSelect ? formatSelect.value : "";
                 var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
                 if (model) { config.llm_model = model; config.agentic_model = model; }
-                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ", model: " + (model || config.llm_model) + ")...");
+                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ", model: " + (model || config.llm_model) + ", format: " + (fmt || "answers only") + ")...");
 
                 for (var i = 0; i < questions.length; i++) {
                     if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
@@ -7256,7 +7364,12 @@ a { color: var(--accent); text-decoration: none; }
                     try {
                         var data = await askOne(q, config);
                         var secs = Math.round((Date.now() - t0) / 1000);
-                        results.push({ question: q, answer: data.answer });
+                        var row = { question: q, answer: data.answer };
+                        if (fmt) {
+                            try { row.record = await fetchRecord(data, fmt, config.spec); }
+                            catch (re) { row.record = null; row.record_error = re.message; logLine("[" + (i + 1) + "/" + questions.length + "] record failed: " + re.message, "err"); }
+                        }
+                        results.push(row);
                         card.ok(data.answer, secs);
                         logLine("[" + (i + 1) + "/" + questions.length + "] OK (" + secs + "s): " + q, "ok");
                     } catch (err) {
@@ -7281,10 +7394,22 @@ a { color: var(--accent); text-decoration: none; }
 
             function downloadResults() {
                 if (!results || !results.length) return;
-                var blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
+                var fmt = formatSelect ? formatSelect.value : "";
+                var blob, name;
+                if (fmt) {
+                    // ShareGPT .jsonl (one record per line), ready for Unsloth.
+                    var lines = results
+                        .filter(function (r) { return r.record; })
+                        .map(function (r) { return JSON.stringify(r.record); });
+                    blob = new Blob([lines.join("\\n") + "\\n"], { type: "application/jsonl" });
+                    name = "batch_" + fmt + ".jsonl";
+                } else {
+                    blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
+                    name = "batch_answers.json";
+                }
                 var a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
-                a.download = "batch_answers.json";
+                a.download = name;
                 a.click();
                 URL.revokeObjectURL(a.href);
             }

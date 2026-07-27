@@ -8,17 +8,12 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 WORKDIR /app
 
 # Install dependencies first (layer-cached until requirements.txt changes).
-#
-# The BuildKit cache mount persists pip's downloaded wheels at /root/.cache/pip
-# across builds. When requirements.txt changes (or the layer cache is otherwise
-# invalidated) pip reuses those cached wheels instead of re-downloading the
-# whole dependency tree from PyPI -- the difference between a several-minute and
-# a ~15-second rebuild. The cache lives in the mount, not in an image layer, so
-# the final image stays slim (this is why we do NOT pass --no-cache-dir, which
-# would defeat the mount). Runs as root, before the USER switch below.
+# Plain pip install so the build works on the legacy Docker builder too, not
+# just BuildKit. Runs as root, before the USER switch below.
+# ponytail: dropped the BuildKit --mount=type=cache; re-add it (with
+# DOCKER_BUILDKIT=1) only if slow rebuilds actually become a problem.
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source
 COPY src/ ./src/
