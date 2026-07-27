@@ -2484,12 +2484,17 @@ a { color: var(--accent); text-decoration: none; }
 .batch-progress { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
 .batch-bar { flex:1; height:8px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
 .batch-bar-fill { height:100%; width:0%; background:var(--accent); border-radius:99px; transition:width .25s ease; }
-.batch-log { display:flex; flex-direction:column; gap:4px; font-family:var(--mono); font-size:11.5px; }
-.batch-log-line { padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-xs); background:var(--surface); color:var(--t-muted); word-break:break-word; }
-.batch-log-line.ok { border-color:color-mix(in srgb, var(--accent) 35%, var(--border)); }
-.batch-log-line.err { color:var(--danger); border-color:color-mix(in srgb, var(--danger) 40%, var(--border)); }
+/* batch status: one live line — spinner + what's happening right now */
+.batch-status { display:flex; align-items:center; gap:10px; margin-bottom:12px; min-height:20px; }
+.batch-status .loading-spinner { width:15px; height:15px; }
+.batch-status-text { font-size:12.5px; color:var(--t-muted); word-break:break-word; }
+.batch-status-text.err { color:var(--danger); }
+/* batch outputs: collapsed by default so answers don't flood the panel */
+.batch-out { margin-top:4px; }
+.batch-out-sum { cursor:pointer; font-size:12.5px; font-weight:600; color:var(--ink); padding:8px 0; user-select:none; }
+.batch-out-sum:hover { color:var(--accent-ink); }
 /* batch results: a scrollable running list of completed answers */
-.batch-results { margin-top:14px; display:flex; flex-direction:column; gap:10px;
+.batch-results { margin-top:10px; display:flex; flex-direction:column; gap:10px;
   max-height:min(52vh, 620px); overflow-y:auto; padding-right:4px; scroll-behavior:smooth; }
 .batch-results:empty { display:none; }
 .batch-item { border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden;
@@ -2949,8 +2954,14 @@ a { color: var(--accent); text-decoration: none; }
                         <div class="batch-bar"><div class="batch-bar-fill" id="batch-bar-fill"></div></div>
                         <span class="dev-count" id="batch-pct">0%</span>
                     </div>
-                    <div id="batch-log" class="batch-log"></div>
-                    <div id="batch-results" class="batch-results"></div>
+                    <div class="batch-status" id="batch-status" hidden>
+                        <div class="loading-spinner" id="batch-spinner" aria-hidden="true"></div>
+                        <span class="batch-status-text" id="batch-status-text"></span>
+                    </div>
+                    <details class="batch-out" id="batch-out" hidden>
+                        <summary class="batch-out-sum" id="batch-out-sum">Outputs</summary>
+                        <div id="batch-results" class="batch-results"></div>
+                    </details>
                 </div>
             </div>
         </div>
@@ -7149,7 +7160,11 @@ a { color: var(--accent); text-decoration: none; }
             var progWrap = document.getElementById("batch-progress");
             var barFill = document.getElementById("batch-bar-fill");
             var pctEl = document.getElementById("batch-pct");
-            var logEl = document.getElementById("batch-log");
+            var statusWrap = document.getElementById("batch-status");
+            var spinnerEl = document.getElementById("batch-spinner");
+            var statusText = document.getElementById("batch-status-text");
+            var outWrap = document.getElementById("batch-out");
+            var outSum = document.getElementById("batch-out-sum");
             var resultsEl = document.getElementById("batch-results");
             var modelSelect = document.getElementById("batch-model-select");
             var formatSelect = document.getElementById("batch-format-select");
@@ -7161,12 +7176,13 @@ a { color: var(--accent); text-decoration: none; }
             var running = false;
             var cancelled = false;
 
-            function logLine(text, cls) {
-                var div = document.createElement("div");
-                div.className = "batch-log-line" + (cls ? " " + cls : "");
-                div.textContent = text;
-                logEl.appendChild(div);
-                logEl.scrollTop = logEl.scrollHeight;
+            // One live status line: spinner on while working, off when idle/done.
+            function setStatus(text, opts) {
+                opts = opts || {};
+                statusWrap.hidden = false;
+                spinnerEl.style.display = opts.spin ? "" : "none";
+                statusText.textContent = text;
+                statusText.className = "batch-status-text" + (opts.err ? " err" : "");
             }
             function setProgress(done, total) {
                 var pct = total ? Math.round(done / total * 100) : 0;
@@ -7237,6 +7253,8 @@ a { color: var(--accent); text-decoration: none; }
                 // bottom, so scrolling up to read earlier answers isn't yanked.
                 var nearBottom = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 60;
                 resultsEl.appendChild(card);
+                outWrap.hidden = false;
+                outSum.textContent = "Outputs (" + resultsEl.children.length + ")";
                 if (nearBottom) resultsEl.scrollTop = resultsEl.scrollHeight;
                 function follow() {
                     var nb = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 120;
@@ -7268,8 +7286,8 @@ a { color: var(--accent); text-decoration: none; }
                 questions = null;
                 runBtn.disabled = true;
                 dlBtn.hidden = true;
-                logEl.innerHTML = "";
                 if (resultsEl) resultsEl.innerHTML = "";
+                outWrap.hidden = true;
                 var f = fileInput.files && fileInput.files[0];
                 if (!f) return;
                 f.text().then(function (txt) {
@@ -7280,9 +7298,9 @@ a { color: var(--accent); text-decoration: none; }
                     if (!qs.length) throw new Error('no objects with a "question" field found');
                     questions = qs;
                     runBtn.disabled = false;
-                    logLine("Loaded " + qs.length + " question" + (qs.length === 1 ? "" : "s") + " from " + f.name + ".");
+                    setStatus("Loaded " + qs.length + " question" + (qs.length === 1 ? "" : "s") + " from " + f.name + ".");
                 }).catch(function (err) {
-                    logLine("Invalid file: " + err.message, "err");
+                    setStatus("Invalid file: " + err.message, { err: true });
                 });
             });
 
@@ -7297,25 +7315,34 @@ a { color: var(--accent); text-decoration: none; }
                 return null;
             }
 
-            /* POST one question; on 429 honor Retry-After and retry. The
-               query endpoint allows 10/min; thorough runs are slow enough
-               that this rarely triggers. */
-            async function askOne(query, config) {
+            /* POST one question, retrying transient failures. 429 = our own
+               10/min limiter (honor Retry-After). 5xx = usually an upstream LLM
+               rate-limit/overload surfacing as a 500 — back off and retry rather
+               than failing the question. Network blips retry too. Non-transient
+               4xx fail immediately. onRetry(msg) reports the wait to the caller. */
+            async function askOne(query, config, onRetry) {
+                var attempt = 0;
                 for (;;) {
                     if (cancelled) throw new Error("cancelled");
-                    var res = await fetch("/api/query", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ query: query, config: config, debug: false, agentic: true }),
-                    });
-                    if (res.status === 429) {
-                        var wait = parseInt(res.headers.get("Retry-After") || "10", 10) || 10;
-                        logLine("Rate limited, retrying in " + wait + "s...");
-                        await new Promise(function (r) { setTimeout(r, wait * 1000); });
-                        continue;
-                    }
-                    if (!res.ok) throw new Error("HTTP " + res.status);
-                    return res.json();
+                    var res = null, netErr = null;
+                    try {
+                        res = await fetch("/api/query", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ query: query, config: config, debug: false, agentic: true }),
+                        });
+                    } catch (e) { netErr = e; }
+                    if (res && res.ok) return res.json();
+                    var status = res ? res.status : 0;
+                    var transient = netErr || status === 429 || status >= 500;
+                    if (!transient) throw new Error("HTTP " + status);
+                    attempt++;
+                    if (attempt > 6) throw new Error(res ? ("HTTP " + status + " (gave up after retries)") : "network error (gave up after retries)");
+                    var wait;
+                    if (status === 429) wait = parseInt(res.headers.get("Retry-After") || "10", 10) || 10;
+                    else wait = Math.min(Math.pow(2, attempt), 30);  // 2,4,8,16,30,30s
+                    if (onRetry) onRetry((netErr ? "Network error" : ("Server busy (HTTP " + status + ")")) + ", retry " + attempt + " in " + wait + "s");
+                    await new Promise(function (r) { setTimeout(r, wait * 1000); });
                 }
             }
 
@@ -7344,8 +7371,8 @@ a { color: var(--accent); text-decoration: none; }
                 fileInput.disabled = true;
                 cancelBtn.hidden = false;
                 dlBtn.hidden = true;
-                logEl.innerHTML = "";
                 if (resultsEl) resultsEl.innerHTML = "";
+                outWrap.hidden = true;
                 progWrap.hidden = false;
                 setProgress(0, questions.length);
 
@@ -7354,29 +7381,32 @@ a { color: var(--accent); text-decoration: none; }
                 var fmt = formatSelect ? formatSelect.value : "";
                 var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
                 if (model) { config.llm_model = model; config.agentic_model = model; }
-                logLine("Running " + questions.length + " question" + (questions.length === 1 ? "" : "s") + " on Thorough preset (spec: " + config.spec + ", model: " + (model || config.llm_model) + ", format: " + (fmt || "answers only") + ")...");
+
+                function short(s) { return s.length > 70 ? s.slice(0, 70) + "\\u2026" : s; }
 
                 for (var i = 0; i < questions.length; i++) {
-                    if (cancelled) { logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
+                    if (cancelled) { setStatus("Cancelled after " + i + " of " + questions.length + ".", { err: true }); break; }
                     var q = questions[i];
                     var t0 = Date.now();
                     var card = startResultCard(i + 1, questions.length, q);
+                    setStatus("Running " + (i + 1) + "/" + questions.length + " \\u00b7 " + short(q), { spin: true });
                     try {
-                        var data = await askOne(q, config);
+                        var onRetry = (function (n, total, question) {
+                            return function (msg) { setStatus(n + "/" + total + " \\u00b7 " + msg + " \\u00b7 " + short(question), { spin: true }); };
+                        })(i + 1, questions.length, q);
+                        var data = await askOne(q, config, onRetry);
                         var secs = Math.round((Date.now() - t0) / 1000);
                         var row = { question: q, answer: data.answer };
                         if (fmt) {
                             try { row.record = await fetchRecord(data, fmt, config.spec); }
-                            catch (re) { row.record = null; row.record_error = re.message; logLine("[" + (i + 1) + "/" + questions.length + "] record failed: " + re.message, "err"); }
+                            catch (re) { row.record = null; row.record_error = re.message; }
                         }
                         results.push(row);
                         card.ok(data.answer, secs);
-                        logLine("[" + (i + 1) + "/" + questions.length + "] OK (" + secs + "s): " + q, "ok");
                     } catch (err) {
-                        if (cancelled) { card.fail("cancelled"); logLine("Cancelled after " + i + " of " + questions.length + ".", "err"); break; }
+                        if (cancelled) { card.fail("cancelled"); setStatus("Cancelled after " + i + " of " + questions.length + ".", { err: true }); break; }
                         results.push({ question: q, answer: null, error: err.message });
                         card.fail(err.message);
-                        logLine("[" + (i + 1) + "/" + questions.length + "] FAILED (" + err.message + "): " + q, "err");
                     }
                     setProgress(i + 1, questions.length);
                 }
@@ -7385,10 +7415,12 @@ a { color: var(--accent); text-decoration: none; }
                 fileInput.disabled = false;
                 runBtn.disabled = false;
                 cancelBtn.hidden = true;
-                if (results.length) {
+                if (results.length && !cancelled) {
                     dlBtn.hidden = false;
                     var failed = results.filter(function (r) { return r.error; }).length;
-                    logLine("Done: " + (results.length - failed) + " answered, " + failed + " failed. Download is ready.");
+                    setStatus("Done: " + (results.length - failed) + " answered, " + failed + " failed. Download ready.");
+                } else if (results.length) {
+                    dlBtn.hidden = false;
                 }
             }
 
