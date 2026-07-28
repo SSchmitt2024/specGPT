@@ -7310,7 +7310,7 @@ a { color: var(--accent); text-decoration: none; }
                     if (nb) resultsEl.scrollTop = resultsEl.scrollHeight;
                 }
                 return {
-                    ok: function (answer, secs) {
+                    ok: function (answer, secs, recordErr) {
                         badge.className = "batch-item-badge ok";
                         badge.textContent = "done";
                         time.textContent = secs + "s";
@@ -7318,6 +7318,13 @@ a { color: var(--accent); text-decoration: none; }
                         var html = (typeof renderMarkdown === "function") ? renderMarkdown(answer || "") : "";
                         if (html) { body.innerHTML = html; }
                         else { body.textContent = (answer && answer.trim()) ? answer : "(empty answer)"; }
+                        if (recordErr) {
+                            var warn = document.createElement("div");
+                            warn.className = "batch-item-a err-text";
+                            warn.style.paddingTop = "0";
+                            warn.textContent = "no training record: " + recordErr;
+                            card.appendChild(warn);
+                        }
                         follow();
                     },
                     fail: function (msg) {
@@ -7513,7 +7520,7 @@ a { color: var(--accent); text-decoration: none; }
                         try { row.record = await fetchRecord(data, fmt, config.spec); }
                         catch (re) { row.record = null; row.record_error = re.message; }
                     }
-                    card.ok(data.answer, secs);
+                    card.ok(data.answer, secs, row.record_error);
                 } catch (err) {
                     runningCount--;
                     if (cancelled) { card.fail("cancelled"); return; }   // leave for resume; don't checkpoint
@@ -7643,12 +7650,22 @@ a { color: var(--accent); text-decoration: none; }
                     blob = new Blob([lines.join("\\n") + (lines.length ? "\\n" : "")], { type: "application/jsonl" });
                     name = "batch_" + fmt + ".jsonl";
                     var dropped = rows.length - withRec.length;
+                    var errs = rows.filter(function (r) { return !r.record && r.record_error; })
+                                   .map(function (r) { return r.record_error; });
+                    var sampleErr = errs.length ? errs[0] : "";
+                    var hint = "";
+                    if (/HTTP 5\\d\\d/.test(sampleErr)) {
+                        hint = " A 5xx means the record endpoint is throwing \\u2014 the app process may still have pre-build_raft_dataset code (restart/redeploy it), or _load_pools hit a missing Supabase table/column.";
+                    } else if (/HTTP 422/.test(sampleErr)) {
+                        hint = " A 422 means the answer's citations didn't resolve to any indexed corpus section (spec / section-id mismatch against spec_chunks).";
+                    }
                     if (!withRec.length) {
-                        setStatus("No training records were built \\u2014 all " + rows.length
-                            + " answers were refusals or had unresolved citations. Try \\"Answers only\\".", { err: true });
+                        setStatus("No training records built for any of the " + rows.length + " answer(s)."
+                            + (sampleErr ? " Example: " + sampleErr + "." : "") + hint
+                            + " \\"Answers only\\" always works.", { err: true });
                     } else if (dropped) {
                         setStatus("Downloaded " + withRec.length + " record(s); " + dropped
-                            + " question(s) produced no record (refusal / unresolved citation) and were left out.");
+                            + " left out." + (sampleErr ? " Example failure: " + sampleErr + "." : "") + hint);
                     } else {
                         setStatus("Downloaded " + withRec.length + " record(s).");
                     }
