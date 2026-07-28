@@ -259,7 +259,7 @@ class FinetuneRecordRequest(BaseModel):
     """Request body for POST /api/finetune-record (batch-mode dataset export).
 
     Turns one answered query into a ShareGPT training record, reusing the exact
-    same oracle-resolution / context-assembly logic as scripts.build_raft_dataset
+    same oracle-resolution / context-assembly logic as src.pipeline.build_raft_dataset
     so batch exports match the offline dataset byte-for-byte. `fmt="sft"` grounds
     the record on just the cited (oracle) sections; `fmt="raft"` shuffles in
     random same-spec distractor chunks.
@@ -1041,7 +1041,7 @@ def _finetune_pools():
     """Lazily load + cache the corpus pools build_raft_dataset needs to resolve
     oracle sections and sample distractors. First batch record pays the load;
     the rest are instant (process-lifetime cache)."""
-    from scripts.build_raft_dataset import _load_pools
+    from src.pipeline.build_raft_dataset import _load_pools
     return _load_pools()
 
 
@@ -1051,13 +1051,13 @@ async def finetune_record_endpoint(
     _: bool = Depends(require_auth),
 ) -> dict:
     """Build one ShareGPT fine-tuning record (system+context / question / answer)
-    from an answered query. Reuses scripts.build_raft_dataset so batch exports are
+    from an answered query. Reuses src.pipeline.build_raft_dataset so batch exports are
     identical to the offline dataset. fmt=sft: oracle-only context; fmt=raft: adds
     shuffled same-spec distractors."""
     import random as _random
 
     try:
-        from scripts.build_raft_dataset import (
+        from src.pipeline.build_raft_dataset import (
             DISTRACTOR_RANGE,
             MAX_CONTEXT_TOKENS,
             _resolve_oracle,
@@ -1065,7 +1065,7 @@ async def finetune_record_endpoint(
         )
     except ImportError as e:
         # The record builder module isn't importable in this process — usually a
-        # stale deploy running code from before scripts/build_raft_dataset.py
+        # stale deploy running code from before src/pipeline/build_raft_dataset.py
         # existed. Surface it plainly instead of a generic 500 so the fix
         # (restart / rebuild the instance) is obvious.
         raise HTTPException(

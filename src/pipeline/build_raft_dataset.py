@@ -8,7 +8,7 @@ same-spec distractor chunks (RAFT), shuffled so oracle position isn't fixed.
 
 Usage:
     source venv/bin/activate
-    python -m scripts.build_raft_dataset [--out data/raft_finetune/gemma_raft_sft.jsonl]
+    python -m src.pipeline.build_raft_dataset [--out data/raft_finetune/gemma_raft_sft.jsonl]
 """
 from __future__ import annotations
 
