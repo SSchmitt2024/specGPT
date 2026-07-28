@@ -1060,6 +1060,7 @@ async def finetune_record_endpoint(
         from src.pipeline.build_raft_dataset import (
             DISTRACTOR_RANGE,
             MAX_CONTEXT_TOKENS,
+            REFUSAL_RE,
             _resolve_oracle,
             _sample_distractors,
         )
@@ -1072,7 +1073,7 @@ async def finetune_record_endpoint(
             status_code=503,
             detail=f"record builder unavailable ({e}); restart/redeploy this instance",
         )
-    from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, assemble_context
+    from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, _extract_citations, assemble_context
 
     try:
         by_section, by_spec, fields_by_section, enums_by_section = await asyncio.to_thread(
@@ -1123,9 +1124,37 @@ async def finetune_record_endpoint(
         combined += _sample_distractors(by_spec, specs_used, oracle_sections, n_distractors)
         _random.shuffle(combined)
 
-    context_text, _used = assemble_context(
+    context_text, used = assemble_context(
         req.query, combined, max_context_tokens=MAX_CONTEXT_TOKENS, figure_reserve_tokens=0
     )
+
+    # Grounding gate — mirror src.pipeline.build_raft_dataset.build_dataset so
+    # batch records meet the same quality bar as the offline dataset. Without
+    # this the endpoint would emit any answer verbatim, including ones that cite
+    # a section the assembled context doesn't actually contain (an oracle section
+    # evicted by the token budget, or a tag the model recalled from memory) —
+    # training the model to hallucinate citations. Reject those; the batch client
+    # drops rejected records and reports the count + reason, so a bad answer is
+    # left out of the .jsonl rather than poisoning the fine-tune.
+    is_refusal = bool(REFUSAL_RE.search(req.answer))
+    used_sections = {u.get("section_id") for u in used}
+    if oracle_sections and not oracle_sections.issubset(used_sections):
+        raise HTTPException(
+            status_code=422,
+            detail="context budget evicted an oracle section; record would be ungrounded",
+        )
+    resolved_cites = _extract_citations(req.answer, used)
+    if any(c.get("hallucinated") for c in resolved_cites):
+        raise HTTPException(
+            status_code=422,
+            detail="answer cites a section/figure not present in its own context (hallucinated tag)",
+        )
+    if not is_refusal and not resolved_cites:
+        raise HTTPException(
+            status_code=422,
+            detail="answer makes claims with no citation that resolves to the context",
+        )
+
     system = DEFAULT_SYSTEM_PROMPT.format(context=context_text)
     return {
         "conversations": [
