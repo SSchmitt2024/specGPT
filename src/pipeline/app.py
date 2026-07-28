@@ -659,7 +659,12 @@ def _rate_limit_dep(limiter: RateLimiter):
 
 
 # /api/query*, /api/refine* each cost a full retrieval + LLM generation.
-query_rate_limit = _rate_limit_dep(RateLimiter(max_requests=10, window_seconds=60.0))
+# The per-minute ceiling is the hard floor on batch-mode throughput (batch runs
+# one /api/query per question), so it's tunable for dedicated batch instances:
+# set SPECGPT_QUERY_RATE_PER_MIN higher to let the batch runner's concurrency
+# actually help. Defaults to the interactive-safe 10/min.
+_QUERY_RATE_PER_MIN = max(1, int(os.environ.get("SPECGPT_QUERY_RATE_PER_MIN", "10") or "10"))
+query_rate_limit = _rate_limit_dep(RateLimiter(max_requests=_QUERY_RATE_PER_MIN, window_seconds=60.0))
 # Shared by /api/flag-answer and the read-only /api/testplans* endpoints.
 flag_rate_limit = _rate_limit_dep(RateLimiter(max_requests=30, window_seconds=60.0))
 
@@ -2481,6 +2486,12 @@ a { color: var(--accent); text-decoration: none; }
 .dev-note-body { font-size:12.5px; color:var(--ink); white-space:pre-wrap; word-break:break-word; }
 /* batch mode */
 .batch-hint { font-size:12px; color:var(--t-subtle); margin:0 0 12px; line-height:1.5; }
+/* recovery banner: shown when a previous run left checkpointed results behind */
+.batch-recover { display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:10px 12px; margin:0 0 12px; border:1px solid var(--accent);
+    background:var(--accent-soft); border-radius:var(--radius-sm); flex-wrap:wrap; }
+.batch-recover-text { font-size:12.5px; color:var(--accent-ink); font-weight:600; }
+.batch-recover-actions { display:flex; gap:8px; flex:none; }
 .batch-progress { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
 .batch-bar { flex:1; height:8px; border-radius:99px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
 .batch-bar-fill { height:100%; width:0%; background:var(--accent); border-radius:99px; transition:width .25s ease; }
@@ -2945,11 +2956,28 @@ a { color: var(--accent); text-decoration: none; }
                             <option value="sft">SFT</option>
                             <option value="raft">SFT RAFT</option>
                         </select>
+                        <select id="batch-concurrency" title="How many questions to run in parallel">
+                            <option value="1">1 at a time</option>
+                            <option value="2">2 parallel</option>
+                            <option value="3">3 parallel</option>
+                            <option value="4" selected>4 parallel</option>
+                            <option value="6">6 parallel</option>
+                            <option value="8">8 parallel</option>
+                            <option value="12">12 parallel</option>
+                        </select>
                         <button class="dev-btn dev-btn-primary" id="batch-run" type="button" disabled>Run batch</button>
                         <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
                         <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
                     </div>
-                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset, one at a time. Answers appear in the scrollable list below as they finish. <b>Answers only</b> downloads question/answer JSON; <b>SFT</b> / <b>SFT RAFT</b> download a ShareGPT <code>.jsonl</code> where each record carries the injected context (SFT: cited sections only; RAFT: plus shuffled distractors).</p>
+                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset. Results are <b>checkpointed to the browser as they finish</b>, so a refresh, crash, or closed tab won't lose completed work &mdash; reopen this tab to recover or resume. Raise the parallelism to run faster (the server rate limit still applies; the runner backs off automatically if it's hit). <b>Answers only</b> downloads question/answer JSON; <b>SFT</b> / <b>SFT RAFT</b> download a ShareGPT <code>.jsonl</code> where each record carries the injected context (SFT: cited sections only; RAFT: plus shuffled distractors).</p>
+                    <div class="batch-recover" id="batch-recover" hidden>
+                        <span class="batch-recover-text" id="batch-recover-text"></span>
+                        <span class="batch-recover-actions">
+                            <button class="dev-btn dev-btn-primary" id="batch-recover-resume" type="button">Resume</button>
+                            <button class="dev-btn" id="batch-recover-dl" type="button">Download so far</button>
+                            <button class="dev-btn" id="batch-recover-discard" type="button">Discard</button>
+                        </span>
+                    </div>
                     <div class="batch-progress" id="batch-progress" hidden>
                         <div class="batch-bar"><div class="batch-bar-fill" id="batch-bar-fill"></div></div>
                         <span class="dev-count" id="batch-pct">0%</span>
@@ -7168,13 +7196,32 @@ a { color: var(--accent); text-decoration: none; }
             var resultsEl = document.getElementById("batch-results");
             var modelSelect = document.getElementById("batch-model-select");
             var formatSelect = document.getElementById("batch-format-select");
+            var concSelect = document.getElementById("batch-concurrency");
+            var recoverWrap = document.getElementById("batch-recover");
+            var recoverText = document.getElementById("batch-recover-text");
+            var resumeBtn = document.getElementById("batch-recover-resume");
+            var recoverDlBtn = document.getElementById("batch-recover-dl");
+            var recoverDiscardBtn = document.getElementById("batch-recover-discard");
             if (!fileInput || !runBtn) return;
             if (modelSelect) populateModelSelect(modelSelect, "agentic");
 
+            // Per-question fetch cap: a single wedged /api/query aborts and
+            // retries instead of hanging the whole run forever.
+            var REQUEST_TIMEOUT_MS = 300000;
+            // Keep the on-screen card list bounded. Every result is durably in
+            // IndexedDB regardless, so trimming old DOM nodes can't lose data but
+            // does keep a 1600-question run from bloating memory into a crash.
+            var MAX_CARDS = 300;
+
             var questions = null;
-            var results = null;
             var running = false;
             var cancelled = false;
+            var concurrency = 4;
+            var completed = 0, failed = 0, runningCount = 0;
+            var retryNote = "";
+            var memResults = [];          // in-session fallback if IndexedDB is unavailable
+            var checkpointWarned = false;
+            var activeControllers = new Set();
 
             // One live status line: spinner on while working, off when idle/done.
             function setStatus(text, opts) {
@@ -7253,8 +7300,10 @@ a { color: var(--accent); text-decoration: none; }
                 // bottom, so scrolling up to read earlier answers isn't yanked.
                 var nearBottom = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 60;
                 resultsEl.appendChild(card);
+                while (resultsEl.children.length > MAX_CARDS) {
+                    resultsEl.removeChild(resultsEl.firstChild);
+                }
                 outWrap.hidden = false;
-                outSum.textContent = "Outputs (" + resultsEl.children.length + ")";
                 if (nearBottom) resultsEl.scrollTop = resultsEl.scrollHeight;
                 function follow() {
                     var nb = resultsEl.scrollHeight - resultsEl.scrollTop - resultsEl.clientHeight < 120;
@@ -7315,33 +7364,41 @@ a { color: var(--accent); text-decoration: none; }
                 return null;
             }
 
-            /* POST one question, retrying transient failures. 429 = our own
-               10/min limiter (honor Retry-After). 5xx = usually an upstream LLM
+            /* POST one question, retrying transient failures. 429 = the server's
+               per-minute limiter (honor Retry-After). 5xx = usually an upstream LLM
                rate-limit/overload surfacing as a 500 — back off and retry rather
-               than failing the question. Network blips retry too. Non-transient
-               4xx fail immediately. onRetry(msg) reports the wait to the caller. */
+               than failing the question. Network blips and per-request timeouts
+               retry too. Non-transient 4xx fail immediately. onRetry(msg) reports
+               the wait to the caller. */
             async function askOne(query, config, onRetry) {
                 var attempt = 0;
                 for (;;) {
                     if (cancelled) throw new Error("cancelled");
-                    var res = null, netErr = null;
+                    var res = null, netErr = null, timedOut = false;
+                    var ctrl = ("AbortController" in window) ? new AbortController() : null;
+                    if (ctrl) activeControllers.add(ctrl);
+                    var timer = ctrl ? setTimeout(function () { timedOut = true; ctrl.abort(); }, REQUEST_TIMEOUT_MS) : null;
                     try {
                         res = await fetch("/api/query", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ query: query, config: config, debug: false, agentic: true }),
+                            signal: ctrl ? ctrl.signal : undefined,
                         });
                     } catch (e) { netErr = e; }
+                    finally { if (timer) clearTimeout(timer); if (ctrl) activeControllers.delete(ctrl); }
+                    if (cancelled) throw new Error("cancelled");
                     if (res && res.ok) return res.json();
                     var status = res ? res.status : 0;
                     var transient = netErr || status === 429 || status >= 500;
                     if (!transient) throw new Error("HTTP " + status);
                     attempt++;
-                    if (attempt > 6) throw new Error(res ? ("HTTP " + status + " (gave up after retries)") : "network error (gave up after retries)");
+                    if (attempt > 6) throw new Error(res ? ("HTTP " + status + " (gave up after retries)") : ((timedOut ? "timed out" : "network error") + " (gave up after retries)"));
                     var wait;
                     if (status === 429) wait = parseInt(res.headers.get("Retry-After") || "10", 10) || 10;
                     else wait = Math.min(Math.pow(2, attempt), 30);  // 2,4,8,16,30,30s
-                    if (onRetry) onRetry((netErr ? "Network error" : ("Server busy (HTTP " + status + ")")) + ", retry " + attempt + " in " + wait + "s");
+                    var why = netErr ? (timedOut ? "Request timed out" : "Network error") : ("Server busy (HTTP " + status + ")");
+                    if (onRetry) onRetry(why + ", retry " + attempt + " in " + wait + "s");
                     await new Promise(function (r) { setTimeout(r, wait * 1000); });
                 }
             }
@@ -7362,82 +7419,248 @@ a { color: var(--accent); text-decoration: none; }
                 return res.json();
             }
 
-            async function runBatch() {
-                if (running || !questions) return;
+            // ── Durable checkpoint store (IndexedDB) ─────────────────────────
+            // Every finished question is written immediately, so a refresh,
+            // crash, or closed tab never loses completed work. "meta" holds the
+            // run manifest (questions + config) so a run can be resumed.
+            var IDB_NAME = "specgpt_batch";
+            function idbOpen() {
+                return new Promise(function (resolve, reject) {
+                    var req = indexedDB.open(IDB_NAME, 1);
+                    req.onupgradeneeded = function () {
+                        var db = req.result;
+                        if (!db.objectStoreNames.contains("results")) db.createObjectStore("results", { keyPath: "idx" });
+                        if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "key" });
+                    };
+                    req.onsuccess = function () { resolve(req.result); };
+                    req.onerror = function () { reject(req.error); };
+                });
+            }
+            function idbPut(store, row) {
+                return idbOpen().then(function (db) {
+                    return new Promise(function (resolve, reject) {
+                        var tx = db.transaction(store, "readwrite");
+                        tx.objectStore(store).put(row);
+                        tx.oncomplete = function () { db.close(); resolve(); };
+                        tx.onerror = function () { db.close(); reject(tx.error); };
+                        tx.onabort = function () { db.close(); reject(tx.error); };
+                    });
+                });
+            }
+            function idbGet(store, key) {
+                return idbOpen().then(function (db) {
+                    return new Promise(function (resolve, reject) {
+                        var tx = db.transaction(store, "readonly");
+                        var req = tx.objectStore(store).get(key);
+                        req.onsuccess = function () { resolve(req.result || null); };
+                        req.onerror = function () { reject(req.error); };
+                        tx.oncomplete = function () { db.close(); };
+                    });
+                });
+            }
+            function idbGetAll(store) {
+                return idbOpen().then(function (db) {
+                    return new Promise(function (resolve, reject) {
+                        var tx = db.transaction(store, "readonly");
+                        var req = tx.objectStore(store).getAll();
+                        req.onsuccess = function () { resolve(req.result || []); };
+                        req.onerror = function () { reject(req.error); };
+                        tx.oncomplete = function () { db.close(); };
+                    });
+                });
+            }
+            function idbClear() {
+                return idbOpen().then(function (db) {
+                    return new Promise(function (resolve, reject) {
+                        var tx = db.transaction(["results", "meta"], "readwrite");
+                        tx.objectStore("results").clear();
+                        tx.objectStore("meta").clear();
+                        tx.oncomplete = function () { db.close(); resolve(); };
+                        tx.onerror = function () { db.close(); reject(tx.error); };
+                    });
+                });
+            }
+            function checkpoint(row) {
+                memResults.push(row);   // always keep an in-session copy
+                return idbPut("results", row).catch(function (e) {
+                    if (!checkpointWarned) {
+                        checkpointWarned = true;
+                        console.warn("batch: IndexedDB checkpoint failed, keeping results in memory only", e);
+                    }
+                });
+            }
+
+            function short(s) { return s.length > 70 ? s.slice(0, 70) + "\\u2026" : s; }
+            function refreshStatus(total) {
+                setStatus(completed + "/" + total + " done \\u00b7 " + failed + " failed \\u00b7 "
+                    + runningCount + " running" + (retryNote ? " \\u00b7 " + retryNote : ""), { spin: running });
+            }
+
+            // Run one question end-to-end, then checkpoint it.
+            async function processOne(i, qs, config, fmt, total) {
+                var q = qs[i];
+                var t0 = Date.now();
+                var card = startResultCard(i + 1, total, q);
+                runningCount++;
+                refreshStatus(total);
+                var row;
+                try {
+                    var data = await askOne(q, config, function (msg) { retryNote = msg; refreshStatus(total); });
+                    retryNote = "";
+                    var secs = Math.round((Date.now() - t0) / 1000);
+                    row = { idx: i, question: q, answer: data.answer, secs: secs };
+                    if (fmt) {
+                        try { row.record = await fetchRecord(data, fmt, config.spec); }
+                        catch (re) { row.record = null; row.record_error = re.message; }
+                    }
+                    card.ok(data.answer, secs);
+                } catch (err) {
+                    runningCount--;
+                    if (cancelled) { card.fail("cancelled"); return; }   // leave for resume; don't checkpoint
+                    row = { idx: i, question: q, answer: null, error: err.message };
+                    card.fail(err.message);
+                    await checkpoint(row);
+                    completed++; failed++;
+                    setProgress(completed, total);
+                    outSum.textContent = "Outputs (" + completed + ")";
+                    refreshStatus(total);
+                    return;
+                }
+                runningCount--;
+                await checkpoint(row);
+                completed++;
+                setProgress(completed, total);
+                outSum.textContent = "Outputs (" + completed + ")";
+                refreshStatus(total);
+            }
+
+            // Fixed-size worker pool over the indices still to do.
+            async function runQueue(todo, qs, config, fmt, total) {
+                var next = 0;
+                async function worker() {
+                    for (;;) {
+                        if (cancelled) return;
+                        var k = next++;
+                        if (k >= todo.length) return;
+                        await processOne(todo[k], qs, config, fmt, total);
+                    }
+                }
+                var pool = [];
+                var n = Math.max(1, Math.min(concurrency, todo.length));
+                for (var w = 0; w < n; w++) pool.push(worker());
+                await Promise.all(pool);
+            }
+
+            async function startRun(qs, config, fmt, existing) {
                 running = true;
                 cancelled = false;
-                results = [];
+                retryNote = "";
                 runBtn.disabled = true;
                 fileInput.disabled = true;
                 cancelBtn.hidden = false;
                 dlBtn.hidden = true;
-                if (resultsEl) resultsEl.innerHTML = "";
-                outWrap.hidden = true;
+                recoverWrap.hidden = true;
                 progWrap.hidden = false;
-                setProgress(0, questions.length);
+                outWrap.hidden = true;
+
+                var total = qs.length;
+                existing = existing || [];
+                completed = existing.length;
+                failed = existing.filter(function (r) { return r.error; }).length;
+                var have = {};
+                existing.forEach(function (r) { have[r.idx] = 1; });
+                var todo = [];
+                for (var i = 0; i < total; i++) if (!have[i]) todo.push(i);
+
+                setProgress(completed, total);
+                refreshStatus(total);
+
+                await runQueue(todo, qs, config, fmt, total);
+
+                running = false;
+                fileInput.disabled = false;
+                runBtn.disabled = false;
+                cancelBtn.hidden = true;
+                if (completed) dlBtn.hidden = false;
+                if (cancelled) {
+                    setStatus("Cancelled \\u2014 " + completed + "/" + total + " done (" + failed
+                        + " failed). Checkpoint saved; reopen this tab to resume or download.", { err: true });
+                } else {
+                    setStatus("Done: " + (completed - failed) + " answered, " + failed
+                        + " failed of " + total + ". Download ready.");
+                }
+            }
+
+            async function runBatch() {
+                if (running || !questions) return;
+                await idbClear().catch(function () {});
+                memResults = [];
+                checkpointWarned = false;
+                if (resultsEl) resultsEl.innerHTML = "";
 
                 var thorough = await fetchThoroughConfig();
                 var model = modelSelect && modelSelect.value;
                 var fmt = formatSelect ? formatSelect.value : "";
                 var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
                 if (model) { config.llm_model = model; config.agentic_model = model; }
+                concurrency = parseInt((concSelect && concSelect.value) || "4", 10) || 4;
+                var fileName = (fileInput.files && fileInput.files[0] && fileInput.files[0].name) || "batch";
 
-                function short(s) { return s.length > 70 ? s.slice(0, 70) + "\\u2026" : s; }
+                await idbPut("meta", {
+                    key: "current", questions: questions, total: questions.length,
+                    fmt: fmt, config: config, fileName: fileName,
+                    startedAt: Date.now(), concurrency: concurrency,
+                }).catch(function () {});
 
-                for (var i = 0; i < questions.length; i++) {
-                    if (cancelled) { setStatus("Cancelled after " + i + " of " + questions.length + ".", { err: true }); break; }
-                    var q = questions[i];
-                    var t0 = Date.now();
-                    var card = startResultCard(i + 1, questions.length, q);
-                    setStatus("Running " + (i + 1) + "/" + questions.length + " \\u00b7 " + short(q), { spin: true });
-                    try {
-                        var onRetry = (function (n, total, question) {
-                            return function (msg) { setStatus(n + "/" + total + " \\u00b7 " + msg + " \\u00b7 " + short(question), { spin: true }); };
-                        })(i + 1, questions.length, q);
-                        var data = await askOne(q, config, onRetry);
-                        var secs = Math.round((Date.now() - t0) / 1000);
-                        var row = { question: q, answer: data.answer };
-                        if (fmt) {
-                            try { row.record = await fetchRecord(data, fmt, config.spec); }
-                            catch (re) { row.record = null; row.record_error = re.message; }
-                        }
-                        results.push(row);
-                        card.ok(data.answer, secs);
-                    } catch (err) {
-                        if (cancelled) { card.fail("cancelled"); setStatus("Cancelled after " + i + " of " + questions.length + ".", { err: true }); break; }
-                        results.push({ question: q, answer: null, error: err.message });
-                        card.fail(err.message);
-                    }
-                    setProgress(i + 1, questions.length);
-                }
-
-                running = false;
-                fileInput.disabled = false;
-                runBtn.disabled = false;
-                cancelBtn.hidden = true;
-                if (results.length && !cancelled) {
-                    dlBtn.hidden = false;
-                    var failed = results.filter(function (r) { return r.error; }).length;
-                    setStatus("Done: " + (results.length - failed) + " answered, " + failed + " failed. Download ready.");
-                } else if (results.length) {
-                    dlBtn.hidden = false;
-                }
+                await startRun(questions, config, fmt, []);
             }
 
-            function downloadResults() {
-                if (!results || !results.length) return;
-                var fmt = formatSelect ? formatSelect.value : "";
+            async function resumeRun() {
+                if (running) return;
+                var meta = await idbGet("meta", "current").catch(function () { return null; });
+                if (!meta || !meta.questions) { recoverWrap.hidden = true; return; }
+                var existing = await idbGetAll("results").catch(function () { return []; });
+                memResults = existing.slice();
+                checkpointWarned = false;
+                if (resultsEl) resultsEl.innerHTML = "";
+                questions = meta.questions;
+                concurrency = meta.concurrency || parseInt((concSelect && concSelect.value) || "4", 10) || 4;
+                await startRun(meta.questions, meta.config || {}, meta.fmt || "", existing);
+            }
+
+            async function downloadResults() {
+                var meta = await idbGet("meta", "current").catch(function () { return null; });
+                var rows = await idbGetAll("results").catch(function () { return []; });
+                if ((!rows || !rows.length) && memResults.length) rows = memResults.slice();
+                if (!rows || !rows.length) { setStatus("Nothing to download yet.", { err: true }); return; }
+                rows.sort(function (a, b) { return (a.idx || 0) - (b.idx || 0); });
+                var fmt = meta ? (meta.fmt || "") : (formatSelect ? formatSelect.value : "");
                 var blob, name;
                 if (fmt) {
                     // ShareGPT .jsonl (one record per line), ready for Unsloth.
-                    var lines = results
-                        .filter(function (r) { return r.record; })
-                        .map(function (r) { return JSON.stringify(r.record); });
-                    blob = new Blob([lines.join("\\n") + "\\n"], { type: "application/jsonl" });
+                    var withRec = rows.filter(function (r) { return r.record; });
+                    var lines = withRec.map(function (r) { return JSON.stringify(r.record); });
+                    blob = new Blob([lines.join("\\n") + (lines.length ? "\\n" : "")], { type: "application/jsonl" });
                     name = "batch_" + fmt + ".jsonl";
+                    var dropped = rows.length - withRec.length;
+                    if (!withRec.length) {
+                        setStatus("No training records were built \\u2014 all " + rows.length
+                            + " answers were refusals or had unresolved citations. Try \\"Answers only\\".", { err: true });
+                    } else if (dropped) {
+                        setStatus("Downloaded " + withRec.length + " record(s); " + dropped
+                            + " question(s) produced no record (refusal / unresolved citation) and were left out.");
+                    } else {
+                        setStatus("Downloaded " + withRec.length + " record(s).");
+                    }
                 } else {
-                    blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
+                    var out = rows.map(function (r) {
+                        var o = { question: r.question, answer: r.answer };
+                        if (r.error) o.error = r.error;
+                        return o;
+                    });
+                    blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
                     name = "batch_answers.json";
+                    setStatus("Downloaded " + rows.length + " answer(s).");
                 }
                 var a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -7446,9 +7669,43 @@ a { color: var(--accent); text-decoration: none; }
                 URL.revokeObjectURL(a.href);
             }
 
+            function cancelRun() {
+                cancelled = true;
+                cancelBtn.hidden = true;
+                activeControllers.forEach(function (c) { try { c.abort(); } catch (e) {} });
+                activeControllers.clear();
+            }
+
+            // On (re)load, surface any checkpoint a previous run left behind.
+            async function checkRecovery() {
+                if (running) return;
+                var meta, rows;
+                try { meta = await idbGet("meta", "current"); rows = await idbGetAll("results"); }
+                catch (e) { return; }
+                if (!meta || !rows || !rows.length) { if (recoverWrap) recoverWrap.hidden = true; return; }
+                var done = rows.length, total = meta.total || done;
+                var when = meta.startedAt ? new Date(meta.startedAt).toLocaleString() : "";
+                var complete = done >= total;
+                recoverText.textContent = (complete ? "Recovered " : "Found ") + done + "/" + total
+                    + " saved result" + (done === 1 ? "" : "s") + " from " + (meta.fileName || "a previous run")
+                    + (when ? " (" + when + ")" : "") + ".";
+                resumeBtn.hidden = complete;
+                recoverWrap.hidden = false;
+            }
+
             runBtn.addEventListener("click", runBatch);
-            cancelBtn.addEventListener("click", function () { cancelled = true; cancelBtn.hidden = true; });
+            cancelBtn.addEventListener("click", cancelRun);
             dlBtn.addEventListener("click", downloadResults);
+            if (resumeBtn) resumeBtn.addEventListener("click", resumeRun);
+            if (recoverDlBtn) recoverDlBtn.addEventListener("click", downloadResults);
+            if (recoverDiscardBtn) recoverDiscardBtn.addEventListener("click", function () {
+                idbClear().catch(function () {}).then(function () {
+                    recoverWrap.hidden = true;
+                    memResults = [];
+                    setStatus("Discarded saved batch results.");
+                });
+            });
+            checkRecovery();
         })();
 
         /* ── renderSidebar override (gap-hint card) ──────────────────────── */
