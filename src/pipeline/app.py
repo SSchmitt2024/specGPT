@@ -1056,24 +1056,43 @@ async def finetune_record_endpoint(
     shuffled same-spec distractors."""
     import random as _random
 
-    from scripts.build_raft_dataset import (
-        DISTRACTOR_RANGE,
-        MAX_CONTEXT_TOKENS,
-        _resolve_oracle,
-        _sample_distractors,
-    )
+    try:
+        from scripts.build_raft_dataset import (
+            DISTRACTOR_RANGE,
+            MAX_CONTEXT_TOKENS,
+            _resolve_oracle,
+            _sample_distractors,
+        )
+    except ImportError as e:
+        # The record builder module isn't importable in this process — usually a
+        # stale deploy running code from before scripts/build_raft_dataset.py
+        # existed. Surface it plainly instead of a generic 500 so the fix
+        # (restart / rebuild the instance) is obvious.
+        raise HTTPException(
+            status_code=503,
+            detail=f"record builder unavailable ({e}); restart/redeploy this instance",
+        )
     from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, assemble_context
 
-    by_section, by_spec, fields_by_section, enums_by_section = await asyncio.to_thread(
-        _finetune_pools
-    )
+    try:
+        by_section, by_spec, fields_by_section, enums_by_section = await asyncio.to_thread(
+            _finetune_pools
+        )
+    except Exception as e:
+        # Corpus pools failed to load — almost always a missing/renamed Supabase
+        # table or column (spec_chunks / spec_fields / spec_enum_index). Name the
+        # cause so it's fixable without server-log spelunking.
+        logger.exception("finetune-record: corpus pool load failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"corpus load failed: {type(e).__name__}: {e}",
+        )
 
+    non_hallucinated = [c for c in req.citations if not c.get("hallucinated")]
     oracle_chunks: list[dict] = []
     oracle_sections: set[str] = set()
     specs_used: set[str] = set()
-    for c in req.citations:
-        if c.get("hallucinated"):
-            continue
+    for c in non_hallucinated:
         resolved = _resolve_oracle(c, req.spec, by_section, fields_by_section, enums_by_section)
         if resolved and resolved["section_id"] not in oracle_sections:
             oracle_chunks.append(resolved)
@@ -1081,9 +1100,21 @@ async def finetune_record_endpoint(
             specs_used.add(resolved["spec"])
 
     if not oracle_chunks:
+        # Distinguish "no usable citations came in" from "citations came in but
+        # none matched the indexed corpus" (empty pools or section-id mismatch),
+        # so the caller can tell a data problem from a citation problem.
+        if not by_section:
+            reason = "corpus is empty (spec_chunks returned 0 rows in this DB)"
+        elif not non_hallucinated:
+            reason = f"answer had no non-hallucinated citations (of {len(req.citations)} total)"
+        else:
+            reason = (
+                f"none of {len(non_hallucinated)} citation(s) resolved to an indexed "
+                f"section (spec/section-id mismatch against spec_chunks)"
+            )
         raise HTTPException(
             status_code=422,
-            detail="no citation resolved to a corpus section; nothing to ground a record on",
+            detail=f"no citation resolved to a corpus section; {reason}",
         )
 
     combined = list(oracle_chunks)
@@ -7422,7 +7453,18 @@ a { color: var(--accent); text-decoration: none; }
                         citations: data.citations || [], spec: spec, fmt: fmt,
                     }),
                 });
-                if (!res.ok) throw new Error("record HTTP " + res.status);
+                if (!res.ok) {
+                    // Keep the server's detail (why the record couldn't be built),
+                    // not just the status, so the UI can show the real reason.
+                    var detail = "";
+                    try {
+                        var j = await res.json();
+                        detail = j && j.detail
+                            ? (typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail))
+                            : "";
+                    } catch (e) { /* non-JSON body */ }
+                    throw new Error("record HTTP " + res.status + (detail ? " \\u2014 " + detail : ""));
+                }
                 return res.json();
             }
 
