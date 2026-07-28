@@ -3185,11 +3185,13 @@ a { color: var(--accent); text-decoration: none; }
         function _modelOptionLabel(m) {
             return m.tags.length ? `${m.label} (${m.tags.join(", ")})` : m.label;
         }
-        function populateModelSelect(selectEl, role) {
+        function populateModelSelect(selectEl, role, opts) {
             if (!selectEl) return;
+            const include = opts && opts.include;   // optional (m) => bool filter
             const byProvider = {};
             for (const m of MODEL_CATALOG) {
                 if (!m.provider || (!m.provider.startsWith("DeepThought") && !m.provider.startsWith("Claude"))) continue;
+                if (include && !include(m)) continue;
                 (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
             }
             // Stable provider order matching the catalog declaration (only included providers).
@@ -7234,7 +7236,10 @@ a { color: var(--accent); text-decoration: none; }
             var recoverDlBtn = document.getElementById("batch-recover-dl");
             var recoverDiscardBtn = document.getElementById("batch-recover-discard");
             if (!fileInput || !runBtn) return;
-            if (modelSelect) populateModelSelect(modelSelect, "agentic");
+            // Batch fine-tuning data is generated with the open-weight model only.
+            if (modelSelect) populateModelSelect(modelSelect, "agentic", {
+                include: function (m) { return m.id === "deepthought-llama-3.3-70b"; },
+            });
 
             // Per-question fetch cap: a single wedged /api/query aborts and
             // retries instead of hanging the whole run forever.
