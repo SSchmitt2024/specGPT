@@ -167,7 +167,7 @@ class PipelineConfig:
     # analyser that keeps asking for unavailable data cannot loop forever.
     # qa_log shows median 0 / mean ~1.8 refinement passes, so 4 is effectively
     # never binding and exists to bound worst-case cost.
-    agentic_max_iterations: int = 4
+    agentic_max_iterations: int = 2
 
     # When True and agentic mode is OFF, still run a one-shot gap analysis
     # after the first-pass answer and surface the result as `gap_hint` in
@@ -540,8 +540,11 @@ _AGENTIC_HARD_CAP = 10
 #   - Live spot-check: Haiku 4.5 follows the bracket-citation format exactly
 #     as well as Sonnet on identical context, so Fast can ride the cheap fast
 #     model safely (~$0.006 and ~5-8 s vs ~$0.02 and ~13 s on Sonnet).
-#   - Agentic iteration cap 4: qa_log shows median 0 / mean ~1.8 refinement
-#     passes, so 4 is never binding in practice and bounds worst-case cost.
+#   - Agentic iteration cap 2: retrieval lands the right sections on the
+#     first pass; iteration 0's targeted fetch + regenerate is where the
+#     value is, and traced runs show rounds 2+ only paraphrase the same
+#     follow-up queries against an already-seen corpus (see flagged_answers
+#     id 32). Cap 2 halves worst-case cost/latency with no observed loss.
 PRESETS: dict[str, dict] = {
     # Quick lookups: cheapest/fastest model, lean single-query retrieval, no
     # gap check. Same measured recall as the old Fast AND old Balanced (0.90)
@@ -603,7 +606,7 @@ PRESETS: dict[str, dict] = {
             "agentic_max_output_tokens": 3072,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
-            "agentic_max_iterations": 4,
+            "agentic_max_iterations": 2,
         },
     },
     # Maximum answer quality, cost shown is the price of admission: recursive
@@ -635,7 +638,7 @@ PRESETS: dict[str, dict] = {
             "agentic_max_output_tokens": 3072,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
-            "agentic_max_iterations": 4,
+            "agentic_max_iterations": 2,
         },
     },
 }

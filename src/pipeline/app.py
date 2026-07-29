@@ -2835,7 +2835,7 @@ a { color: var(--accent); text-decoration: none; }
                                     </div>
                                     <div class="config-item">
                                         <label>Max Iterations</label>
-                                        <input type="number" id="config-agentic_max_iterations" value="4" min="1" max="10">
+                                        <input type="number" id="config-agentic_max_iterations" value="2" min="1" max="10">
                                     </div>
                                 </div>
                                 <div hidden aria-hidden="true">
@@ -3542,7 +3542,7 @@ a { color: var(--accent); text-decoration: none; }
                 agentic_max_followups:      num("config-agentic_max_followups", 3),
                 agentic_targeted_fetch:     chk("config-agentic_targeted_fetch"),
                 agentic_recursive:          chk("config-agentic_recursive"),
-                agentic_max_iterations:     num("config-agentic_max_iterations", 4),
+                agentic_max_iterations:     num("config-agentic_max_iterations", 2),
                 figure_reserve_tokens:      num("config-figure_reserve_tokens", 3000),
             };
         }
@@ -4548,7 +4548,7 @@ a { color: var(--accent); text-decoration: none; }
                 ["Rerank top-k", val("config-agentic_rerank_topk") || "14"],
                 ["Max ctx tok",  val("config-agentic_max_context_tokens") || "16000"],
                 ["Targeted fetch", chk("config-agentic_targeted_fetch") ? "on" : "off"],
-                ["Recursive",    chk("config-agentic_recursive") ? "on (max " + (val("config-agentic_max_iterations") || "4") + " iter)" : "off"],
+                ["Recursive",    chk("config-agentic_recursive") ? "on (max " + (val("config-agentic_max_iterations") || "2") + " iter)" : "off"],
             ];
             document.getElementById("ag-confirm-rows").innerHTML = rows.map(([k, v]) =>
                 `<span class="ag-confirm-key">${escapeHtml(k)}</span><span class="ag-confirm-val">${escapeHtml(String(v))}</span>`
