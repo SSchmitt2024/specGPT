@@ -31,7 +31,6 @@ httptools==0.7.1
 httpx==0.28.1
 hyperframe==6.1.0
 idna==3.15
-iniconfig==2.3.0
 Jinja2==3.1.6
 jiter==0.15.0
 markdown-it-py==4.2.0
@@ -45,8 +44,6 @@ packaging==26.2
 pdfminer.six==20251230
 pdfplumber==0.11.9
 pillow==12.2.0
-playwright==1.60.0
-pluggy==1.6.0
 postgrest==2.30.0
 propcache==0.5.2
 psycopg2-binary==2.9.12
@@ -57,13 +54,11 @@ pydantic==2.13.4
 pydantic_core==2.46.4
 pyee==13.0.1
 Pygments==2.20.0
-pyiceberg==0.11.1
 PyJWT==2.12.1
 PyMuPDF==1.27.2.2
 pyparsing==3.3.2
 pypdfium2==5.7.0
 pyroaring==1.1.0
-pytest==9.0.3
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.29
