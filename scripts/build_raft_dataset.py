@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, _extract_citations, assemble_context
+from src.pipeline.orchestrator import _agentic_gap_analysis
 from src.pipeline.search import supabase_client
 
 CONCRETE_SPECS = ("base", "command", "pcie")
@@ -212,6 +213,23 @@ def build_dataset(out_path: Path) -> Counter:
         if not is_refusal and not resolved_cites:
             stats["ungrounded_no_citations"] += 1
             continue
+
+        # Content-groundedness gate: citation IDs can resolve to real headers
+        # while the claims next to them aren't actually supported by that
+        # chunk's content (real citation, fabricated substance). Re-run the
+        # same classifier the live agentic pipeline uses to catch this —
+        # drop the example rather than train the student on it.
+        if not is_refusal:
+            followups, _reason, requested, _call = _agentic_gap_analysis(
+                query=query,
+                answer=answer,
+                used_chunks=used_chunks,
+                citations=resolved_cites,
+                max_followups=3,
+            )
+            if followups or any(requested.values()):
+                stats["gap_flagged"] += 1
+                continue
 
         system = DEFAULT_SYSTEM_PROMPT.format(context=context_text)
         records.append({

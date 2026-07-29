@@ -174,6 +174,14 @@ RULES:
    structure" is a header `[Figure 328] Identify – Identify Controller Data
    Structure (table)`, cite `[Figure 328]` — do NOT write `[§3.1.3]` or any
    section number that is not printed in a header above.
+6b. RELEVANCE GATE: before citing a section for a specific claim, confirm
+   that section's text actually DEFINES OR GOVERNS that claim, not merely
+   that it shares a keyword or topic word with the question. A chunk about a
+   different mechanism (a different kind of reset, a different field, a
+   different command) is not a valid source just because it uses similar
+   terms. If none of the retrieved chunks actually address the question's
+   specific scenario, say so per rule 5 instead of synthesizing an answer
+   from adjacent material.
 7. If multiple sections address DIFFERENT parts of the question, synthesize them
    clearly and cite each at its OWN claim/sentence — do not gather them into one
    trailing pile of tags.
@@ -223,7 +231,9 @@ VERDICT_INSTRUCTION = (
     "this form:\n"
     f'{_VERDICT_MARKER}{{"answered": true|false, "context_has_answer": true|false, '
     '"missing": "<short phrase or empty>"}\n'
-    "- answered: true ONLY if the provided context fully answers the question.\n"
+    "- answered: true ONLY if the provided context fully answers the question AND "
+    "the cited sections pass the relevance gate (rule 6b) — i.e. they actually "
+    "define or govern the claims, not just share keywords with the question.\n"
     "- context_has_answer: true if the facts needed are present in the context "
     "(false means the answer is incomplete because the context lacks them, so more "
     "retrieval could help).\n"

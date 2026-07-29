@@ -1460,9 +1460,14 @@ def _run_stage5_and_finalize(
             # Strong-model self-assessment short-circuit: if the model that wrote
             # the current answer says it fully answered the question, stop —
             # fetching more context can't improve an already-complete answer, and
-            # re-running only risks drift + cost. Skips the gap-analysis call
-            # entirely. Falls through when there's no verdict (refine fast-path
-            # or the model didn't emit one).
+            # re-running only risks drift + cost. Falls through when there's no
+            # verdict (refine fast-path or the model didn't emit one).
+            # Gated to iteration > 0: a self-verdict alone must never skip the
+            # independent gap-analysis check on the very first pass — a model
+            # can confidently self-certify an answer built from topically-
+            # adjacent-but-ungrounded citations as "complete" (see qa_log
+            # request 9995c9b0e950). Iteration 0 always runs gap-analysis below;
+            # only a later iteration may trust the verdict alone.
             # Exception: an "answered" verdict doesn't excuse citations to
             # sections that were never retrieved — those claims are
             # unverifiable, so keep iterating (the targeted fetch below pulls
@@ -1494,7 +1499,7 @@ def _run_stage5_and_finalize(
                 kind: [v for v in vals if (kind, v) not in attempted_fetches]
                 for kind, vals in missing_resources.items()
             }
-            if (verdict is not None and verdict.get("answered")
+            if (iteration > 0 and verdict is not None and verdict.get("answered")
                     and not blocking_cites
                     and not any(blocking_missing.values())):
                 converged = True
