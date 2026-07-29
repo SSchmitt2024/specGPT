@@ -1437,8 +1437,8 @@ def _run_stage5_and_finalize(
         # keeps asking for chunks the deterministic reranker keeps discarding.
         # Detecting it lets us stop early instead of burning every remaining
         # iteration (saving the regenerate + all later gap/fetch/rerank calls).
-        # Cheap: a tuple compare of ids we already have in hand.
-        prev_ctx_sig: tuple | None = None
+        # Cheap: a set compare of ids we already have in hand.
+        prev_ctx_sig: frozenset | None = None
         stalled = False
         # Strong-model completeness verdict for the *current* answer. The model
         # that wrote the answer read the whole context, so its "is this answered?"
@@ -1460,14 +1460,9 @@ def _run_stage5_and_finalize(
             # Strong-model self-assessment short-circuit: if the model that wrote
             # the current answer says it fully answered the question, stop —
             # fetching more context can't improve an already-complete answer, and
-            # re-running only risks drift + cost. Falls through when there's no
-            # verdict (refine fast-path or the model didn't emit one).
-            # Gated to iteration > 0: a self-verdict alone must never skip the
-            # independent gap-analysis check on the very first pass — a model
-            # can confidently self-certify an answer built from topically-
-            # adjacent-but-ungrounded citations as "complete" (see qa_log
-            # request 9995c9b0e950). Iteration 0 always runs gap-analysis below;
-            # only a later iteration may trust the verdict alone.
+            # re-running only risks drift + cost. Skips the gap-analysis call
+            # entirely. Falls through when there's no verdict (refine fast-path
+            # or the model didn't emit one).
             # Exception: an "answered" verdict doesn't excuse citations to
             # sections that were never retrieved — those claims are
             # unverifiable, so keep iterating (the targeted fetch below pulls
@@ -1499,7 +1494,7 @@ def _run_stage5_and_finalize(
                 kind: [v for v in vals if (kind, v) not in attempted_fetches]
                 for kind, vals in missing_resources.items()
             }
-            if (iteration > 0 and verdict is not None and verdict.get("answered")
+            if (verdict is not None and verdict.get("answered")
                     and not blocking_cites
                     and not any(blocking_missing.values())):
                 converged = True
@@ -1741,7 +1736,11 @@ def _run_stage5_and_finalize(
             # one. Identical -> regenerate can only reproduce the prior answer,
             # so skip it and stop the loop. prev_ctx_sig is None on the first
             # iteration, so we always run at least one agentic regenerate.
-            ctx_sig = tuple(
+            # frozenset, not tuple: the cross-encoder API returns slightly
+            # jittered scores run-to-run, so the same chunk set can come back
+            # reordered — same set means regenerate would see the same context
+            # (assemble_context budget aside), so treat it as a stall.
+            ctx_sig = frozenset(
                 (c.get("id") or c.get("chunk_id") or
                  (c.get("section_id"), c.get("figure_number"), c.get("content_type")))
                 for c in reranked2
