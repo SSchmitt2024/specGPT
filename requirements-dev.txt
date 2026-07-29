@@ -1,0 +1,7 @@
+# Dev/test-only dependencies — NOT installed into the runtime Docker image
+# (the Dockerfile installs requirements.txt only). Install locally with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+# then run the suite with: python -m pytest
+pytest==9.0.3
+pluggy==1.6.0
+iniconfig==2.3.0
