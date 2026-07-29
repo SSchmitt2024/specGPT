@@ -1728,7 +1728,7 @@ def test_frontend_batch_mode_markup_and_escaping():
     assert 'data-devtab="batch"' in html
     assert 'id="dev-pane-batch"' in html
     for el in ("batch-file", "batch-run", "batch-cancel", "batch-download",
-               "batch-bar-fill", "batch-pct", "batch-log"):
+               "batch-bar-fill", "batch-pct", "batch-status"):
         assert f'id="{el}"' in html
-    # the escaped quote in the validation message must arrive as \" not \\"
-    assert 'missing a \\"question\\" string' in html
+    # the escaped quote in the status message must arrive as \" not \\"
+    assert '\\"Answers only\\" always works.' in html
