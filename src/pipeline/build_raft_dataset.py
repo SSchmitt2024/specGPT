@@ -20,10 +20,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from src.pipeline.generator import DEFAULT_SYSTEM_PROMPT, _extract_citations, assemble_context
-from src.pipeline.orchestrator import _agentic_gap_analysis
+from src.pipeline.orchestrator import CONCRETE_SPEC_IDS, _agentic_gap_analysis
 from src.pipeline.search import supabase_client
 
-CONCRETE_SPECS = ("base", "command", "pcie")
+CONCRETE_SPECS = CONCRETE_SPEC_IDS
 
 REFUSAL_RE = re.compile(
     r"does not (contain|specify|address|provide)|"

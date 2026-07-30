@@ -569,6 +569,14 @@ AVAILABLE_SPECS = [
     {"id": "base", "label": "Base Specification", "version": "2.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-Revision-2.3-2025.08.01-Ratified.pdf"},
     {"id": "pcie", "label": "PCIe Transport", "version": "1.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVMe-over-PCIe-Transport-Specification-Revision-1.3-2025.08.01-Ratified.pdf"},
     {"id": "command", "label": "NVM Command Set", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVM-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    {"id": "boot", "label": "Boot Specification", "version": "1.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Boot-Specification-Revision-1.3-2025.08.01-Ratified.pdf"},
+    {"id": "cps", "label": "Computational Programs", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Computational-Programs-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    {"id": "kv", "label": "Key Value Command Set", "version": "1.3", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Key-Value-Command-Set-Specification-Revision-1.3-2025.08.01-Ratified.pdf"},
+    {"id": "mi", "label": "Management Interface", "version": "2.1", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Management-Interface-Specification-Revision-2.1-2025.08.01-Ratified.pdf"},
+    {"id": "rdma", "label": "RDMA Transport", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVMe-over-RDMA-Transport-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    {"id": "tcp", "label": "TCP Transport", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-NVMe-over-TCP-Transport-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    {"id": "slm", "label": "Subsystem Local Memory", "version": "1.2", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Subsystem-Local-Memory-Command-Set-Specification-Revision-1.2-2025.08.01-Ratified.pdf"},
+    {"id": "zns", "label": "Zoned Namespace", "version": "1.4", "url": "https://nvmexpress.org/wp-content/uploads/NVM-Express-Zoned-Namespace-Command-Set-Specification-Revision-1.4-2025.08.01-Ratified.pdf"},
     # Sentinel: search every corpus at once (orchestrator.ALL_SPECS). There is
     # no single PDF, so url is None; citation deep-links use each chunk's own
     # spec provenance instead. Keep this entry LAST so the frontend's
@@ -3295,7 +3303,11 @@ a { color: var(--accent); text-decoration: none; }
         (function _wireSpecPicker() {
             const el = document.getElementById("global-spec-select");
             if (!el) return;
-            const _specShortNames = { base: "Base", pcie: "PCIe", command: "Cmd-Set", all: "All" };
+            const _specShortNames = {
+                base: "Base", pcie: "PCIe", command: "Cmd-Set", boot: "Boot",
+                cps: "CPS", kv: "KV", mi: "MI", rdma: "RDMA", tcp: "TCP",
+                slm: "SLM", zns: "ZNS", all: "All",
+            };
             function _updateAskSpecLabel(specId) {
                 const lbl = document.getElementById("ask-spec-label");
                 if (lbl) lbl.textContent = _specShortNames[specId] || specId;

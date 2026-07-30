@@ -69,13 +69,15 @@ ALL_SPECS = "all"
 # Every ingested corpus, i.e. what ALL_SPECS expands to. Must match the
 # concrete (non-"all") ids in app.AVAILABLE_SPECS; app.py asserts this at
 # import time so the two lists can't drift.
-CONCRETE_SPEC_IDS: tuple[str, ...] = ("base", "pcie", "command")
+CONCRETE_SPEC_IDS: tuple[str, ...] = (
+    "base", "pcie", "command", "boot", "cps", "kv", "mi", "rdma", "tcp", "slm", "zns",
+)
 
 
 @dataclass
 class PipelineConfig:
     """Configuration for all tunable high-impact parameters."""
-    # Which specification corpus to search: "base" | "pcie" | "command", or
+    # Which specification corpus to search: any of CONCRETE_SPEC_IDS, or
     # ALL_SPECS to search every ingested corpus (see AVAILABLE_SPECS in
     # app.py). A concrete spec scopes every retrieval (vector / BM25 /
     # structured lookup) to rows tagged with it so different specs'
