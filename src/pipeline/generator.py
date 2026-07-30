@@ -357,6 +357,19 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _body_signature(text: str) -> str:
+    """Identity key for near-duplicate prose bodies across corpora.
+
+    Cross-corpus copies of a boilerplate section are not byte-identical: they
+    differ in their own section numbers and internal cross-references. Blanking
+    every number collapses those to one key while leaving genuinely different
+    prose distinct. Measured on the Sanitize family: the slm/cps copies match
+    exactly, while "Sanitize command" and "Sanitize Namespace command" stay
+    apart despite 0.95 raw similarity.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"\d+(?:\.\d+)*", "#", text.lower())).strip()
+
+
 def _format_history(turns: list[dict], max_tokens: int = DEFAULT_HISTORY_TOKENS) -> str:
     """Render prior conversation turns as a Q/A transcript under a token
     budget. Walks newest-first so the most recent turns survive, then emits
@@ -472,6 +485,7 @@ def assemble_context(
     used_chunks: list[dict] = []
     context_lines: list[str] = []
     seen_ids: set = set()
+    seen_bodies: set = set()
     # chunk_no is shared so fence numbering stays contiguous across both passes.
     counter = {"n": 0}
 
@@ -501,6 +515,18 @@ def assemble_context(
         figure_number = chunk.get("figure_number")
         content_type = chunk.get("content_type", "prose")
 
+        # Boilerplate sections (Sanitize, Asynchronous Event Request, ...) are
+        # restated near-verbatim in every command-set spec, differing only in
+        # their section numbers. In all-specs mode all eleven copies rank
+        # together and can take a third of the budget to say one thing once.
+        # Tables are exempt: _body_signature blanks numbers, and in a register
+        # or status table the numbers ARE the content.
+        if content_type != "table":
+            sig = _body_signature(chunk_text)
+            if sig in seen_bodies:
+                return None
+            seen_bodies.add(sig)
+
         counter["n"] += 1
         chunk_no = counter["n"]
         # The header carries the citable identifier the model must copy verbatim.
@@ -517,6 +543,14 @@ def assemble_context(
             header = f"[Section {section_title or 'unknown'}]"
         if content_type == "table":
             header += " (table)"
+        # Section numbers are per-document, so in all-specs mode one header can
+        # name three unrelated sections ("[Section 4.1.7] Sanitize command" is
+        # zns, kv and command at once). Without the corpus a reader sees a spec
+        # contradicting itself. Kept outside the bracket so the citable tag the
+        # model copies is unchanged and _extract_citations still matches.
+        spec_label = (chunk.get("spec") or "").upper()
+        if spec_label:
+            header += f"  <{spec_label}>"
 
         context_lines.append(_CHUNK_FENCE % chunk_no)
         context_lines.append(header)
@@ -581,6 +615,24 @@ def assemble_context(
                 fig_tokens = nt
 
     formatted_context = "\n".join(context_lines).strip()
+
+    # ponytail: legend only when the corpus is actually mixed. Single-spec runs
+    # (the interactive default) keep the exact context they had before, and a
+    # bare "<ZNS>" tag means nothing to a reader that never saw the spec list.
+    docs: dict[str, str] = {}
+    for c in used_chunks:
+        label = (c.get("spec") or "").upper()
+        if label and label not in docs:
+            docs[label] = c.get("spec_document") or label
+    if len(docs) > 1:
+        legend = "\n".join(f"  <{k}> = {v}" for k, v in sorted(docs.items()))
+        formatted_context = (
+            "Sources below are drawn from several specifications. Section numbers\n"
+            "are per-document, so the same number in two of them is two different\n"
+            "sections. The tag after each heading names the document:\n"
+            f"{legend}\n\n{formatted_context}"
+        )
+
     return formatted_context, used_chunks
 
 

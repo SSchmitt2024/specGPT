@@ -1233,6 +1233,58 @@ def _expand_referenced_figures(
     return out
 
 
+def _drop_colliding_figures(per_spec: list[tuple[str, object]]) -> None:
+    """Drop unanchored figure hits whose number collides across corpora.
+
+    Figure numbers are per-document, so a bare "Figure 45" in the query matches
+    a different, unrelated table in all eleven corpora. In single-spec mode that
+    was unambiguous; in all-specs mode it fans one reference out into eleven
+    wrong tables and can swallow the whole context budget.
+
+    A figure is *anchored* when some matched field points at it (a field name is
+    corpus-meaningful, so the corpus was identified by something other than the
+    number). An unanchored figure claimed by more than one corpus is a numbering
+    collision, not a signal. Claimed by exactly one corpus it stays: no ambiguity
+    to resolve, and dropping it would regress plain "what is in Figure 300".
+
+    Mutates the results in place.
+    """
+    from src.pipeline.retriever import _figures_from_entities
+
+    entities = next((r.entities for _, r in per_spec if r.entities), [])
+    bare = set(_figures_from_entities(entities))
+    if not bare:
+        return
+
+    def anchored_figs(res) -> set[str]:
+        return {str(f.get("parent_figure")) for f in res.fields
+                if f.get("parent_figure") is not None}
+
+    claims: dict[str, int] = {}
+    for _, res in per_spec:
+        unanchored = bare - anchored_figs(res)
+        for fig in unanchored:
+            if any(str(s.get("figure_number")) == fig for s in res.sources):
+                claims[fig] = claims.get(fig, 0) + 1
+
+    ambiguous = {fig for fig, n in claims.items() if n > 1}
+    if not ambiguous:
+        return
+
+    for _, res in per_spec:
+        drop = ambiguous - anchored_figs(res)
+        if not drop:
+            continue
+        res.sources = [s for s in res.sources
+                       if str(s.get("figure_number")) not in drop]
+        res.tables = [t for t in res.tables
+                      if str(t.get("figure_number")) not in drop]
+        # A corpus whose only contribution was the collided figure no longer
+        # found anything; leaving found=True would raise merged confidence.
+        if not res.sources and not res.fields:
+            res.found = False
+
+
 def _structured_lookup_all_specs(
     decomp,
     *,
@@ -1256,6 +1308,8 @@ def _structured_lookup_all_specs(
 
     merged = StructuredLookupResult(query="", found=False, confidence="LOW")
     conf_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+    per_spec: list[tuple[str, object]] = []
     for spec_id in CONCRETE_SPEC_IDS:
         try:
             res = retriever.structured_lookup(
@@ -1269,6 +1323,11 @@ def _structured_lookup_all_specs(
         except Exception as e:  # noqa: BLE001
             logger.warning("structured lookup failed for spec=%s: %s", spec_id, e)
             continue
+        per_spec.append((spec_id, res))
+
+    _drop_colliding_figures(per_spec)
+
+    for spec_id, res in per_spec:
         if not merged.query:
             merged.query = res.query
             merged.entities = res.entities

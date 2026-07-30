@@ -2050,3 +2050,102 @@ def test_tiered_loop_entity_gate_vetoes_sufficiency(monkeypatch):
     assert result["gap_analysis"]["iterations_run"] == 2
     assert result["gap_analysis"]["absent_entities"] == []
     assert "Management Controller address" in result["context"]
+
+
+# ── all-specs noise fixes (figure-number collisions, cross-corpus boilerplate) ──
+
+def test_body_signature_collapses_boilerplate_but_keeps_distinct_prose():
+    from src.pipeline.generator import _body_signature
+    # Same section restated in two corpora, differing only in its own numbering.
+    assert _body_signature("Section 4.1.9 The Sanitize command shall abort.") == \
+           _body_signature("Section 4.1.8 The Sanitize command shall abort.")
+    # Different commands that read alike must stay apart.
+    assert _body_signature("The Sanitize command aborts.") != \
+           _body_signature("The Sanitize Namespace command aborts.")
+
+
+def _dup_chunk(i, content_type, text, spec):
+    return {"id": f"{spec}:{i}", "section_id": f"4.1.{i}", "section_title": "Sanitize command",
+            "content_type": content_type, "text_raw": text, "spec": spec}
+
+
+def test_assemble_context_dedups_prose_copies_but_not_tables():
+    from src.pipeline.generator import assemble_context
+    prose = [_dup_chunk(7, "prose", "Section 4.1.7 The Sanitize command shall abort.", "zns"),
+             _dup_chunk(8, "prose", "Section 4.1.8 The Sanitize command shall abort.", "cps"),
+             _dup_chunk(9, "prose", "Section 4.1.9 The Sanitize command shall abort.", "slm"),
+             _dup_chunk(1, "prose", "A totally different paragraph about zones.", "zns")]
+    _, used = assemble_context("q", prose)
+    assert [u["id"] for u in used] == ["zns:7", "zns:1"]
+
+    # _body_signature blanks numbers, but in a register table the numbers ARE
+    # the content, so tables must be exempt.
+    tables = [_dup_chunk(1, "table", "Offset 20h: NSSR", "base"),
+              _dup_chunk(2, "table", "Offset 28h: ASQ", "base")]
+    _, used_t = assemble_context("q", tables)
+    assert len(used_t) == 2
+
+
+class _FakeLookupResult:
+    def __init__(self, sources, fields, entities=()):
+        self.sources = sources
+        self.fields = fields
+        self.entities = list(entities)
+        self.tables = []
+        self.found = True
+
+
+def test_drop_colliding_figures():
+    from src.pipeline.orchestrator import _drop_colliding_figures
+    ents = [{"kind": "figure", "text": "Figure 45"}]
+    per_spec = [
+        # anchored: a matched field points at the figure, so the corpus is confirmed
+        ("base", _FakeLookupResult([{"figure_number": "45"}], [{"parent_figure": "45"}], ents)),
+        ("pcie", _FakeLookupResult([{"figure_number": "45"}], [], ents)),
+        ("mi", _FakeLookupResult([{"figure_number": "45"}], [], ents)),
+    ]
+    _drop_colliding_figures(per_spec)
+    assert len(per_spec[0][1].sources) == 1
+    assert per_spec[1][1].sources == [] and per_spec[2][1].sources == []
+    assert per_spec[1][1].found is False
+
+    # Claimed by exactly one corpus there is no ambiguity to resolve.
+    solo = [("base", _FakeLookupResult([{"figure_number": "300"}], [],
+                                       [{"kind": "figure", "text": "Figure 300"}])),
+            ("pcie", _FakeLookupResult([], [], []))]
+    _drop_colliding_figures(solo)
+    assert len(solo[0][1].sources) == 1
+
+
+def test_assemble_context_labels_specs_only_when_mixed():
+    from src.pipeline.generator import assemble_context, _extract_citations
+
+    def chunk(spec, doc, body):
+        return {"id": f"{spec}:4.1.7", "section_id": "4.1.7",
+                "section_title": "Sanitize command", "content_type": "prose",
+                "text_raw": body, "spec": spec, "spec_document": doc}
+
+    # Row 13 of the batch output: one header naming three unrelated sections.
+    mixed = [chunk("zns", "NVM Express Zoned Namespace Command Set Specification",
+                   "Sanitize shall transition all zones to the Empty state."),
+             chunk("kv", "NVM Express Key Value Command Set Specification",
+                   "Sanitize shall delete all key value pairs in the namespace."),
+             chunk("command", "NVM Express NVM Command Set Specification",
+                   "Sanitize operates as defined in the Base Specification.")]
+    ctx, used = assemble_context("q", mixed)
+    assert len(used) == 3
+    assert ctx.count("[Section 4.1.7] Sanitize command") == 3
+    assert all(f"<{s}>" in ctx for s in ("ZNS", "KV", "COMMAND"))
+    assert ctx.startswith("Sources below are drawn from several specifications")
+    # Legend names every corpus that survived admission, and only those.
+    assert "NVM Express Key Value Command Set Specification" in ctx
+
+    # Single-spec runs are the interactive default and must be untouched.
+    solo, _ = assemble_context("q", mixed[:1])
+    assert not solo.startswith("Sources below")
+    assert "<ZNS>" in solo
+
+    # The bracket tag the model copies is unchanged, so citations still parse.
+    cite = _extract_citations("Per [Section 4.1.7] it aborts.", used)[0]
+    assert cite["section_id"] == "4.1.7"
+    assert cite["hallucinated"] is False
