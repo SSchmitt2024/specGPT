@@ -198,7 +198,8 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     """Response from /api/query endpoint."""
     query: str
-    answer: str
+    # None only for tiered context-only runs (batch context harvesting).
+    answer: str | None
     citations: list[dict]
     config: dict
     pipeline_trace: list[dict] | None = None
@@ -217,6 +218,11 @@ class QueryResponse(BaseModel):
     # spec PDF at that figure. Each: {figure_number, spec, pdf_pages, caption,
     # section_id}. Only figures we have a page for are included.
     figures: list[dict] = []
+    # Tiered context-only runs (gap_mode="tiered", context_only=True): the
+    # assembled context string and its scored source metadata.
+    context: str | None = None
+    sources: list[dict] | None = None
+    gap_analysis: dict | None = None
 
 
 class FlagAnswerRequest(BaseModel):
@@ -998,10 +1004,13 @@ async def query_endpoint(
         )
     latency_ms = (time.time() - start) * 1000
 
+    context_only = result.get("answer") is None
+
     # Cache first-pass state so /api/refine can resume without redoing
     # Stages 1-4. Only meaningful when the request landed in non-agentic
     # mode (agentic queries already ran the loop and have nothing to resume).
-    if not req.agentic:
+    # Context-only tiered runs have no answer to refine.
+    if not req.agentic and not context_only:
         _refine_cache_set(request_id, {
             "query": result["query"],
             "deduplicated": result.get("deduplicated") or [],
@@ -1025,9 +1034,14 @@ async def query_endpoint(
         gap_hint=result.get("gap_hint"),
         figures=_figures_from_sources(result),
         request_id=request_id if not req.agentic else None,
+        context=result.get("context"),
+        sources=result.get("sources") if context_only else None,
+        gap_analysis=result.get("gap_analysis"),
     )
     turn_index = _conversation_append(req.conversation_id, result)
-    _schedule_qa_log(resp, request_id, req.conversation_id, turn_index)
+    # Context-only runs produce no answer; qa_log rows assume one.
+    if not context_only:
+        _schedule_qa_log(resp, request_id, req.conversation_id, turn_index)
     return resp
 
 
@@ -3015,6 +3029,7 @@ a { color: var(--accent); text-decoration: none; }
                             <option value="">Answers only</option>
                             <option value="sft">SFT</option>
                             <option value="raft">SFT RAFT</option>
+                            <option value="context">Context only</option>
                         </select>
                         <select id="batch-concurrency" title="How many questions to run in parallel">
                             <option value="1">1 at a time</option>
@@ -3029,7 +3044,7 @@ a { color: var(--accent); text-decoration: none; }
                         <button class="dev-btn" id="batch-cancel" type="button" hidden>Cancel</button>
                         <button class="dev-btn" id="batch-download" type="button" hidden>Download results</button>
                     </div>
-                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset. Results are <b>checkpointed to the browser as they finish</b>, so a refresh, crash, or closed tab won't lose completed work &mdash; reopen this tab to recover or resume. Raise the parallelism to run faster (the server rate limit still applies; the runner backs off automatically if it's hit). <b>Answers only</b> downloads question/answer JSON; <b>SFT</b> / <b>SFT RAFT</b> download a ShareGPT <code>.jsonl</code> where each record carries the injected context (SFT: cited sections only; RAFT: plus shuffled distractors).</p>
+                    <p class="batch-hint">Upload JSON containing objects with a "question" field &mdash; a top-level array (<code>[{"question": "..."}]</code>), a wrapper object (<code>{"questions": [...]}</code>), a single object, or a bare array of strings all work. Each question runs through the pipeline on the Thorough preset. Results are <b>checkpointed to the browser as they finish</b>, so a refresh, crash, or closed tab won't lose completed work &mdash; reopen this tab to recover or resume. Raise the parallelism to run faster (the server rate limit still applies; the runner backs off automatically if it's hit). <b>Answers only</b> downloads question/answer JSON; <b>SFT</b> / <b>SFT RAFT</b> download a ShareGPT <code>.jsonl</code> where each record carries the injected context (SFT: cited sections only; RAFT: plus shuffled distractors). <b>Context only</b> skips generation entirely: three-tier gap analysis (deterministic cross-refs, score checks, constrained JSON judge) assembles the context, and the download is a <code>.jsonl</code> of question + context + scored sources.</p>
                     <div class="batch-recover" id="batch-recover" hidden>
                         <span class="batch-recover-text" id="batch-recover-text"></span>
                         <span class="batch-recover-actions">
@@ -7269,6 +7284,13 @@ a { color: var(--accent); text-decoration: none; }
             if (modelSelect) populateModelSelect(modelSelect, "agentic", {
                 include: function (m) { return m.id === "deepthought-llama-3.3-70b"; },
             });
+            // Context-only runs never generate, so the model picker is moot.
+            function syncBatchModelVisibility() {
+                if (modelSelect) modelSelect.style.display =
+                    (formatSelect && formatSelect.value === "context") ? "none" : "";
+            }
+            if (formatSelect) formatSelect.addEventListener("change", syncBatchModelVisibility);
+            syncBatchModelVisibility();
 
             // Per-question fetch cap: a single wedged /api/query aborts and
             // retries instead of hanging the whole run forever.
@@ -7592,11 +7614,18 @@ a { color: var(--accent); text-decoration: none; }
                     retryNote = "";
                     var secs = Math.round((Date.now() - t0) / 1000);
                     row = { idx: i, question: q, answer: data.answer, secs: secs };
-                    if (fmt) {
-                        try { row.record = await fetchRecord(data, fmt, config.spec); }
-                        catch (re) { row.record = null; row.record_error = re.message; }
+                    if (fmt === "context") {
+                        row.context = data.context || "";
+                        row.sources = data.sources || [];
+                        row.gap = data.gap_analysis || null;
+                        card.ok("[context] " + row.sources.length + " sources, " + row.context.length + " chars", secs);
+                    } else {
+                        if (fmt) {
+                            try { row.record = await fetchRecord(data, fmt, config.spec); }
+                            catch (re) { row.record = null; row.record_error = re.message; }
+                        }
+                        card.ok(data.answer, secs, row.record_error);
                     }
-                    card.ok(data.answer, secs, row.record_error);
                 } catch (err) {
                     runningCount--;
                     if (cancelled) { card.fail("cancelled"); return; }   // leave for resume; don't checkpoint
@@ -7686,6 +7715,12 @@ a { color: var(--accent); text-decoration: none; }
                 var fmt = formatSelect ? formatSelect.value : "";
                 var config = Object.assign({}, thorough || {}, { spec: window.getSelectedSpec() });
                 if (model) { config.llm_model = model; config.agentic_model = model; }
+                if (fmt === "context") {
+                    // Three-tier gap analysis, no generation: the response is
+                    // the assembled context + scored sources.
+                    config.gap_mode = "tiered";
+                    config.context_only = true;
+                }
                 concurrency = parseInt((concSelect && concSelect.value) || "4", 10) || 4;
                 var fileName = (fileInput.files && fileInput.files[0] && fileInput.files[0].name) || "batch";
 
@@ -7719,7 +7754,18 @@ a { color: var(--accent); text-decoration: none; }
                 rows.sort(function (a, b) { return (a.idx || 0) - (b.idx || 0); });
                 var fmt = meta ? (meta.fmt || "") : (formatSelect ? formatSelect.value : "");
                 var blob, name;
-                if (fmt) {
+                if (fmt === "context") {
+                    // One {question, context, sources, gap_analysis} per line.
+                    var ctxLines = rows.map(function (r) {
+                        var o = { question: r.question, context: r.context || "", sources: r.sources || [] };
+                        if (r.gap) o.gap_analysis = r.gap;
+                        if (r.error) o.error = r.error;
+                        return JSON.stringify(o);
+                    });
+                    blob = new Blob([ctxLines.join("\\n") + (ctxLines.length ? "\\n" : "")], { type: "application/jsonl" });
+                    name = "batch_context.jsonl";
+                    setStatus("Downloaded " + rows.length + " context record(s).");
+                } else if (fmt) {
                     // ShareGPT .jsonl (one record per line), ready for Unsloth.
                     var withRec = rows.filter(function (r) { return r.record; });
                     var lines = withRec.map(function (r) { return JSON.stringify(r.record); });

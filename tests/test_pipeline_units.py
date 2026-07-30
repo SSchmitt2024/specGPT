@@ -1732,3 +1732,254 @@ def test_frontend_batch_mode_markup_and_escaping():
         assert f'id="{el}"' in html
     # the escaped quote in the status message must arrive as \" not \\"
     assert '\\"Answers only\\" always works.' in html
+
+
+# ---------------------------------------------------------------------------
+# three-tier gap analysis (gap_mode="tiered")
+
+def test_tiered_config_defaults_keep_live_pipeline_on_llm_path():
+    """gap_mode must default to "llm" so live queries never enter the tiered
+    loop; the tier-2 knobs exist with their shipped defaults."""
+    from src.pipeline.orchestrator import PipelineConfig
+
+    cfg = PipelineConfig()
+    assert cfg.gap_mode == "llm"
+    assert cfg.context_only is False
+    assert cfg.gap_model == "deepthought-qwen3-30b"
+    assert cfg.gap_score_sufficient == 0.6
+    assert cfg.gap_score_insufficient == 0.3
+    assert cfg.gap_min_strong == 2
+    assert cfg.xref_section_cap == 4
+
+
+def test_score_gap_check_bands():
+    from src.pipeline.gap_analysis import score_gap_check
+
+    strong = [{"rerank_score": 0.9}, {"rerank_score": 0.7}]
+    assert score_gap_check(strong)["decision"] == "sufficient"
+    # high top1 but only one strong chunk -> not enough agreement
+    assert score_gap_check([{"rerank_score": 0.9}])["decision"] == "ambiguous"
+    assert score_gap_check([{"rerank_score": 0.1}])["decision"] == "insufficient"
+    assert score_gap_check([{"rerank_score": 0.45}])["decision"] == "ambiguous"
+    # no scores at all (rerank API failure) must escalate, not pass blind
+    assert score_gap_check([])["decision"] == "ambiguous"
+    assert score_gap_check([{"rerank_score": None}])["decision"] == "ambiguous"
+
+
+def test_score_gap_check_structured_and_agreement_signals():
+    from src.pipeline.gap_analysis import score_gap_check
+
+    # structured HIGH hit converges even with middling rerank scores
+    out = score_gap_check(
+        [{"rerank_score": 0.4}],
+        structured_found=True, structured_confidence="HIGH",
+    )
+    assert out["decision"] == "sufficient"
+    # ...but not when retrieval found essentially nothing relevant
+    out = score_gap_check(
+        [{"rerank_score": 0.1}],
+        structured_found=True, structured_confidence="HIGH",
+    )
+    assert out["decision"] == "insufficient"
+    # multi-method agreement discounts the strong threshold slightly
+    agree = {"rerank_score": 0.57, "contributing_methods": ["vector", "bm25"]}
+    out = score_gap_check([{"rerank_score": 0.62}, agree])
+    assert out["strong_n"] == 2
+    assert out["decision"] == "sufficient"
+
+
+def test_expand_section_refs_strong_only_capped_and_tagged(monkeypatch):
+    from src.pipeline import gap_analysis
+
+    fetched = []
+
+    def fake_fetch(sid, top_k=3, spec=None):
+        fetched.append((sid, spec))
+        return [{"id": f"{sid}__c0", "section_id": sid, "text_raw": "body",
+                 "score": 1.0, "method": "section_fetch"}]
+
+    monkeypatch.setattr(gap_analysis.search, "fetch_section_chunks", fake_fetch)
+    pool = [
+        {"id": "1.1__c0", "section_id": "1.1",
+         # strong verb ("see") -> fetched; bare mention -> ignored
+         "text_raw": "see section 5.2.1 for details. Section 9.9.9 is big."},
+        {"id": "2.2__c0", "section_id": "2.2",
+         "text_raw": "as defined in section 5.2.1 and see section 7.3.4."},
+    ]
+    attempted: set = set()
+    out = gap_analysis.expand_section_refs(pool, spec="base", cap=1, attempted=attempted)
+
+    # cap=1 keeps only the most-referenced section (5.2.1, referenced twice)
+    assert [c["section_id"] for c in out] == ["5.2.1"]
+    assert out[0]["method"] == "xref_section_fetch"
+    assert fetched == [("5.2.1", "base")]
+    assert ("xref_section", "5.2.1") in attempted
+    # a second round doesn't refetch 5.2.1 but picks up the cap-dropped 7.3.4
+    out2 = gap_analysis.expand_section_refs(pool, spec="base", cap=1, attempted=attempted)
+    assert [c["section_id"] for c in out2] == ["7.3.4"]
+    # once everything strong is attempted, further rounds fetch nothing
+    assert gap_analysis.expand_section_refs(pool, spec="base", cap=1, attempted=attempted) == []
+
+
+def test_expand_section_refs_skips_sections_already_in_pool(monkeypatch):
+    from src.pipeline import gap_analysis
+
+    monkeypatch.setattr(
+        gap_analysis.search, "fetch_section_chunks",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fetch")),
+    )
+    pool = [
+        {"id": "1.1__c0", "section_id": "1.1", "text_raw": "see section 5.2.1"},
+        {"id": "5.2.1__c0", "section_id": "5.2.1", "text_raw": "the target itself"},
+    ]
+    assert gap_analysis.expand_section_refs(pool, spec="base") == []
+
+
+def test_judge_json_parse_tolerance():
+    from src.pipeline.gap_analysis import _parse_judge_json
+
+    ok = _parse_judge_json('{"sufficient": true, "missing": []}')
+    assert ok == {"sufficient": True, "missing": []}
+    # Qwen3 <think> leak must not corrupt parsing
+    ok = _parse_judge_json('<think>reasoning...</think>{"sufficient": false, "missing": ["5.2.1", "Figure 12"]}')
+    assert ok == {"sufficient": False, "missing": ["5.2.1", "Figure 12"]}
+    # malformed / non-object / missing key -> None (caller retries then defaults)
+    assert _parse_judge_json("no json here") is None
+    assert _parse_judge_json('{"sufficient": broken}') is None
+    assert _parse_judge_json('[1, 2]') is None
+    assert _parse_judge_json('{"missing": []}') is None
+    # missing list is deduped, stringified, capped at 5
+    ok = _parse_judge_json('{"sufficient": false, "missing": ["a","a",1,2,3,4,5]}')
+    assert ok["missing"] == ["a", "1", "2", "3", "4"]
+
+
+def test_constrained_gap_check_fails_toward_insufficient(monkeypatch):
+    from src.pipeline import gap_analysis
+
+    calls = {"n": 0}
+
+    def bad_judge(prompt, *, model, max_tokens=300):
+        calls["n"] += 1
+        return "utter garbage, no json", {"prompt": 10, "completion": 5}
+
+    monkeypatch.setattr(gap_analysis, "_judge_call", bad_judge)
+    verdict, llm_call = gap_analysis.constrained_gap_check("q", [])
+    # one retry, then fail toward "fetch more", never a hallucinated pass
+    assert calls["n"] == 2
+    assert verdict == {"sufficient": False, "missing": []}
+    assert llm_call is not None and llm_call["stage"] == "tiered_judge"
+
+
+def test_constrained_gap_check_success(monkeypatch):
+    from src.pipeline import gap_analysis
+
+    def good_judge(prompt, *, model, max_tokens=300):
+        assert "Question:" in prompt
+        return '{"sufficient": false, "missing": ["8.1.6"]}', {"prompt": 50, "completion": 12}
+
+    monkeypatch.setattr(gap_analysis, "_judge_call", good_judge)
+    verdict, llm_call = gap_analysis.constrained_gap_check(
+        "q", [{"section_id": "1.1", "section_title": "Intro", "text_raw": "text"}])
+    assert verdict == {"sufficient": False, "missing": ["8.1.6"]}
+    assert llm_call["prompt"] == 50
+
+
+def test_tiered_loop_context_only_never_generates(monkeypatch):
+    """gap_mode=tiered + context_only: zero generator.generate calls, answer
+    is None, and the assembled context + scored sources come back."""
+    from src.pipeline import orchestrator
+    from src.pipeline.orchestrator import PipelineConfig
+
+    monkeypatch.setattr(
+        orchestrator.generator, "generate",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("generate() must not run")),
+    )
+    chunks = [
+        {"id": "1.1__c0", "section_id": "1.1", "section_title": "Intro",
+         "content_type": "prose", "text_raw": "Plain prose, no cross references.",
+         "rerank_score": 0.9},
+        {"id": "2.2__c0", "section_id": "2.2", "section_title": "Scope",
+         "content_type": "prose", "text_raw": "More prose without references.",
+         "rerank_score": 0.8},
+    ]
+    cfg = PipelineConfig(gap_mode="tiered", context_only=True, spec="base")
+    trace: list = []
+    result = orchestrator._run_tiered_context_loop(
+        query="what is the scope?", config=cfg, debug=True, trace=trace,
+        deduplicated=list(chunks), retrieved_chunks=list(chunks),
+        structured_found=False, structured_confidence=None, llm_calls=[],
+    )
+    assert result["answer"] is None
+    assert "Plain prose" in result["context"]
+    assert result["gap_analysis"]["converged"] is True
+    assert result["gap_analysis"]["score_check"]["decision"] == "sufficient"
+    # scores are forwarded onto the returned sources for later calibration
+    assert result["sources"][0]["rerank_score"] == 0.9
+    stages = [s.stage for s in trace]
+    assert "tiered.xref" in stages
+    assert any(s.startswith("tiered.score_check") for s in stages)
+    # sufficient scores mean the tier-3 judge is never consulted
+    assert not any(s.startswith("tiered.judge") for s in stages)
+
+
+def test_tiered_loop_escalates_fetches_then_converges(monkeypatch):
+    """Ambiguous scores escalate to the tier-3 judge; its missing list drives
+    a targeted fetch; the second round's judge verdict converges the loop."""
+    from src.pipeline import orchestrator
+    from src.pipeline.orchestrator import PipelineConfig
+
+    monkeypatch.setattr(
+        orchestrator.generator, "generate",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("generate() must not run")),
+    )
+    judge_verdicts = iter([
+        ({"sufficient": False, "missing": ["9.9.9"]}, {"stage": "tiered_judge", "model": "m", "prompt": 40, "completion": 10}),
+        ({"sufficient": True, "missing": []}, {"stage": "tiered_judge", "model": "m", "prompt": 45, "completion": 8}),
+    ])
+    monkeypatch.setattr(
+        orchestrator.gap_analysis, "constrained_gap_check",
+        lambda q, pool, model: next(judge_verdicts),
+    )
+    fetched_requests = []
+
+    def fake_resolve(requests, spec=None):
+        fetched_requests.append(requests)
+        return [{"id": "9.9.9__c0", "section_id": "9.9.9", "section_title": "Target",
+                 "content_type": "prose", "text_raw": "the missing section",
+                 "score": 1.0, "method": "agentic_fetch_section"}]
+
+    monkeypatch.setattr(orchestrator, "_resolve_requested_resources", fake_resolve)
+    monkeypatch.setattr(
+        orchestrator.reranker, "rerank",
+        lambda query, pool, top_k=None, model_name=None, text_field=None: list(pool),
+    )
+    chunks = [{"id": "1.1__c0", "section_id": "1.1", "section_title": "Intro",
+               "content_type": "prose", "text_raw": "Ambiguously related prose.",
+               "rerank_score": 0.45}]
+    cfg = PipelineConfig(gap_mode="tiered", context_only=True, spec="base")
+    trace: list = []
+    llm_calls: list = []
+    result = orchestrator._run_tiered_context_loop(
+        query="q", config=cfg, debug=False, trace=trace,
+        deduplicated=list(chunks), retrieved_chunks=list(chunks),
+        structured_found=False, structured_confidence=None, llm_calls=llm_calls,
+    )
+    assert result["answer"] is None
+    assert fetched_requests and fetched_requests[0]["sections"] == ["9.9.9"]
+    assert result["gap_analysis"]["converged"] is True
+    assert result["gap_analysis"]["iterations_run"] == 2
+    # both judge calls are accounted for in the cost breakdown
+    assert len(llm_calls) == 2
+    # the fetched section made it into the assembled context
+    assert "the missing section" in result["context"]
+
+
+def test_frontend_batch_context_mode_markup():
+    """Batch dev panel: the context-only format option and its tiered config
+    wiring are present in the embedded frontend."""
+    from src.pipeline.app import FRONTEND_HTML as html
+
+    assert 'value="context"' in html
+    assert "batch_context.jsonl" in html
+    assert 'config.gap_mode = "tiered"' in html
+    assert "config.context_only = true" in html

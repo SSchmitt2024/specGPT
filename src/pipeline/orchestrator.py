@@ -37,6 +37,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from src.pipeline import query_processor, retriever, search, reranker, generator, table_serializer
+from src.pipeline import gap_analysis
 from src.pipeline.query_processor import QueryDecomposition
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,23 @@ class PipelineConfig:
     # is asking for more context. Has no effect when agentic mode is on
     # (the agentic loop is the gap analyser).
     auto_gap_check: bool = True
+
+    # Three-tier gap analysis (batch context assembly). gap_mode="tiered"
+    # replaces the LLM verdict loop with: deterministic cross-ref expansion
+    # (tier 1), score-based sufficiency (tier 2), and a small model constrained
+    # to JSON output consulted only when scores can't decide (tier 3). The live
+    # UI keeps gap_mode="llm"; only batch context runs flip this.
+    gap_mode: str = "llm"  # "llm" | "tiered"
+    # When True (tiered only), skip generation entirely: the response carries
+    # the assembled context string + scored sources and answer=None.
+    context_only: bool = False
+    gap_model: str = "deepthought-qwen3-30b"
+    # Tier-2 bands on the top rerank_score (Voyage, normalized 0-1). Defaults
+    # are uncalibrated starting points; tune from batch pipeline_traces.
+    gap_score_sufficient: float = 0.6
+    gap_score_insufficient: float = 0.3
+    gap_min_strong: int = 2   # chunks >= sufficient threshold needed to converge
+    xref_section_cap: int = 4  # tier-1 section fetches per round
 
     # Test-plan priming: on the first query of a conversation bound to a
     # UNH-IOL conformance test, run an agentic pre-retrieval (plan → hybrid
@@ -1976,6 +1994,363 @@ def _run_stage5_and_finalize(
     }
 
 
+def _run_tiered_context_loop(
+    *,
+    query: str,
+    config: PipelineConfig,
+    debug: bool,
+    trace: list,
+    deduplicated: list[dict],
+    retrieved_chunks: list[dict],
+    structured_found: bool,
+    structured_confidence: str | None,
+    llm_calls: list[dict],
+    history: dict | None = None,
+    test_context: dict | None = None,
+) -> dict:
+    """Three-tier gap analysis (gap_mode="tiered"): assemble context WITHOUT
+    generating inside the loop.
+
+    Tier 1: deterministic cross-reference expansion (gap_analysis.expand_
+    section_refs + the existing figure expansion, no LLM). Tier 2: score-based
+    sufficiency from rerank scores (gap_analysis.score_gap_check, no LLM).
+    Tier 3: a small model constrained to JSON output, consulted only when
+    Tier 2 says "ambiguous" (is it sufficient?) or "insufficient" (scores know
+    more is needed but not WHAT to fetch).
+
+    With config.context_only the response carries the assembled context string
+    and scored sources with answer=None (batch context harvesting); otherwise
+    a single generation with config.llm_model runs after assembly converges.
+    The live agentic verdict loop (_run_stage5_and_finalize) is unaffected.
+    """
+    expanded_pool: list[dict] = list(deduplicated)
+    ranked: list[dict] = list(retrieved_chunks)
+    attempted: set[tuple[str, str]] = set()
+    max_iters = min(max(1, config.agentic_max_iterations), _AGENTIC_HARD_CAP)
+    converged = False
+    iterations_run = 0
+    last_check: dict = {}
+    judge_verdict: dict | None = None
+
+    def _merge_and_rerank(new_chunks: list[dict], stage: str) -> None:
+        nonlocal expanded_pool, ranked
+        before = len(expanded_pool)
+        expanded_pool = _merge_agentic_pool(expanded_pool, new_chunks)
+        start = time.time()
+        ranked_all = reranker.rerank(
+            query,
+            expanded_pool,
+            top_k=None,
+            model_name=config.cross_encoder_model,
+            text_field="text_raw",
+        )
+        ranked = _pin_structured_hits(
+            ranked_all, expanded_pool, budget=config.agentic_rerank_topk
+        )
+        trace.append(
+            PipelineStage(
+                stage=stage,
+                input={"pool_count": len(expanded_pool),
+                       "merged_new": len(expanded_pool) - before},
+                output={"results": _result_summary(ranked), "count": len(ranked)},
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
+
+    # Tier 1 up front on the initial ranked context. Figures were already
+    # expanded deterministically by _expand_referenced_figures in orchestrate().
+    start = time.time()
+    xrefs = gap_analysis.expand_section_refs(
+        ranked, spec=config.spec, cap=config.xref_section_cap, attempted=attempted
+    )
+    trace.append(
+        PipelineStage(
+            stage="tiered.xref",
+            input={"context_count": len(ranked), "cap": config.xref_section_cap},
+            output={"added_count": len(xrefs),
+                    "added": [{"id": c.get("id"), "section_id": c.get("section_id")}
+                              for c in xrefs]},
+            took_ms=(time.time() - start) * 1000,
+        )
+    )
+    if xrefs:
+        _merge_and_rerank(xrefs, "tiered.rerank.init")
+
+    for iteration in range(max_iters):
+        iterations_run = iteration + 1
+        suffix = f".iter{iteration}" if max_iters > 1 else ""
+
+        # Tier 2: pure score check, no I/O.
+        start = time.time()
+        check = gap_analysis.score_gap_check(
+            ranked,
+            structured_found=structured_found,
+            structured_confidence=structured_confidence,
+            sufficient_threshold=config.gap_score_sufficient,
+            insufficient_threshold=config.gap_score_insufficient,
+            min_strong=config.gap_min_strong,
+        )
+        last_check = check
+        trace.append(
+            PipelineStage(
+                stage=f"tiered.score_check{suffix}",
+                input={"context_count": len(ranked)},
+                output=check,
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
+        if check["decision"] == "sufficient":
+            converged = True
+            break
+
+        # Tier 3: constrained-JSON judge. VPN-down (DeepThoughtUnreachable)
+        # propagates so a broken batch run fails loudly instead of silently
+        # skipping gap analysis for hours.
+        start = time.time()
+        try:
+            judge_verdict, judge_call = gap_analysis.constrained_gap_check(
+                query, ranked, model=config.gap_model
+            )
+        except generator.DeepThoughtUnreachableError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.exception("tiered judge failed: %s", e)
+            judge_verdict, judge_call = {"sufficient": False, "missing": []}, None
+        if judge_call:
+            llm_calls.append(judge_call)
+        trace.append(
+            PipelineStage(
+                stage=f"tiered.judge{suffix}",
+                input={"model": config.gap_model,
+                       "score_decision": check["decision"]},
+                output=judge_verdict,
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
+        if judge_verdict.get("sufficient"):
+            converged = True
+            break
+
+        # Split the judge's missing list into direct-fetchable resources
+        # (section ids / figure numbers, via the existing verdict parser) and
+        # free-text follow-up search phrases. attempted blacklist prevents
+        # refetch loops, same pattern as the agentic loop.
+        requests: dict[str, list[str]] = {"figures": [], "fields": [], "sections": []}
+        followups: list[str] = []
+        for item in judge_verdict.get("missing") or []:
+            item_res = _resources_from_missing(item)
+            if item_res["figures"] or item_res["sections"]:
+                for kind in ("figures", "sections"):
+                    for v in item_res[kind]:
+                        if (kind, v) not in attempted and v not in requests[kind]:
+                            requests[kind].append(v)
+            else:
+                fq = item.strip()
+                if fq and ("query", fq.lower()) not in attempted:
+                    followups.append(fq)
+        followups = followups[: config.agentic_max_followups]
+        attempted.update(("query", fq.lower()) for fq in followups)
+        for kind in ("figures", "sections"):
+            attempted.update((kind, v) for v in requests[kind])
+
+        if not any(requests.values()) and not followups:
+            trace.append(
+                PipelineStage(
+                    stage=f"tiered.stalled{suffix}",
+                    input={"missing": judge_verdict.get("missing") or []},
+                    output={"note": "no new fetchable resources; keeping assembled context"},
+                    took_ms=0.0,
+                )
+            )
+            break
+
+        start = time.time()
+        new_chunks: list[dict] = []
+        try:
+            new_chunks.extend(_resolve_requested_resources(requests, spec=config.spec))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("tiered targeted fetch failed: %s", e)
+        for fq in followups:
+            try:
+                hits, _fq_trace = hybrid_search(fq, sub_queries=[fq], config=config)
+                new_chunks.extend(hits)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("tiered follow-up search failed (%s): %s", fq, e)
+        # Tier 1 again on what was just fetched (new sections may themselves
+        # strongly reference further sections).
+        new_chunks.extend(
+            gap_analysis.expand_section_refs(
+                new_chunks, spec=config.spec,
+                cap=config.xref_section_cap, attempted=attempted,
+            )
+        )
+        trace.append(
+            PipelineStage(
+                stage=f"tiered.fetch{suffix}",
+                input={"requested": requests, "followups": followups},
+                output={"added_count": len(new_chunks),
+                        "added": [{"id": c.get("id"), "method": c.get("method")}
+                                  for c in new_chunks[:10]]},
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
+
+        # Stall guard: everything fetched is already in the pool.
+        existing_ids = {c.get("id") or c.get("chunk_id") for c in expanded_pool}
+        if all((c.get("id") or c.get("chunk_id")) in existing_ids for c in new_chunks):
+            trace.append(
+                PipelineStage(
+                    stage=f"tiered.stalled{suffix}",
+                    input={},
+                    output={"note": "fetches returned nothing not already in the pool"},
+                    took_ms=0.0,
+                )
+            )
+            break
+
+        _merge_and_rerank(new_chunks, f"tiered.rerank{suffix}")
+
+    if not converged and iterations_run >= max_iters:
+        trace.append(
+            PipelineStage(
+                stage="tiered.cap_reached",
+                input={"max_iterations": max_iters},
+                output={"iterations_run": iterations_run,
+                        "last_score_check": last_check},
+                took_ms=0.0,
+            )
+        )
+
+    # Final assembly. No LLM involved; same budgets the agentic regenerate used.
+    start = time.time()
+    context_str, used_chunks = generator.assemble_context(
+        query,
+        ranked,
+        max_context_tokens=config.agentic_max_context_tokens,
+        figure_reserve_tokens=config.figure_reserve_tokens,
+        pinned_chunks=(history or {}).get("pinned_chunks") or None,
+    )
+    # assemble_context strips retrieval metadata from used_chunks; forward the
+    # scores + provenance so batch output (and traces) can be calibrated later.
+    # Structured-lookup synthetic chunks carry no "id"; match those by
+    # figure_number + title instead.
+    by_id = {c.get("id"): c for c in ranked if c.get("id")}
+    by_fig = {(str(c.get("figure_number") or ""), c.get("section_title") or ""): c
+              for c in ranked if not c.get("id")}
+    for u in used_chunks:
+        src = by_id.get(u.get("id")) or by_fig.get(
+            (str(u.get("figure_number") or ""), u.get("section_title") or ""))
+        if src:
+            u["rerank_score"] = src.get("rerank_score")
+            u["method"] = src.get("method") or src.get("prior_method")
+    trace.append(
+        PipelineStage(
+            stage="tiered.assemble",
+            input={"chunk_count": len(ranked),
+                   "max_context_tokens": config.agentic_max_context_tokens},
+            output={"used_count": len(used_chunks),
+                    "context_chars": len(context_str)},
+            took_ms=(time.time() - start) * 1000,
+        )
+    )
+
+    tiered_meta = {
+        "mode": "tiered",
+        "iterations_run": iterations_run,
+        "converged": converged,
+        "score_check": last_check,
+        "judge": judge_verdict,
+    }
+
+    if config.context_only:
+        return {
+            "query": query,
+            "answer": None,
+            "citations": [],
+            "context": context_str,
+            "sources": used_chunks,
+            "deduplicated": expanded_pool,
+            "config": config.to_dict(),
+            "agentic": False,
+            "gap_hint": None,
+            "gap_analysis": tiered_meta,
+            "tokens_used": _aggregate_tokens(llm_calls, None) or {},
+            "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
+        }
+
+    # Single final generation after context assembly is complete.
+    start = time.time()
+    try:
+        answer, citations, context_used, tokens_used, _verdict = generator.generate(
+            query,
+            ranked,
+            model=config.llm_model,
+            max_context_tokens=config.agentic_max_context_tokens,
+            figure_reserve_tokens=config.figure_reserve_tokens,
+            max_tokens=config.llm_max_output_tokens,
+            emit_verdict=False,
+            history=(history or {}).get("turns") or None,
+            pinned_chunks=(history or {}).get("pinned_chunks") or None,
+            test_context=test_context,
+        )
+    except Exception as e:
+        logger.exception("tiered final generation failed: %s", e)
+        trace.append(
+            PipelineStage(
+                stage="tiered.generation",
+                input={"query": query, "chunk_count": len(ranked),
+                       "model": config.llm_model},
+                output={"error_type": type(e).__name__},
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
+        raise GenerationError(
+            f"Generation failed: {type(e).__name__}",
+            cause=e,
+            trace=[s.to_dict() for s in trace],
+            retrieved_chunks=ranked,
+        ) from e
+
+    final_call: dict | None = None
+    if isinstance(tokens_used, dict):
+        final_call = {
+            "stage": "generation",
+            "model": config.llm_model,
+            "prompt": int(tokens_used.get("prompt", 0) or 0),
+            "completion": int(tokens_used.get("completion", 0) or 0),
+            "stop_reason": tokens_used.get("stop_reason"),
+        }
+        llm_calls.append(final_call)
+        tokens_used.setdefault("model", config.llm_model)
+    trace.append(
+        PipelineStage(
+            stage="tiered.generation",
+            input={"query": query, "chunk_count": len(ranked),
+                   "model": config.llm_model},
+            output={"answer_length": len(answer),
+                    "citation_count": len(citations),
+                    "tokens": tokens_used},
+            took_ms=(time.time() - start) * 1000,
+        )
+    )
+
+    _backfill_citation_pages(citations, config.spec)
+
+    return {
+        "query": query,
+        "answer": answer,
+        "citations": citations,
+        "sources": context_used,
+        "deduplicated": expanded_pool,
+        "config": config.to_dict(),
+        "agentic": False,
+        "gap_hint": None,
+        "gap_analysis": tiered_meta,
+        "tokens_used": _aggregate_tokens(llm_calls, final_call) or tokens_used,
+        "pipeline_trace": [s.to_dict() for s in trace] if debug else [],
+    }
+
+
 def orchestrate(
     query: str,
     *,
@@ -2361,6 +2736,32 @@ def orchestrate(
                         ]},
                 took_ms=(time.time() - start) * 1000,
             )
+        )
+
+    # -------------------------------------------------------------------------
+    # Tiered gap analysis (gap_mode="tiered"): three-tier context assembly with
+    # no generation inside the loop. Replaces Stage 4 + the agentic verdict
+    # loop for batch runs; the "llm" path below is untouched.
+    # -------------------------------------------------------------------------
+    if config.gap_mode == "tiered":
+        structured_found = False
+        structured_confidence = None
+        for st in trace:
+            if getattr(st, "stage", "") == "structured_lookup":
+                structured_found = bool((st.output or {}).get("found"))
+                structured_confidence = (st.output or {}).get("confidence")
+        return _run_tiered_context_loop(
+            query=query,
+            config=config,
+            debug=debug,
+            trace=trace,
+            deduplicated=deduplicated,
+            retrieved_chunks=retrieved_chunks,
+            structured_found=structured_found,
+            structured_confidence=structured_confidence,
+            llm_calls=llm_calls,
+            history=history,
+            test_context=test_context,
         )
 
     # -------------------------------------------------------------------------
