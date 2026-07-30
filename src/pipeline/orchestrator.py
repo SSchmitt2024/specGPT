@@ -2093,6 +2093,11 @@ def _run_tiered_context_loop(
             insufficient_threshold=config.gap_score_insufficient,
             min_strong=config.gap_min_strong,
         )
+        # Tier 2.5: deterministic entity-coverage veto. Neither scores nor the
+        # judge may declare sufficiency while a multi-word entity named in the
+        # question is absent from the pool text (observed judge failure mode).
+        absent_entities = gap_analysis.absent_question_entities(query, expanded_pool)
+        check = {**check, "absent_entities": absent_entities}
         last_check = check
         trace.append(
             PipelineStage(
@@ -2102,7 +2107,7 @@ def _run_tiered_context_loop(
                 took_ms=(time.time() - start) * 1000,
             )
         )
-        if check["decision"] == "sufficient":
+        if check["decision"] == "sufficient" and not absent_entities:
             converged = True
             break
 
@@ -2130,21 +2135,33 @@ def _run_tiered_context_loop(
                 took_ms=(time.time() - start) * 1000,
             )
         )
-        if judge_verdict.get("sufficient"):
+        if judge_verdict.get("sufficient") and not absent_entities:
             converged = True
             break
 
         # Split the judge's missing list into direct-fetchable resources
         # (section ids / figure numbers, via the existing verdict parser) and
-        # free-text follow-up search phrases. attempted blacklist prevents
-        # refetch loops, same pattern as the agentic loop.
+        # free-text follow-up search phrases. Resources already in the pool are
+        # dropped (judges sometimes re-request what they can see); the
+        # attempted blacklist prevents refetch loops, same as the agentic loop.
+        present_sections = {str(c.get("section_id") or "") for c in expanded_pool}
+        present_figures = {str(c.get("figure_number") or "").lstrip("0")
+                           for c in expanded_pool if c.get("figure_number")}
         requests: dict[str, list[str]] = {"figures": [], "fields": [], "sections": []}
         followups: list[str] = []
+        # Absent question entities are the highest-priority follow-up fetches.
+        for ent in absent_entities:
+            if ("query", ent.lower()) not in attempted:
+                followups.append(ent)
         for item in judge_verdict.get("missing") or []:
             item_res = _resources_from_missing(item)
             if item_res["figures"] or item_res["sections"]:
                 for kind in ("figures", "sections"):
                     for v in item_res[kind]:
+                        if kind == "sections" and v in present_sections:
+                            continue
+                        if kind == "figures" and v.lstrip("0") in present_figures:
+                            continue
                         if (kind, v) not in attempted and v not in requests[kind]:
                             requests[kind].append(v)
             else:
@@ -2263,6 +2280,9 @@ def _run_tiered_context_loop(
         "converged": converged,
         "score_check": last_check,
         "judge": judge_verdict,
+        # Question entities still absent from the final pool: a non-empty list
+        # with converged=False usually means the material is out of corpus.
+        "absent_entities": gap_analysis.absent_question_entities(query, expanded_pool),
     }
 
     if config.context_only:

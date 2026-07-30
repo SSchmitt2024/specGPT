@@ -162,20 +162,33 @@ def score_gap_check(
 # -----------------------------------------------------------------------------
 
 _GAP_JUDGE_SYSTEM = (
-    "You judge whether retrieved hardware-spec excerpts contain enough "
-    "information to answer a question. Respond with ONLY a JSON object, no "
-    "prose, no markdown fences:\n"
+    "You judge whether the provided hardware-spec excerpts contain enough "
+    "information to answer a question. The excerpts shown are ALREADY in the "
+    "context; never request them again.\n"
+    "Respond with ONLY a JSON object, no prose, no markdown fences:\n"
     '{"sufficient": true|false, "missing": ["<item>", ...]}\n'
-    'Each "missing" item must be fetchable: a dotted section id (e.g. '
-    '"5.2.1"), "Figure N", or a short search phrase (under 8 words). '
-    "Use an empty list when sufficient. At most 5 items."
+    "Rules:\n"
+    '- "sufficient" is true when the excerpts state the specific facts needed '
+    "to answer the question.\n"
+    "- The excerpts must cover EVERY entity and aspect the question asks "
+    "about. If a component, field, or mechanism named in the question never "
+    "appears in the excerpts, it is not sufficient.\n"
+    '- "missing" may only name material NOT in the provided excerpts: a dotted '
+    'section id (e.g. "5.2.1"), "Figure N", or a short search phrase (under 8 '
+    "words).\n"
+    "- If the needed information is absent from the excerpts and you cannot "
+    'name anything new to fetch, respond {"sufficient": false, "missing": []}.\n'
+    "- At most 5 items."
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-_INVENTORY_LINES = 15
-_SNIPPET_CHARS = 150
+# The judge needs enough substance per chunk to tell "topically related" from
+# "states the answer" — 150-char snippets made it re-request sections it could
+# already see. Input tokens are free on the local gateway; output stays JSON.
+_INVENTORY_LINES = 20
+_SNIPPET_CHARS = 700
 
 
 def _parse_judge_json(text: str) -> dict | None:
@@ -278,7 +291,8 @@ def constrained_gap_check(
         snippet = (c.get("text_raw") or "")[:_SNIPPET_CHARS].replace("\n", " ")
         lines.append(f"[{sid}] {title} :: {snippet}")
     user_prompt = (
-        f"Question:\n{query}\n\nRetrieved excerpts:\n" + "\n".join(lines)
+        f"Question:\n{query}\n\nProvided excerpts (already in context):\n"
+        + "\n".join(lines)
     )
 
     llm_call: dict | None = None
@@ -296,3 +310,40 @@ def constrained_gap_check(
             return verdict, llm_call
         logger.warning("tiered judge returned unparseable output (attempt %d)", attempt + 1)
     return {"sufficient": False, "missing": []}, llm_call
+
+
+# -----------------------------------------------------------------------------
+# Tier 2.5: deterministic entity-coverage gate
+# -----------------------------------------------------------------------------
+
+# Capitalized multi-word spec terms ("Controller Level Reset", "Management
+# Controller"). Single capitalized words are too noisy (sentence starts).
+_ENTITY_PHRASE_RE = re.compile(r"\b((?:[A-Z][A-Za-z0-9]+\s+){1,4}[A-Z][A-Za-z0-9]+)\b")
+# Meta-references to the spec document itself, not content entities.
+_ENTITY_STOP = {
+    "nvm express",
+    "nvm express base",
+    "nvm express base specification",
+    "express base specification",
+    "base specification",
+}
+
+
+def absent_question_entities(query: str, pool: list[dict]) -> list[str]:
+    """Capitalized multi-word phrases from the question that never appear in
+    the pool text. Deterministic: no judge may declare context sufficient for
+    an entity the context never mentions (observed Qwen failure mode). The
+    caller turns these into follow-up fetches; phrases genuinely absent from
+    the corpus keep the row honestly unconverged."""
+    text = " ".join((c.get("text_raw") or "") for c in pool).lower()
+    absent: list[str] = []
+    seen: set[str] = set()
+    for m in _ENTITY_PHRASE_RE.finditer(query or ""):
+        phrase = m.group(1).strip()
+        key = phrase.lower()
+        if key in seen or key in _ENTITY_STOP:
+            continue
+        seen.add(key)
+        if key not in text:
+            absent.append(phrase)
+    return absent

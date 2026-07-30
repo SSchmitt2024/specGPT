@@ -1983,3 +1983,70 @@ def test_frontend_batch_context_mode_markup():
     assert "batch_context.jsonl" in html
     assert 'config.gap_mode = "tiered"' in html
     assert "config.context_only = true" in html
+
+
+def test_absent_question_entities():
+    from src.pipeline.gap_analysis import absent_question_entities
+
+    pool = [{"text_raw": "A Controller Level Reset affects the controller state."}]
+    q = ("What is the expected behavior of the Management Controller during a "
+         "Controller Level Reset per the NVM Express Base Specification?")
+    # present entity and spec-name stop phrases are excluded; absent entity flagged
+    assert absent_question_entities(q, pool) == ["Management Controller"]
+    # no multi-word capitalized phrases -> nothing to check
+    assert absent_question_entities("what is the scope?", pool) == []
+    # match is case-insensitive against pool text
+    pool2 = [{"text_raw": "the management controller (refer to the MI spec)"}]
+    assert absent_question_entities(q, pool2 + pool) == []
+
+
+def test_tiered_loop_entity_gate_vetoes_sufficiency(monkeypatch):
+    """Sufficient scores AND a sufficient judge verdict must not converge while
+    a question entity is absent from the pool; the entity is fetched as a
+    follow-up, after which convergence is allowed."""
+    from src.pipeline import orchestrator
+    from src.pipeline.orchestrator import PipelineConfig
+
+    monkeypatch.setattr(
+        orchestrator.generator, "generate",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("generate() must not run")),
+    )
+    monkeypatch.setattr(
+        orchestrator.gap_analysis, "constrained_gap_check",
+        lambda q, pool, model: ({"sufficient": True, "missing": []},
+                                {"stage": "tiered_judge", "model": "m", "prompt": 1, "completion": 1}),
+    )
+    searched = []
+
+    def fake_hybrid(fq, sub_queries=None, config=None):
+        searched.append(fq)
+        return ([{"id": "8.1.15__c0", "section_id": "8.1.15", "section_title": "Management Addresses",
+                  "content_type": "prose", "text_raw": "the Management Controller address feature",
+                  "rerank_score": 0.9}], [])
+
+    monkeypatch.setattr(orchestrator, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(
+        orchestrator.reranker, "rerank",
+        lambda query, pool, top_k=None, model_name=None, text_field=None: list(pool),
+    )
+    chunks = [{"id": "3.7.2__c0", "section_id": "3.7.2", "section_title": "Controller Level Reset",
+               "content_type": "prose", "text_raw": "A Controller Level Reset does things.",
+               "rerank_score": 0.9},
+              {"id": "3.7.2__c1", "section_id": "3.7.2", "section_title": "Controller Level Reset",
+               "content_type": "prose", "text_raw": "More reset details.",
+               "rerank_score": 0.85}]
+    cfg = PipelineConfig(gap_mode="tiered", context_only=True, spec="base")
+    trace: list = []
+    result = orchestrator._run_tiered_context_loop(
+        query="How does the Management Controller react to a Controller Level Reset?",
+        config=cfg, debug=False, trace=trace,
+        deduplicated=list(chunks), retrieved_chunks=list(chunks),
+        structured_found=False, structured_confidence=None, llm_calls=[],
+    )
+    # iteration 0: scores sufficient but entity absent -> vetoed, entity searched
+    assert searched == ["Management Controller"]
+    # iteration 1: entity now present -> convergence allowed
+    assert result["gap_analysis"]["converged"] is True
+    assert result["gap_analysis"]["iterations_run"] == 2
+    assert result["gap_analysis"]["absent_entities"] == []
+    assert "Management Controller address" in result["context"]
