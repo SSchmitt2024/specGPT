@@ -1746,7 +1746,7 @@ def test_tiered_config_defaults_keep_live_pipeline_on_llm_path():
     assert cfg.gap_mode == "llm"
     assert cfg.context_only is False
     assert cfg.gap_model == "deepthought-qwen3-30b"
-    assert cfg.gap_score_sufficient == 0.6
+    assert cfg.gap_score_sufficient == 0.8
     assert cfg.gap_score_insufficient == 0.3
     assert cfg.gap_min_strong == 2
     assert cfg.xref_section_cap == 4

@@ -188,9 +188,12 @@ class PipelineConfig:
     # the assembled context string + scored sources and answer=None.
     context_only: bool = False
     gap_model: str = "deepthought-qwen3-30b"
-    # Tier-2 bands on the top rerank_score (Voyage, normalized 0-1). Defaults
-    # are uncalibrated starting points; tune from batch pipeline_traces.
-    gap_score_sufficient: float = 0.6
+    # Tier-2 bands on the top rerank_score (Voyage, normalized 0-1). In the
+    # 0.6-0.75 band rerank scores measure topical overlap, not answerability
+    # (observed: a false-sufficient row at 0.71 outscored a true-sufficient at
+    # 0.70), so the "skip the judge" bar is deliberately high; ambiguous rows
+    # cost one tiny judge call.
+    gap_score_sufficient: float = 0.8
     gap_score_insufficient: float = 0.3
     gap_min_strong: int = 2   # chunks >= sufficient threshold needed to converge
     xref_section_cap: int = 4  # tier-1 section fetches per round
