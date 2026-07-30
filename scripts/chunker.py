@@ -15,6 +15,15 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src import spec_env
+
+# Spec identity for chunks with no card to inherit from. Reads SPEC_DOCUMENT /
+# SPEC_VERSION, which run_phase2.sh exports per corpus; falls back to Base.
+DEFAULT_SPEC_DOCUMENT = spec_env.spec_document()
+DEFAULT_SPEC_VERSION = spec_env.spec_version()
+
 
 # ── tokenization ──────────────────────────────────────────────
 # We approximate tokens as whitespace-split words.
@@ -151,8 +160,8 @@ def _make_chunk(
         "chunk_id": f"{section_id}__c{chunk_index}",
         "section_id": section_id,
         "section_title": section_title,
-        "spec_document": card.get("spec_document", "NVM Express Base Specification") if card else "NVM Express Base Specification",
-        "spec_version": card.get("spec_version", "2.1") if card else "2.1",
+        "spec_document": card.get("spec_document", DEFAULT_SPEC_DOCUMENT) if card else DEFAULT_SPEC_DOCUMENT,
+        "spec_version": card.get("spec_version", DEFAULT_SPEC_VERSION) if card else DEFAULT_SPEC_VERSION,
         "content_type": "prose",
         "text": enriched_text,
         "text_raw": body,

@@ -24,6 +24,14 @@ import os
 import sys
 from pathlib import Path
 
+from src import spec_env
+
+# Table chunks rarely have a card to inherit spec identity from (they key off
+# figure_number, not section_id), so the fallback has to be the active corpus,
+# not Base — otherwise every figure cites the wrong document.
+DEFAULT_SPEC_DOCUMENT = spec_env.spec_document()
+DEFAULT_SPEC_VERSION = spec_env.spec_version()
+
 
 WORDS_PER_TOKEN = 0.75
 SPLIT_ROW_THRESHOLD = 30   # tables with more rows than this get split
@@ -126,8 +134,8 @@ def _make_chunk(
         "chunk_id":           chunk_id,
         "section_id":         section_id,
         "section_title":      table.get("caption", ""),
-        "spec_document":      card.get("spec_document", "NVM Express Base Specification") if card else "NVM Express Base Specification",
-        "spec_version":       card.get("spec_version", "2.1") if card else "2.1",
+        "spec_document":      card.get("spec_document", DEFAULT_SPEC_DOCUMENT) if card else DEFAULT_SPEC_DOCUMENT,
+        "spec_version":       card.get("spec_version", DEFAULT_SPEC_VERSION) if card else DEFAULT_SPEC_VERSION,
         "content_type":       "table",
         "text":               enriched,
         "text_raw":           serialized,
