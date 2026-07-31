@@ -7322,6 +7322,41 @@ a { color: var(--accent); text-decoration: none; }
             var checkpointWarned = false;
             var activeControllers = new Set();
 
+            // Dispatch throttle: at most one /api/query started every
+            // CALL_DELAY_MS, whatever the concurrency. Slots are handed out in
+            // order, so the earliest pending one is what the countdown shows.
+            // ponytail: single shared timestamp, no queue object needed.
+            var CALL_DELAY_MS = 30000;
+            var nextSlotAt = 0;
+            var pendingSlots = new Set();
+            var tickTimer = null;
+            var runTotal = 0;
+
+            function countdownText() {
+                if (!pendingSlots.size) return "";
+                var soonest = Math.min.apply(null, Array.from(pendingSlots));
+                var s = Math.ceil((soonest - Date.now()) / 1000);
+                return s > 0 ? "next call in " + s + "s" : "";
+            }
+
+            async function waitForSlot() {
+                var now = Date.now();
+                var at = Math.max(now, nextSlotAt);
+                nextSlotAt = at + CALL_DELAY_MS;
+                if (at <= now) return;
+                pendingSlots.add(at);
+                try {
+                    for (;;) {
+                        var left = at - Date.now();
+                        if (left <= 0 || cancelled) return;
+                        // Poll in slices so cancel doesn't wait out the full delay.
+                        await new Promise(function (r) { setTimeout(r, Math.min(left, 400)); });
+                    }
+                } finally {
+                    pendingSlots.delete(at);
+                }
+            }
+
             // One live status line: spinner on while working, off when idle/done.
             function setStatus(text, opts) {
                 opts = opts || {};
@@ -7609,13 +7644,19 @@ a { color: var(--accent); text-decoration: none; }
 
             function short(s) { return s.length > 70 ? s.slice(0, 70) + "\\u2026" : s; }
             function refreshStatus(total) {
+                if (total) runTotal = total;
+                total = total || runTotal;
+                var cd = countdownText();
                 setStatus(completed + "/" + total + " done \\u00b7 " + failed + " failed \\u00b7 "
-                    + runningCount + " running" + (retryNote ? " \\u00b7 " + retryNote : ""), { spin: running });
+                    + runningCount + " running" + (retryNote ? " \\u00b7 " + retryNote : "")
+                    + (cd ? " \\u00b7 " + cd : ""), { spin: running });
             }
 
             // Run one question end-to-end, then checkpoint it.
             async function processOne(i, qs, config, fmt, total) {
                 var q = qs[i];
+                await waitForSlot();
+                if (cancelled) return;
                 var t0 = Date.now();
                 var card = startResultCard(i + 1, total, q);
                 runningCount++;
@@ -7698,9 +7739,16 @@ a { color: var(--accent); text-decoration: none; }
 
                 setProgress(completed, total);
                 refreshStatus(total);
+                nextSlotAt = 0;   // first question goes immediately
+                pendingSlots.clear();
+                if (tickTimer) clearInterval(tickTimer);
+                tickTimer = setInterval(function () { refreshStatus(total); }, 1000);
 
                 await runQueue(todo, qs, config, fmt, total);
 
+                clearInterval(tickTimer);
+                tickTimer = null;
+                pendingSlots.clear();
                 running = false;
                 fileInput.disabled = false;
                 runBtn.disabled = false;
