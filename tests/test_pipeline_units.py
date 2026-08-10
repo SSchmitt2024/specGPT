@@ -1737,13 +1737,17 @@ def test_frontend_batch_mode_markup_and_escaping():
 # ---------------------------------------------------------------------------
 # three-tier gap analysis (gap_mode="tiered")
 
-def test_tiered_config_defaults_keep_live_pipeline_on_llm_path():
-    """gap_mode must default to "llm" so live queries never enter the tiered
-    loop; the tier-2 knobs exist with their shipped defaults."""
+def test_tiered_config_defaults():
+    """Tiered is the live default; the tier-2 knobs keep their shipped values.
+
+    Was "gap_mode must default to llm". Inverted deliberately: tiered converges
+    the context and generates once, and the regenerate-every-pass loop now
+    ships only behind HyperThink.
+    """
     from src.pipeline.orchestrator import PipelineConfig
 
     cfg = PipelineConfig()
-    assert cfg.gap_mode == "llm"
+    assert cfg.gap_mode == "tiered"
     assert cfg.context_only is False
     assert cfg.gap_model == "deepthought-qwen3-30b"
     assert cfg.gap_score_sufficient == 0.8
@@ -2149,3 +2153,66 @@ def test_assemble_context_labels_specs_only_when_mixed():
     cite = _extract_citations("Per [Section 4.1.7] it aborts.", used)[0]
     assert cite["section_id"] == "4.1.7"
     assert cite["hallucinated"] is False
+
+
+# ---------------------------------------------------------------------------
+# HyperThink / tiered defaults
+
+
+def test_gap_mode_defaults_to_tiered_and_only_hyperthink_regenerates():
+    from src.pipeline.orchestrator import PipelineConfig, resolve_preset
+
+    assert PipelineConfig().gap_mode == "tiered"
+    for name in ("fast", "balanced", "thorough"):
+        assert resolve_preset(name)[0]["gap_mode"] == "tiered", name
+    hyper, hyper_agentic = resolve_preset("hyperthink")
+    assert hyper_agentic is True
+    assert hyper["gap_mode"] == "llm"
+    # "Unlimited" is expressed as 0 and resolved per model at generation time.
+    assert hyper["llm_max_output_tokens"] == 0
+    assert hyper["agentic_max_output_tokens"] == 0
+    # Every preset must still build a valid config.
+    assert PipelineConfig(**hyper).gap_mode == "llm"
+
+
+def test_resolve_max_output_tokens_clamps_unlimited_per_model():
+    from src.pipeline.generator import _DEFAULT_MAX_OUTPUT, resolve_max_output_tokens
+
+    # 0 means "unlimited" -> the model's own ceiling, which differs by model.
+    assert resolve_max_output_tokens("deepthought-claude-sonnet-4-6", 0) == 64000
+    assert resolve_max_output_tokens("deepthought-qwen3-30b", 0) == 8192
+    # An over-ask carried over from a bigger model is clamped, not 400'd.
+    assert resolve_max_output_tokens("deepthought-qwen3-30b", 64000) == 8192
+    # Ordinary budgets pass through untouched.
+    assert resolve_max_output_tokens("deepthought-claude-sonnet-4-6", 3072) == 3072
+    # Unknown models fall back conservatively rather than raising.
+    assert resolve_max_output_tokens("some-new-model", 0) == _DEFAULT_MAX_OUTPUT
+
+
+def test_delete_test_plan_rejects_malformed_ids_and_takes_children():
+    import pytest
+
+    import src.pipeline.search as S
+
+    for bad in ("", "   ", "1.1,id.eq.2", "1.1/*", "%", "../etc"):
+        with pytest.raises(ValueError):
+            S.delete_test_plan(bad)
+
+    seen = {}
+
+    class _Q:
+        def delete(self):                 return self
+        def or_(self, f):                 seen["filter"] = f; return self
+        def execute(self):                return type("R", (), {"data": [{"id": "1.1"}]})()
+
+    class _C:
+        def table(self, name):            seen["table"] = name; return _Q()
+
+    S.delete_test_plan.__globals__["supabase_client"] = lambda: _C()
+    try:
+        assert S.delete_test_plan("1.1/16") == 1
+    finally:
+        S.delete_test_plan.__globals__["supabase_client"] = S.supabase_client
+    assert seen["table"] == "test_plans"
+    # The row itself plus everything nested beneath it.
+    assert seen["filter"] == "id.eq.1.1/16,id.like.1.1/16/*"

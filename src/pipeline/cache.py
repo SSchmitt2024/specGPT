@@ -48,5 +48,13 @@ def ttl_cache(maxsize=1000, ttl=3600):
                 cache[key] = (val, time.time())
                 
             return val
+
+        # Needed by writes: a cached read must not survive the row it cached.
+        # ponytail: whole-cache clear, no per-key eviction. These caches are
+        # small and writes are rare.
+        def cache_clear():
+            with lock:
+                cache.clear()
+        wrapper.cache_clear = cache_clear
         return wrapper
     return decorator

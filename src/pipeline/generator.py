@@ -111,6 +111,40 @@ DEEPTHOUGHT_MODELS = {
 }
 
 
+# Max completion tokens each model will actually accept. HyperThink asks for an
+# "unlimited" output budget (max_output_tokens=0), which resolves here — the
+# providers have no unlimited setting, so "unlimited" means "this model's
+# ceiling". Also clamps explicit over-asks, so a 64k budget carried over from a
+# Sonnet run can't 400 the request after switching to a local model.
+#
+# ponytail: hand-maintained table, not a /models probe. Re-check against the
+# gateway when DEEPTHOUGHT_MODELS changes; a missing entry gets the
+# conservative _DEFAULT_MAX_OUTPUT rather than an exception.
+_DEFAULT_MAX_OUTPUT = 8192
+_MAX_OUTPUT_TOKENS = {
+    # Claude Sonnet 4.x via Bedrock: 64k output on a 200k window.
+    "deepthought-claude-sonnet-4-6": 64000,
+    "deepthought-claude-sonnet-4-5": 64000,
+    "deepthought-claude-sonnet-4":   64000,
+    # Local open-weight models: far smaller practical output ceilings.
+    "deepthought-llama-3.3-70b":     8192,
+    "deepthought-qwen3-30b":         8192,
+}
+
+
+def resolve_max_output_tokens(model: str, requested: int) -> int:
+    """Clamp a requested completion budget to what ``model`` accepts.
+
+    ``requested <= 0`` means "unlimited" and resolves to the model ceiling.
+    Unknown models get ``_DEFAULT_MAX_OUTPUT`` — conservative on purpose: an
+    answer truncated at 8k is recoverable, a 400 on every request is not.
+    """
+    ceiling = _MAX_OUTPUT_TOKENS.get(model, _DEFAULT_MAX_OUTPUT)
+    if requested <= 0:
+        return ceiling
+    return min(requested, ceiling)
+
+
 def resolve_deepthought_model(public_id: str) -> str:
     """Map a public dropdown id to the underlying DeepThought gateway model id.
 
@@ -1275,6 +1309,11 @@ def generate(
                 f"{transcript}\n\n"
                 f"Current question: {query}"
             )
+
+    # Resolve the completion budget once, before dispatch: max_tokens<=0 means
+    # "unlimited" (HyperThink) and becomes the model's ceiling, and an over-ask
+    # is clamped rather than sent through to a 400.
+    max_tokens = resolve_max_output_tokens(model, max_tokens)
 
     # Step 3: Call the appropriate backend based on the model prefix.
     if model in DEEPTHOUGHT_MODELS or model == "deepthought":

@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, asdict
 from functools import lru_cache
 from pathlib import Path
 
-from src.llm.client import generate_json
+from src.llm.client import generate, generate_json
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,74 @@ def _normalize_llm_output(
 
     rationale = str(parsed.get("rationale", "")).strip()
     return qtype, sub_queries, rationale
+
+
+_HYDE_SYSTEM = """You write a short passage in the voice of an NVMe / PCIe base \
+specification, as if it were the excerpt that answers the user's question.
+
+Rules:
+  - Write 2-4 sentences of spec prose. No preamble, no headings, no markdown.
+  - Use the formal register and vocabulary the specs use ("shall", "the \
+controller", "the host", "Reserved", "cleared to '0'", "Dword", "namespace").
+  - Name the concrete artifacts a real answer would touch: field acronyms, \
+figure/table titles, command names, bit ranges, status codes.
+  - Being factually wrong is acceptable. This passage is never shown to the \
+user and is never cited. It exists only to be embedded, so that its wording \
+sits near the real spec text in vector space.
+  - Never say you are unsure or that you lack information. Always produce the \
+passage."""
+
+
+def generate_hyde(
+    query: str,
+    *,
+    model: str | None = None,
+    max_output_tokens: int = 220,
+) -> tuple[str, dict | None]:
+    """HyDE: write a hypothetical spec passage to embed instead of the query.
+
+    Retrieval's weak spot is register mismatch: users ask "how do I unfreeze a
+    personality" while the corpus says "the controller shall transition the
+    Persistent Event Log to ...". Embedding the raw question puts it near other
+    *questions*, not near the answering prose. HyDE (Gao et al., 2022) closes
+    that gap by asking a cheap model to hallucinate the answer *in spec voice*
+    and embedding THAT — the fake passage is lexically and stylistically much
+    closer to the real section than the question ever was.
+
+    The hallucination is never shown and never cited; it is a query-side
+    transform only. Its hits enter RRF as one more ranked list alongside the
+    literal query's vector + BM25 lists, so a bad hypothesis can only fail to
+    contribute — it cannot displace a real hit.
+
+    Returns ``(passage, llm_call)``. On any failure returns ``("", None)`` so
+    the caller silently falls back to plain retrieval.
+    """
+    if not query or not query.strip():
+        return "", None
+    kwargs: dict = {
+        "system": _HYDE_SYSTEM,
+        # Non-zero: a little variety produces richer vocabulary to match on,
+        # and there is no correctness to preserve here.
+        "temperature": 0.3,
+        "max_output_tokens": max_output_tokens,
+    }
+    if model:
+        kwargs["model"] = model
+    try:
+        result = generate(query.strip(), **kwargs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("HyDE generation failed (%s) — falling back to plain retrieval", e)
+        return "", None
+
+    passage = " ".join((getattr(result, "text", "") or "").split())
+    if len(passage) < 20:  # empty / refusal / truncated to nothing
+        return "", None
+    call = {
+        "model": getattr(result, "model", None) or "",
+        "prompt": int(getattr(result, "prompt_tokens", 0) or 0),
+        "completion": int(getattr(result, "output_tokens", 0) or 0),
+    }
+    return passage, call
 
 
 def classify_and_decompose(

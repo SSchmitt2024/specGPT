@@ -394,6 +394,31 @@ def fetch_test_plan(plan_id: str) -> dict | None:
         return None
 
 
+def delete_test_plan(plan_id: str) -> int:
+    """Delete a test-plan unit and everything under it. Returns rows deleted.
+
+    Ids are hierarchical ('1.1', '1.1/16', '1.1/16/3'), so deleting a test
+    has to take its cases and sub-cases with it or the picker is left showing
+    orphans under a group that no longer has a parent. Matches the id itself
+    plus anything prefixed with ``plan_id/``.
+    """
+    plan_id = (plan_id or "").strip()
+    # Whitelist rather than escape: the id goes into a PostgREST filter string
+    # where `,` `*` and `%` all have meaning, and real ids are only digits,
+    # dots and slashes. Anything else is a malformed request, not a wildcard.
+    if not plan_id or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._/-]*", plan_id):
+        raise ValueError(f"malformed test plan id: {plan_id!r}")
+    res = (supabase_client().table("test_plans")
+           .delete()
+           .or_(f"id.eq.{plan_id},id.like.{plan_id}/*")
+           .execute())
+    deleted = len(res.data or [])
+    if deleted:
+        fetch_test_plan.cache_clear()
+        fetch_test_plan_index.cache_clear()
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # CLI
 

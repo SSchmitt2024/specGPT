@@ -116,6 +116,20 @@ class PipelineConfig:
     # Query decomposition parameters
     max_subqueries: int = 3
 
+    # HyDE (Hypothetical Document Embeddings). Before retrieval, a cheap model
+    # writes a short fake passage answering the query *in spec voice*; that
+    # passage is embedded and searched as ONE MORE ranked list feeding RRF,
+    # alongside the literal query's vector and BM25 lists. Closes the register
+    # gap between how users ask ("how do I unfreeze a personality") and how the
+    # spec answers ("the controller shall ..."), which plain question
+    # embeddings handle poorly. Because it only ever ADDS a list to the fusion,
+    # a bad hypothesis dilutes rather than displaces; a failed call degrades to
+    # plain retrieval. Costs one small LLM call on the main query only (never
+    # on agentic follow-ups, which are already spec-phrased).
+    enable_hyde: bool = True
+    hyde_model: str = ""          # "" → the query_processor default (cheap model)
+    hyde_max_output_tokens: int = 220
+
     # Deterministic 1-hop figure expansion: after reranking, scan the context
     # chunks for "Figure N" references and direct-fetch any referenced table
     # not already in context. Spec prose constantly defers to its data
@@ -138,15 +152,22 @@ class PipelineConfig:
     # routes claude-sonnet-4-6 through UNH's gateway (see generator.DEEPTHOUGHT_MODELS).
     llm_model: str = "deepthought-claude-sonnet-4-6"
     llm_max_context_tokens: int = 4000
-    # 2048: procedural answers with tables were hitting stop_reason=max_tokens
-    # at 1024, truncating the first pass — and gap analysis then chases gaps
-    # that are really just the cut-off tail.
-    llm_max_output_tokens: int = 2048
+    # 4096: procedural answers with tables were still hitting
+    # stop_reason=max_tokens at 2048 (flags 31/33/34/36/37 — "keeps
+    # truncating"), and gap analysis then chases gaps that are really just the
+    # cut-off tail, so each truncation buys another full regenerate. Output
+    # tokens are billed on what's produced, not on the cap, so a headroom-only
+    # raise costs nothing on the short answers that dominate qa_log (p90
+    # completion ~440 tokens) while removing the truncate→refine→truncate loop.
+    llm_max_output_tokens: int = 4096
 
     # Agentic-mode parameters (only used when orchestrate(..., agentic=True))
     agentic_model: str = "deepthought-claude-sonnet-4-6"
     agentic_max_context_tokens: int = 16000
-    agentic_max_output_tokens: int = 3072
+    # Regenerate sees 4x the context of the first pass, so its output ceiling
+    # has to scale with it — at 3072 the refinement pass truncated even when
+    # the first pass hadn't.
+    agentic_max_output_tokens: int = 6144
     agentic_max_followups: int = 3   # cap LLM-generated follow-up queries
     agentic_rerank_topk: int = 14    # top-k after re-rerank (~2× normal)
 
@@ -180,12 +201,23 @@ class PipelineConfig:
     # (the agentic loop is the gap analyser).
     auto_gap_check: bool = True
 
-    # Three-tier gap analysis (batch context assembly). gap_mode="tiered"
-    # replaces the LLM verdict loop with: deterministic cross-ref expansion
-    # (tier 1), score-based sufficiency (tier 2), and a small model constrained
-    # to JSON output consulted only when scores can't decide (tier 3). The live
-    # UI keeps gap_mode="llm"; only batch context runs flip this.
-    gap_mode: str = "llm"  # "llm" | "tiered"
+    # Gap-analysis strategy. THE DEFAULT IS "tiered".
+    #
+    # "tiered" — three-tier context assembly with NO generation inside the loop:
+    #   deterministic cross-ref expansion (tier 1, regex, free), score-based
+    #   sufficiency (tier 2, pure function, free), and a small model constrained
+    #   to JSON output consulted only when the scores can't decide (tier 3,
+    #   gap_model). The loop converges on the CONTEXT, then generates exactly
+    #   once. ~4x cheaper than "llm" because the 16k-token regenerate runs once
+    #   instead of once per iteration.
+    #
+    # "llm" — the original loop: generate, gap-analyse the ANSWER, fetch, and
+    #   REGENERATE every iteration. More expensive by roughly the iteration
+    #   count, and better only where the model has to attempt an answer before
+    #   it can name what's missing ("the context does not include Figure 630").
+    #   That signal does not exist in tiered mode, whose judge only ever sees
+    #   the context. Surfaced in the UI as HyperThink; see PRESETS["hyperthink"].
+    gap_mode: str = "tiered"  # "tiered" | "llm"
     # When True (tiered only), skip generation entirely: the response carries
     # the assembled context string + scored sources and answer=None.
     context_only: bool = False
@@ -424,6 +456,8 @@ def hybrid_search(
     sub_queries: list[str] | None = None,
     *,
     config: PipelineConfig | None = None,
+    use_hyde: bool = False,
+    llm_calls: list | None = None,
 ) -> tuple[list[dict], list[PipelineStage]]:
     """
     Orchestrate hybrid retrieval: vector + BM25 per sub-query,
@@ -437,6 +471,12 @@ def hybrid_search(
         query: original user query.
         sub_queries: decomposed queries. If None, use [query].
         config: PipelineConfig with tunable parameters. Defaults to PipelineConfig().
+        use_hyde: run HyDE (see query_processor.generate_hyde) and add one more
+            vector ranked list, searched with the hypothetical spec passage
+            instead of the literal question. Off by default so only the main
+            user query pays for it — agentic follow-ups are already written in
+            spec voice by a model, which is exactly what HyDE would produce.
+        llm_calls: optional list the HyDE token-accounting dict is appended to.
 
     Returns:
         (chunks, sub_trace) where chunks is RRF-merged results and sub_trace
@@ -450,6 +490,31 @@ def hybrid_search(
     sub_trace: list[PipelineStage] = []
     ranked_lists: list[list[dict]] = []
     total_input = 0
+
+    # Stage 0: HyDE — one cheap LLM call producing a fake spec passage whose
+    # embedding stands in for the query's. Failure is non-fatal (returns "").
+    hyde_text = ""
+    if use_hyde and config.enable_hyde:
+        start = time.time()
+        hyde_text, hyde_call = query_processor.generate_hyde(
+            query,
+            model=config.hyde_model or None,
+            max_output_tokens=config.hyde_max_output_tokens,
+        )
+        if hyde_call and llm_calls is not None:
+            llm_calls.append({**hyde_call, "stage": "hyde"})
+        sub_trace.append(
+            PipelineStage(
+                stage="hyde",
+                input={"query": query},
+                output={
+                    "passage": hyde_text,
+                    "chars": len(hyde_text),
+                    "generated": bool(hyde_text),
+                },
+                took_ms=(time.time() - start) * 1000,
+            )
+        )
 
     # Scope every retriever to the selected spec so Base/PCIe never co-mingle.
     # ALL_SPECS searches every corpus: omitting the spec key makes the RPCs
@@ -466,13 +531,36 @@ def hybrid_search(
         return res, time.time() - t0
 
     futures = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(36, len(sub_queries) * 2)) as executor:
+    hyde_fut = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(36, len(sub_queries) * 2 + 1)) as executor:
         for i, sq in enumerate(sub_queries):
             futures.append({
                 "i": i, "sq": sq,
                 "vec_fut": executor.submit(_run_search, search.vector_search, sq, top_k=config.vector_topk, filter=spec_filter),
                 "bm25_fut": executor.submit(_run_search, search.bm25_search, sq, top_k=config.bm25_topk, filter=spec_filter)
             })
+        if hyde_text:
+            # Vector only. BM25 over a hallucinated passage would score its
+            # invented tokens as literal keyword evidence, which is exactly the
+            # failure HyDE is not meant to introduce.
+            hyde_fut = executor.submit(
+                _run_search, search.vector_search, hyde_text,
+                top_k=config.vector_topk, filter=spec_filter,
+            )
+
+    if hyde_fut is not None:
+        hyde_results, took_hyde = hyde_fut.result()
+        sub_trace.append(
+            PipelineStage(
+                stage="hybrid_search.vector_search_hyde",
+                input={"query": hyde_text, "top_k": config.vector_topk},
+                output={"results": _result_summary(hyde_results, limit=3), "count": len(hyde_results)},
+                took_ms=took_hyde * 1000,
+            )
+        )
+        if hyde_results:
+            ranked_lists.append(hyde_results)
+            total_input += len(hyde_results)
 
     for f in futures:
         i, sq = f["i"], f["sq"]
@@ -584,7 +672,7 @@ PRESETS: dict[str, dict] = {
             "llm_model": "deepthought-claude-sonnet-4-6",
             # Fast keeps the lean output budget; quick lookups don't need
             # long procedural answers and this keeps cost/latency flat.
-            "llm_max_output_tokens": 1024,
+            "llm_max_output_tokens": 2048,
             # Leaner figure reserve to match Fast's flat cost/latency profile.
             "figure_reserve_tokens": 1500,
             "vector_topk": 6,
@@ -593,11 +681,12 @@ PRESETS: dict[str, dict] = {
             "rrf_output_topk": 12,
             "final_rerank_topk": 5,
             "max_subqueries": 1,
+            "gap_mode": "tiered",
             "auto_gap_check": False,
             "agentic_max_followups": 2,
             "agentic_rerank_topk": 10,
             "agentic_max_context_tokens": 8000,
-            "agentic_max_output_tokens": 1024,
+            "agentic_max_output_tokens": 3072,
             "agentic_targeted_fetch": True,
             "agentic_recursive": False,
             "agentic_max_iterations": 1,
@@ -613,7 +702,7 @@ PRESETS: dict[str, dict] = {
         "config": {
             "agentic_model": "deepthought-claude-sonnet-4-6",
             "llm_model": "deepthought-claude-sonnet-4-6",
-            "llm_max_output_tokens": 2048,
+            "llm_max_output_tokens": 4096,
             # Keep in sync with the PipelineConfig default (Balanced IS default).
             "figure_reserve_tokens": 3000,
             "vector_topk": 5,
@@ -622,11 +711,12 @@ PRESETS: dict[str, dict] = {
             "rrf_output_topk": 20,
             "final_rerank_topk": 10,
             "max_subqueries": 3,
+            "gap_mode": "tiered",
             "auto_gap_check": True,
             "agentic_max_followups": 3,
             "agentic_rerank_topk": 14,
             "agentic_max_context_tokens": 16000,
-            "agentic_max_output_tokens": 3072,
+            "agentic_max_output_tokens": 6144,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
             "agentic_max_iterations": 2,
@@ -645,8 +735,54 @@ PRESETS: dict[str, dict] = {
         "config": {
             "agentic_model": "deepthought-claude-sonnet-4-6",
             "llm_model": "deepthought-claude-sonnet-4-6",
-            "llm_max_output_tokens": 2048,
+            "llm_max_output_tokens": 4096,
             # Full figure reserve — Thorough optimises for completeness.
+            "figure_reserve_tokens": 3000,
+            "vector_topk": 8,
+            "bm25_topk": 8,
+            "rrf_k": 60,
+            "rrf_output_topk": 20,
+            "final_rerank_topk": 10,
+            "max_subqueries": 3,
+            "gap_mode": "tiered",
+            "auto_gap_check": True,
+            "agentic_max_followups": 3,
+            "agentic_rerank_topk": 14,
+            "agentic_max_context_tokens": 16000,
+            "agentic_max_output_tokens": 6144,
+            "agentic_targeted_fetch": True,
+            "agentic_recursive": True,
+            "agentic_max_iterations": 2,
+        },
+    },
+    # HyperThink: the ONLY preset that regenerates on every iteration.
+    #
+    # Everything else runs gap_mode="tiered" — converge the context, generate
+    # once. This one runs the original gap_mode="llm" loop, which answers,
+    # gap-analyses THE ANSWER, fetches, and re-answers, every pass. That costs
+    # roughly the iteration count in full 16k-context generations. What it buys
+    # is the one signal tiered structurally cannot produce: a model that had to
+    # attempt the answer before it could name what was missing ("the context
+    # does not include Figure 630"). Worth it on hard cross-referential
+    # questions, wasted on lookups.
+    #
+    # Output budget is 0 = unlimited, resolved per model by
+    # generator.resolve_max_output_tokens (64k on Sonnet, 8k on the local
+    # models). Context budget is set high enough never to bind in practice: the
+    # pool is capped at agentic_rerank_topk chunks long before 120k tokens.
+    "hyperthink": {
+        "label": "HyperThink",
+        "agentic": True,
+        # Consumed by the UI to gate the cost warning. Nothing server-side
+        # reads it; the behaviour lives entirely in the config below.
+        "warn": "Regenerates the full answer on every refinement pass with an "
+                "unlimited output budget. Typically several times the cost and "
+                "latency of a normal query.",
+        "config": {
+            "gap_mode": "llm",
+            "agentic_model": "deepthought-claude-sonnet-4-6",
+            "llm_model": "deepthought-claude-sonnet-4-6",
+            "llm_max_output_tokens": 0,
             "figure_reserve_tokens": 3000,
             "vector_topk": 8,
             "bm25_topk": 8,
@@ -657,11 +793,11 @@ PRESETS: dict[str, dict] = {
             "auto_gap_check": True,
             "agentic_max_followups": 3,
             "agentic_rerank_topk": 14,
-            "agentic_max_context_tokens": 16000,
-            "agentic_max_output_tokens": 3072,
+            "agentic_max_context_tokens": 120000,
+            "agentic_max_output_tokens": 0,
             "agentic_targeted_fetch": True,
             "agentic_recursive": True,
-            "agentic_max_iterations": 2,
+            "agentic_max_iterations": 4,
         },
     },
 }
@@ -2252,8 +2388,25 @@ def _run_tiered_context_loop(
         except Exception as e:  # noqa: BLE001
             logger.exception("tiered targeted fetch failed: %s", e)
         for fq in followups:
+            # Decompose multi-part follow-ups before retrieving, same as the
+            # "llm" loop does — passing them verbatim gives a two-part follow-up
+            # the same shallow retrieval as a one-shot keyword search. Unlike
+            # that loop, this runs on the cheap gap_model, not the answer model:
+            # the judge already emits narrow single-issue items, so this is a
+            # safety net for the occasional compound one, not a hot path.
+            fq_subs = [fq]
             try:
-                hits, _fq_trace = hybrid_search(fq, sub_queries=[fq], config=config)
+                fq_decomp = query_processor.process_query(
+                    fq, use_llm=True, model=config.gap_model,
+                    max_subqueries=config.max_subqueries,
+                )
+                fq_subs = fq_decomp.sub_queries or [fq]
+                for c in fq_decomp.llm_calls:
+                    llm_calls.append({**c, "stage": f"tiered.followup_decomp{suffix}"})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("tiered follow-up decomp failed (%s): using verbatim", e)
+            try:
+                hits, _fq_trace = hybrid_search(fq, sub_queries=fq_subs, config=config)
                 new_chunks.extend(hits)
             except Exception as e:  # noqa: BLE001
                 logger.exception("tiered follow-up search failed (%s): %s", fq, e)
@@ -2653,6 +2806,8 @@ def orchestrate(
             query,
             sub_queries=search_queries,
             config=config,
+            use_hyde=True,
+            llm_calls=llm_calls,
         )
 
     # -------------------------------------------------------------------------
@@ -2823,11 +2978,20 @@ def orchestrate(
         )
 
     # -------------------------------------------------------------------------
-    # Tiered gap analysis (gap_mode="tiered"): three-tier context assembly with
-    # no generation inside the loop. Replaces Stage 4 + the agentic verdict
-    # loop for batch runs; the "llm" path below is untouched.
+    # Tiered gap analysis (gap_mode="tiered", the default): three-tier context
+    # assembly with no generation inside the loop, then exactly one generation.
+    # Replaces Stage 4 + the agentic verdict loop. gap_mode="llm" (HyperThink)
+    # falls through to the regenerate-every-iteration path below.
+    #
+    # Gated on `agentic` as well as the mode: tiered REPLACES the refinement
+    # loop, it is not a cheaper single pass. Fast Mode (agentic off) means "one
+    # generation, no refinement of any kind" and must keep skipping the loop
+    # entirely — without this check, flipping the gap_mode default to "tiered"
+    # would silently pull every Fast Mode query into a judge-driven fetch loop.
+    # context_only batch runs set agentic=False but ask for tiered explicitly,
+    # so they opt back in.
     # -------------------------------------------------------------------------
-    if config.gap_mode == "tiered":
+    if config.gap_mode == "tiered" and (agentic or config.context_only):
         structured_found = False
         structured_confidence = None
         for st in trace:

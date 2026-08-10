@@ -1552,6 +1552,30 @@ async def testplan_detail_endpoint(
     return row
 
 
+@app.delete("/api/testplans/{plan_id:path}")
+async def testplan_delete_endpoint(
+    plan_id: str, _: bool = Depends(require_auth), __: None = Depends(flag_rate_limit)
+) -> dict:
+    """Delete one test-plan unit and everything nested under it.
+
+    A test id ('1.1') takes its cases and sub-cases with it; a case id
+    ('1.1/16/3') deletes just that row. Irreversible: there is no soft-delete
+    column on test_plans, so the UI confirms before calling this.
+    """
+    from src.pipeline.search import delete_test_plan
+
+    try:
+        deleted = delete_test_plan(plan_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delete_test_plan(%s) failed", plan_id)
+        raise HTTPException(status_code=500, detail=f"delete failed: {e}")
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"unknown test case: {plan_id!r}")
+    return {"deleted": deleted, "id": plan_id}
+
+
 @app.get("/api/models")
 async def models_endpoint(_: bool = Depends(require_auth)) -> dict:
     """Return model info and per-token pricing for all pipeline stages."""
@@ -2077,6 +2101,8 @@ a { color: var(--accent); text-decoration: none; }
 .config-item input:focus, .config-item select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
 .config-item label > input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); vertical-align:-2px; margin-right:6px; }
 .config-item label:has(input[type=checkbox]) { display:flex; align-items:center; font-size:13px; color:var(--ink); font-weight:500; margin-top:18px; }
+.config-warn { margin:6px 0 0; font-size:11px; line-height:1.45; color:var(--warn, #b45309); }
+.config-warn[hidden] { display:none; }
 
 /* agentic config is always visible inside the config popover and the
    refine-time overlay, regardless of the legacy .hidden toggle */
@@ -2119,6 +2145,13 @@ a { color: var(--accent); text-decoration: none; }
 .addtest-test.open .addtest-test-head .tw { transform:rotate(90deg); }
 .addtest-case { padding:6px 10px 6px 30px; cursor:pointer; font-size:12.5px; color:var(--t-muted); }
 .addtest-case:hover, .addtest-case.active { background:var(--accent-soft); color:var(--ink); }
+.addtest-case { display:flex; align-items:center; gap:8px; }
+.addtest-case .addtest-case-label { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* Delete stays hidden until the row is hovered: destructive and irreversible,
+   so it should not sit under the cursor path of an ordinary pick. */
+.addtest-del { flex:none; border:0; background:none; cursor:pointer; padding:0 4px; font-size:13px; line-height:1; color:var(--t-faint); opacity:0; }
+.addtest-test-head:hover .addtest-del, .addtest-case:hover .addtest-del, .addtest-del:focus-visible { opacity:1; }
+.addtest-del:hover { color:var(--danger, #dc2626); }
 .addtest-error { margin-top:8px; font-size:12px; color:var(--danger); }
 .addtest-error[hidden] { display:none; }
 .addtest-actions { display:flex; align-items:center; gap:10px; margin-top:auto; padding-top:12px; }
@@ -2835,6 +2868,10 @@ a { color: var(--accent); text-decoration: none; }
                                 <div class="config-item">
                                     <label title="Skip agentic refinement for a faster, cheaper answer. Refinement normally runs on every query."><input type="checkbox" id="config-ultra_fast"> Fast Mode</label>
                                 </div>
+                                <div class="config-item">
+                                    <label title="Rewrite the whole answer on every refinement pass instead of answering once at the end, with no cap on answer length. Catches gaps only a drafted answer reveals. Several times the cost and latency."><input type="checkbox" id="config-hyperthink"> HyperThink</label>
+                                    <p class="config-warn" id="hyperthink-warn" hidden>Costly. Regenerates the full answer every pass with an unlimited output budget, typically several times the cost and time of a normal query.</p>
+                                </div>
                             </div>
 
                             <!-- Advanced retrieval internals: still applied per request (presets
@@ -3411,11 +3448,17 @@ a { color: var(--accent); text-decoration: none; }
         function _stageLabel(stage) {
             const s = String(stage || "");
             if (s === "query_processor")                  return "Query processor";
+            if (s === "hyde")                              return "HyDE";
             if (s === "generation")                        return "Generation";
             if (s === "gap_hint")                          return "Gap hint";
             if (s.startsWith("agentic.gap_analysis"))      return "Gap analysis";
             if (s.startsWith("agentic.regenerate"))         return "Regenerate (agentic)";
             if (s.startsWith("agentic.followup_decomp"))    return "Follow-up decompose";
+            /* gap_analysis.py tags its llm_call "tiered_judge"; the pipeline
+               trace uses "tiered.judge". Both mean the Tier 3 judge. */
+            if (s.startsWith("tiered.judge") || s === "tiered_judge") return "Missing-source check";
+            if (s.startsWith("tiered.followup_decomp"))     return "Follow-up decompose";
+            if (s.startsWith("tiered.generation"))          return "Generation";
             return s.replace(/\\.iter\\d+$/, "");
         }
         function renderModelCost(tokensUsed, isAgentic) {
@@ -3529,6 +3572,18 @@ a { color: var(--accent); text-decoration: none; }
             typical_iters: 2,                     // refinement passes billed as typical
             fig_typical_count: 1.5,               // referenced figures typically pulled into the reserve
             embedding_price_per_1m: 0.02,
+            // Tiered mode (the default) runs the judge on the utility model but
+            // only when the free score check can't decide, so it fires on
+            // roughly half the passes. Its prompt is context, not an answer, so
+            // it is larger in and smaller out than the llm-loop verdict.
+            judge_in: 2600, judge_out: 90,
+            judge_hit_rate: 0.5,
+            // "Unlimited" output (HyperThink) has no unlimited setting at the
+            // provider, so worst case is the model ceiling. Mirrors
+            // generator._MAX_OUTPUT_TOKENS for the Sonnet tier.
+            // ponytail: one number, not the whole table. The worst-case figure
+            // is an upper bound on a line nobody bills against.
+            unlimited_out_ceiling: 64000,
         };
 
         function _fmtCostShort(d) {
@@ -3559,6 +3614,7 @@ a { color: var(--accent); text-decoration: none; }
             const str = (id, def) => { const el = v(id); return el ? el.value : def; };
             return {
                 agentic: v("agentic-toggle") ? v("agentic-toggle").checked : false,
+                hyperthink: chk("config-hyperthink"),
                 llm_model:                  str("config-llm_model", "deepthought-claude-sonnet-4-6"),
                 agentic_model:              str("config-agentic_model", "deepthought-claude-sonnet-4-6"),
                 final_rerank_topk:          num("config-final_rerank_topk", 10),
@@ -3586,9 +3642,16 @@ a { color: var(--accent); text-decoration: none; }
             const figReserve = Math.max(0, cfg.figure_reserve_tokens || 0);
             const figTypical = Math.min(A.fig_typical_count * A.avg_chunk_tokens, figReserve);
             const figWorstExtraTok = figReserve - figTypical;
-            // First-pass generation always runs, so its figure worst-case is
-            // always in play.
-            let worstExtra = _llmCallCost(figWorstExtraTok, 0, regPrice);
+            // Tiered (the default) converges the CONTEXT with no generation
+            // inside the loop, then generates exactly once at the end on the
+            // agentic model. HyperThink runs the original llm loop: generate,
+            // gap-analyse THE ANSWER, regenerate, every pass. That difference
+            // is most of the cost gap between the two, so the estimator has to
+            // bill them as different shapes, not the same shape scaled.
+            const tiered = cfg.agentic && !cfg.hyperthink;
+            // Figure worst-case for the first-pass generation, which runs in
+            // every mode except tiered.
+            let worstExtra = tiered ? 0 : _llmCallCost(figWorstExtraTok, 0, regPrice);
 
             // Embedding the query (negligible, shown for completeness).
             const embCost = (A.qp_in / 1e6) * A.embedding_price_per_1m;
@@ -3606,14 +3669,17 @@ a { color: var(--accent); text-decoration: none; }
                 value: qpCost,
             });
 
-            // First-pass generation (always runs).
-            const normalIn  = A.base_prompt + cfg.final_rerank_topk * A.avg_chunk_tokens + figTypical;
-            const normalCost = _llmCallCost(normalIn, A.gen_out, regPrice);
-            rows.push({
-                name: "Generate (regular)",
-                sub: `${cfg.llm_model} · ${cfg.final_rerank_topk} chunks → ~${normalIn.toLocaleString()} in / ~${A.gen_out} out`,
-                value: normalCost,
-            });
+            // First-pass generation. Tiered skips it: the loop returns before
+            // Stage 4 and generates once at the end instead.
+            if (!tiered) {
+                const normalIn  = A.base_prompt + cfg.final_rerank_topk * A.avg_chunk_tokens + figTypical;
+                const normalCost = _llmCallCost(normalIn, A.gen_out, regPrice);
+                rows.push({
+                    name: "Generate (regular)",
+                    sub: `${cfg.llm_model} · ${cfg.final_rerank_topk} chunks → ~${normalIn.toLocaleString()} in / ~${A.gen_out} out`,
+                    value: normalCost,
+                });
+            }
 
             // Optional auto-gap-check (regular mode only - agentic has its own).
             if (cfg.auto_gap_check && !cfg.agentic) {
@@ -3636,6 +3702,15 @@ a { color: var(--accent); text-decoration: none; }
                     cfg.agentic_max_context_tokens
                 ) + figTypical;
 
+                // HyperThink sends max_output_tokens=0 ("unlimited"), which the
+                // server resolves to the model ceiling. Mirror that here so the
+                // worst-case line is honest about what unlimited costs.
+                // The slider keeps its old value while HyperThink is on, so key
+                // off the toggle, not the field.
+                const outCeiling = cfg.hyperthink
+                    ? A.unlimited_out_ceiling
+                    : Math.max(1, cfg.agentic_max_output_tokens);
+
                 const decompCalls = Math.min(A.decomp_calls, Math.max(1, cfg.agentic_max_followups));
                 const decompCost = _llmCallCost(A.decomp_in, A.decomp_out, supPrice) * decompCalls;
                 rows.push({
@@ -3644,24 +3719,51 @@ a { color: var(--accent); text-decoration: none; }
                     value: decompCost,
                 });
 
-                const gapCostOne   = _llmCallCost(A.gap_in, A.gap_out, supPrice);
-                const regenCostOne = _llmCallCost(agIn, A.regen_out, agPrice);
-                rows.push({
-                    name: "Agentic gap analysis",
-                    sub: `utility model · ~${iters}× ~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
-                    value: gapCostOne * iters,
-                });
-                rows.push({
-                    name: "Regenerate (agentic)",
-                    sub: `${cfg.agentic_model} · ~${iters}× ${cfg.agentic_rerank_topk} chunks → ~${agIn.toLocaleString()} in / ~${A.regen_out} out`,
-                    value: regenCostOne * iters,
-                });
+                if (tiered) {
+                    // Tier 1 (regex cross-ref expansion) and Tier 2 (score-based
+                    // sufficiency) are free, so the only per-pass model call is
+                    // the Tier 3 judge, and it only fires when the scores can't
+                    // decide. Then exactly one generation, at the end.
+                    const judgeOne  = _llmCallCost(A.judge_in, A.judge_out, supPrice);
+                    const judgeRuns = iters * A.judge_hit_rate;
+                    rows.push({
+                        name: "Missing-source check",
+                        sub: `utility model · ~${judgeRuns.toFixed(1)}× ~${A.judge_in.toLocaleString()} in / ~${A.judge_out} out`,
+                        value: judgeOne * judgeRuns,
+                    });
+                    const genCostOne = _llmCallCost(agIn, A.gen_out, agPrice);
+                    rows.push({
+                        name: "Generate (once, after convergence)",
+                        sub: `${cfg.agentic_model} · ${cfg.agentic_rerank_topk} chunks → ~${agIn.toLocaleString()} in / ~${A.gen_out} out`,
+                        value: genCostOne,
+                    });
 
-                // Worst case: every iteration runs and each regen emits the
-                // full configured output budget.
-                const regenWorstOne = _llmCallCost(agIn + figWorstExtraTok, cfg.agentic_max_output_tokens, agPrice);
-                worstExtra += (gapCostOne + regenWorstOne) * maxIters
-                            - (gapCostOne + regenCostOne) * iters;
+                    // Worst case: judge fires on every pass and the single
+                    // generation emits the full configured output budget.
+                    const genWorst = _llmCallCost(agIn + figWorstExtraTok, outCeiling, agPrice);
+                    worstExtra += judgeOne * (maxIters - judgeRuns) + (genWorst - genCostOne);
+                } else {
+                    const gapCostOne   = _llmCallCost(A.gap_in, A.gap_out, supPrice);
+                    const regenCostOne = _llmCallCost(agIn, A.regen_out, agPrice);
+                    rows.push({
+                        name: "Agentic gap analysis",
+                        sub: `utility model · ~${iters}× ~${A.gap_in.toLocaleString()} in / ~${A.gap_out} out`,
+                        value: gapCostOne * iters,
+                    });
+                    rows.push({
+                        name: cfg.hyperthink ? "Regenerate every pass (HyperThink)" : "Regenerate (agentic)",
+                        sub: `${cfg.agentic_model} · ~${iters}× ${cfg.agentic_rerank_topk} chunks → ~${agIn.toLocaleString()} in / ~${A.regen_out} out`,
+                        value: regenCostOne * iters,
+                    });
+
+                    // Worst case: every iteration runs and each regen emits the
+                    // full output budget. Under HyperThink that budget is
+                    // "unlimited", i.e. the model ceiling, which is why the
+                    // worst-case figure jumps by two orders of magnitude.
+                    const regenWorstOne = _llmCallCost(agIn + figWorstExtraTok, outCeiling, agPrice);
+                    worstExtra += (gapCostOne + regenWorstOne) * maxIters
+                                - (gapCostOne + regenCostOne) * iters;
+                }
             }
 
             const total = rows.reduce((s, r) => s + (typeof r.value === "number" ? r.value : 0), 0);
@@ -3777,6 +3879,7 @@ a { color: var(--accent); text-decoration: none; }
                     "  classDef stage_struct fill:#0f2418,color:#bbf7d0,stroke:#16a34a,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_skipped fill:#1c1c1a,color:#a8a29e,stroke:#44403c,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
                     "  classDef stage_subq   fill:#0c1f2e,color:#bae6fd,stroke:#0284c7,stroke-width:1px,rx:5,ry:5",
+                    "  classDef stage_hyde   fill:#2e0f26,color:#fbcfe8,stroke:#db2777,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_vector fill:#10203f,color:#bfdbfe,stroke:#2563eb,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_bm25   fill:#0a221f,color:#99f6e4,stroke:#0d9488,stroke-width:1px,rx:5,ry:5",
                     "  classDef stage_rrf    fill:#241f0a,color:#fde68a,stroke:#ca8a04,stroke-width:1px,rx:5,ry:5",
@@ -3799,6 +3902,7 @@ a { color: var(--accent); text-decoration: none; }
                 "  classDef stage_struct fill:#f0fdf4,color:#166534,stroke:#bbf7d0,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_skipped fill:#fafaf9,color:#a8a29e,stroke:#e7e5e4,stroke-width:1px,stroke-dasharray:3 3,rx:5,ry:5",
                 "  classDef stage_subq   fill:#f0f9ff,color:#0c4a6e,stroke:#bae6fd,stroke-width:1px,rx:5,ry:5",
+                "  classDef stage_hyde   fill:#fdf2f8,color:#9d174d,stroke:#fbcfe8,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_vector fill:#eff6ff,color:#1e3a8a,stroke:#bfdbfe,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_bm25   fill:#f0fdfa,color:#115e59,stroke:#99f6e4,stroke-width:1px,rx:5,ry:5",
                 "  classDef stage_rrf    fill:#fefce8,color:#854d0e,stroke:#fde68a,stroke-width:1px,rx:5,ry:5",
@@ -3999,6 +4103,26 @@ a { color: var(--accent); text-decoration: none; }
                 nodeMap["SL"] = sl;
             }
 
+            // HyDE - side branch off QP. The hypothetical passage is embedded
+            // and searched on its own, and its hits join RRF as one more
+            // ranked list beside the literal sub-query branches below.
+            const hy = stages.hyde;
+            const hyV = stages["hybrid_search.vector_search_hyde"];
+            if (hy) {
+                const hyChars = (hy.output && hy.output.chars) || 0;
+                const hySub = hy.output && hy.output.generated
+                    ? hyChars + " char passage"
+                    : "no passage · skipped";
+                L.push(`  HYDE["${_label("HyDE", hySub, hy)}"]:::stage_hyde`);
+                L.push("  QP --> HYDE");
+                nodeMap["HYDE"] = hy;
+            }
+            if (hyV) {
+                L.push(`  HV["${_label("Semantic search (HyDE)", (hyV.output.count || 0) + " hits · Voyage", hyV)}"]:::stage_vector`);
+                if (hy) L.push("  HYDE --> HV");
+                nodeMap["HV"] = hyV;
+            }
+
             // Per-sub-query branches: vector + BM25
             const subIds = new Set();
             for (const s of trace) {
@@ -4033,6 +4157,7 @@ a { color: var(--accent); text-decoration: none; }
 
             if (rrf) {
                 L.push(`  RRF["${_label("Fuse results", (rrf.output.count || 0) + " merged · RRF", rrf)}"]:::stage_rrf`);
+                if (hyV) L.push("  HV --> RRF");
                 nodeMap["RRF"] = rrf;
             }
 
@@ -4794,11 +4919,29 @@ a { color: var(--accent); text-decoration: none; }
             agenticConfig.classList.toggle("hidden", !agenticToggle.checked);
         });
 
-        // Fast Mode is the only user-facing switch: checking it turns
-        // agentic refinement off. The hidden #agentic-toggle stays the single
-        // source of truth all existing wiring reads, mirrored inverted here.
+        // Single source of truth for "is HyperThink on", read by both config
+        // payload builders. Defined outside the IIFE below because that one
+        // bails early when the Fast Mode control is absent.
+        function hyperThinkOn() {
+            const el = document.getElementById("config-hyperthink");
+            return !!(el && el.checked);
+        }
+
+        // Fast Mode and HyperThink are the two user-facing switches, and they
+        // are opposite ends of one axis, so they are mutually exclusive:
+        //
+        //   Fast Mode    agentic off        one generation, no refinement loop
+        //   (neither)    gap_mode=tiered    converge the context, generate once
+        //   HyperThink   gap_mode=llm       regenerate every pass, no output cap
+        //
+        // The hidden #agentic-toggle stays the single source of truth all the
+        // existing wiring reads, mirrored inverted from Fast Mode. HyperThink
+        // only sets gap_mode (read in the config payload builders); it does not
+        // touch agentic, which it needs left on.
         (function () {
-            const ultraFast = document.getElementById("config-ultra_fast");
+            const ultraFast   = document.getElementById("config-ultra_fast");
+            const hyperThink  = document.getElementById("config-hyperthink");
+            const hyperWarn   = document.getElementById("hyperthink-warn");
             if (!ultraFast) return;
             ultraFast.addEventListener("change", () => {
                 agenticToggle.checked = !ultraFast.checked;
@@ -4808,7 +4951,26 @@ a { color: var(--accent); text-decoration: none; }
             // (presets, the run-refinement flow, config-popup cancel).
             agenticToggle.addEventListener("change", () => {
                 ultraFast.checked = !agenticToggle.checked;
+                // HyperThink is meaningless with the refinement loop off.
+                if (!agenticToggle.checked && hyperThink) hyperThink.checked = false;
+                syncHyper();
             });
+            function syncHyper() {
+                const on = !!(hyperThink && hyperThink.checked);
+                if (hyperWarn) hyperWarn.hidden = !on;
+                if (typeof renderCostEstimate === "function") renderCostEstimate();
+            }
+            if (hyperThink) {
+                hyperThink.addEventListener("change", () => {
+                    // Turning HyperThink on implies refinement on.
+                    if (hyperThink.checked && ultraFast.checked) {
+                        ultraFast.checked = false;
+                        ultraFast.dispatchEvent(new Event("change"));
+                    }
+                    syncHyper();
+                });
+                syncHyper();
+            }
         })();
 
         // Config panel toggle
@@ -4918,6 +5080,44 @@ a { color: var(--accent); text-decoration: none; }
                 rows[acIdx].scrollIntoView({ block: "nearest" });
             }
 
+            // Delete is irreversible: test_plans has no soft-delete column, so
+            // the confirm is the only safety net. Deleting a test takes its
+            // cases with it, server-side, which is why the prompt says so.
+            function delBtn(id, label, nested) {
+                const b = document.createElement("button");
+                b.type = "button";
+                b.className = "addtest-del";
+                b.title = "Delete " + label;
+                b.setAttribute("aria-label", "Delete " + label);
+                b.textContent = "\\u00d7";
+                b.addEventListener("click", e => {
+                    e.stopPropagation();
+                    const warn = nested
+                        ? "Delete " + label + " and all of its cases? This cannot be undone."
+                        : "Delete " + label + "? This cannot be undone.";
+                    if (!confirm(warn)) return;
+                    b.disabled = true;
+                    fetch("/api/testplans/" + encodeURI(id), { method: "DELETE" })
+                        .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.detail || r.status)))
+                        .then(() => {
+                            // Drop the selection if it just stopped existing.
+                            if (selected && (selected.caseId === id || selected.caseId.startsWith(id + "/") ||
+                                             selected.testId === id)) {
+                                selected = null;
+                                syncUI();
+                            }
+                            loaded = false;
+                            ensureLoaded();
+                        })
+                        .catch(err => {
+                            b.disabled = false;
+                            errEl.textContent = "Delete failed: " + err;
+                            errEl.hidden = false;
+                        });
+                });
+                return b;
+            }
+
             function renderBrowse() {
                 browse.innerHTML = "";
                 groups.forEach(g => {
@@ -4932,7 +5132,9 @@ a { color: var(--accent); text-decoration: none; }
                         head.className = "addtest-test-head";
                         head.innerHTML = '<span class="tw">&#9654;</span><span class="addtest-opt-id"></span>';
                         head.children[1].textContent = t.test_id + " " + shortTitle(t.test_title);
+                        head.children[1].style.flex = "1";
                         head.addEventListener("click", () => box.classList.toggle("open"));
+                        head.appendChild(delBtn(t.test_id, "test " + dotted(t.test_id), true));
                         box.appendChild(head);
                         const cases = document.createElement("div");
                         cases.className = "addtest-cases";
@@ -4940,7 +5142,11 @@ a { color: var(--accent); text-decoration: none; }
                             const u = units.find(x => x.caseId === c.id);
                             const row = document.createElement("div");
                             row.className = "addtest-case";
-                            row.textContent = dotted(c.id) + "  " + shortTitle(c.title || c.id);
+                            const lab = document.createElement("span");
+                            lab.className = "addtest-case-label";
+                            lab.textContent = dotted(c.id) + "  " + shortTitle(c.title || c.id);
+                            row.appendChild(lab);
+                            row.appendChild(delBtn(c.id, "case " + dotted(c.id), false));
                             row.addEventListener("click", () => u && pick(u));
                             cases.appendChild(row);
                         });
@@ -5193,6 +5399,8 @@ a { color: var(--accent); text-decoration: none; }
         // when a real stage arrives we surface its phrase immediately.
         var THINK_MAP = {
             "query_processor":               "breaking your question into parts",
+            "hyde":                          "sketching what the answer should look like",
+            "hybrid_search.vector_search_hyde": "searching the specification",
             "structured_lookup":             "looking up named fields and tables",
             "hybrid_search.vector_search":   "searching the specification",
             "hybrid_search.bm25_search":     "ranking keyword matches",
@@ -5210,6 +5418,15 @@ a { color: var(--accent); text-decoration: none; }
             "agentic.rerank":                "re-ranking the expanded context",
             "agentic.regenerate":            "refining the final answer",
             "agentic.cap_reached":           "wrapping up",
+            "tiered.rerank":                 "re-ranking the expanded context",
+            "tiered.score_check":            "checking whether the sources cover the question",
+            "tiered.judge":                  "looking for missing sources",
+            "tiered.fetch":                  "fetching the missing sources",
+            "tiered.followup_decomp":        "planning follow-up questions",
+            "tiered.assemble":               "assembling the final context",
+            "tiered.generation":             "writing a grounded answer",
+            "tiered.stalled":                "wrapping up",
+            "tiered.cap_reached":            "wrapping up",
             "testplan_prime.plan":           "studying the selected test plan",
             "testplan_prime.search":         "gathering spec background for the test"
         };
@@ -5352,10 +5569,16 @@ a { color: var(--accent); text-decoration: none; }
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
                 final_rerank_topk: parseInt(document.getElementById("config-final_rerank_topk").value),
                 max_subqueries: parseInt(document.getElementById("config-max_subqueries").value),
+                // HyperThink is the only thing that switches the refinement loop
+                // back to "llm" (regenerate every pass) and lifts the output cap.
+                // 0 means unlimited and resolves per model server-side, in
+                // generator.resolve_max_output_tokens.
+                gap_mode: hyperThinkOn() ? "llm" : "tiered",
+                llm_max_output_tokens: hyperThinkOn() ? 0 : undefined,
                 agentic_max_followups: parseInt(document.getElementById("config-agentic_max_followups").value),
                 agentic_rerank_topk: parseInt(document.getElementById("config-agentic_rerank_topk").value),
                 agentic_max_context_tokens: parseInt(document.getElementById("config-agentic_max_context_tokens").value),
-                agentic_max_output_tokens: parseInt(document.getElementById("config-agentic_max_output_tokens").value),
+                agentic_max_output_tokens: hyperThinkOn() ? 0 : parseInt(document.getElementById("config-agentic_max_output_tokens").value),
                 agentic_targeted_fetch: document.getElementById("config-agentic_targeted_fetch").checked,
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
@@ -5487,6 +5710,8 @@ a { color: var(--accent); text-decoration: none; }
             "refine.seed":                  {t: "Resume from cache",             s: "Reused a prior /api/query first-pass state",               g: "normal"},
             "query_processor":              {t: "Understand the question",       s: "Decompose into sub-queries and extract entities",        g: "normal"},
             "structured_lookup":            {t: "Structured lookup",             s: "Direct hit against named fields, tables, or figures",     g: "normal"},
+            "hyde":                         {t: "HyDE",                          s: "Draft a hypothetical spec passage to search with, instead of the raw question", g: "normal"},
+            "hybrid_search.vector_search_hyde": {t: "Semantic search (HyDE)",    s: "Embeddings of the hypothetical passage (Voyage)",         g: "normal"},
             "hybrid_search.vector_search":  {t: "Semantic search",               s: "Embeddings via Voyage (vector similarity)",               g: "normal"},
             "hybrid_search.bm25_search":    {t: "BM25 search",                   s: "Classic Okapi BM25 ranking over the corpus",              g: "normal"},
             "hybrid_search.rrf_merge":      {t: "Fuse search branches",          s: "Reciprocal Rank Fusion across semantic + keyword + BM25", g: "normal"},
@@ -5504,6 +5729,18 @@ a { color: var(--accent); text-decoration: none; }
             "agentic.cap_reached":          {t: "Iteration cap reached",         s: "Agentic loop stopped at its max-iterations setting",       g: "agentic"},
             "agentic.verdict_converged":    {t: "Converged",                     s: "Generator self-assessment marked the answer complete",     g: "agentic"},
             "agentic.stalled":              {t: "Stalled",                       s: "Reranked context unchanged from the previous pass; stopped early", g: "agentic"},
+            /* Tiered gap analysis (the default). Same "agentic" group so these
+               render in the existing refinement lane; the distinguishing fact
+               is that no generation happens until tiered.generation. */
+            "tiered.rerank":                {t: "Rerank expanded pool",          s: "Rescore everything collected so far",                      g: "agentic"},
+            "tiered.score_check":           {t: "Coverage check",                s: "Score-based sufficiency test, no model call",              g: "agentic"},
+            "tiered.judge":                 {t: "Missing-source check",          s: "Utility model names what the context still lacks",         g: "agentic"},
+            "tiered.fetch":                 {t: "Fetch missing sources",         s: "Pull the sections and figures the check asked for",        g: "agentic"},
+            "tiered.followup_decomp":       {t: "Follow-up decomposition",       s: "Split a compound follow-up before retrieving",             g: "agentic"},
+            "tiered.assemble":              {t: "Assemble context",              s: "Final context, no model call",                             g: "agentic"},
+            "tiered.generation":            {t: "Generate answer",               s: "One generation, after the context stopped changing",       g: "agentic"},
+            "tiered.cap_reached":           {t: "Iteration cap reached",         s: "Context loop stopped at its max-iterations setting",       g: "agentic"},
+            "tiered.stalled":               {t: "Stalled",                       s: "Nothing new left to fetch; kept the assembled context",    g: "agentic"},
         };
 
         function formatStageDisplay(name) {
@@ -5733,10 +5970,16 @@ a { color: var(--accent); text-decoration: none; }
                 rrf_output_topk: parseInt(document.getElementById("config-rrf_output_topk").value),
                 final_rerank_topk: parseInt(document.getElementById("config-final_rerank_topk").value),
                 max_subqueries: parseInt(document.getElementById("config-max_subqueries").value),
+                // HyperThink is the only thing that switches the refinement loop
+                // back to "llm" (regenerate every pass) and lifts the output cap.
+                // 0 means unlimited and resolves per model server-side, in
+                // generator.resolve_max_output_tokens.
+                gap_mode: hyperThinkOn() ? "llm" : "tiered",
+                llm_max_output_tokens: hyperThinkOn() ? 0 : undefined,
                 agentic_max_followups: parseInt(document.getElementById("config-agentic_max_followups").value),
                 agentic_rerank_topk: parseInt(document.getElementById("config-agentic_rerank_topk").value),
                 agentic_max_context_tokens: parseInt(document.getElementById("config-agentic_max_context_tokens").value),
-                agentic_max_output_tokens: parseInt(document.getElementById("config-agentic_max_output_tokens").value),
+                agentic_max_output_tokens: hyperThinkOn() ? 0 : parseInt(document.getElementById("config-agentic_max_output_tokens").value),
                 agentic_targeted_fetch: document.getElementById("config-agentic_targeted_fetch").checked,
                 agentic_recursive: document.getElementById("config-agentic_recursive").checked,
                 agentic_max_iterations: parseInt(document.getElementById("config-agentic_max_iterations").value),
